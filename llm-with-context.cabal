@@ -19,6 +19,8 @@ common warnings
 library
     import:           warnings
     exposed-modules:  LLM
+                      ScrubPrefix
+                      Types
     -- other-modules:
     -- other-extensions:
     build-depends:    base
