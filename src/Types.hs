@@ -2,7 +2,7 @@
 {-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
-
+{-# LANGUAGE LambdaCase #-}
 
 module Types where
 
