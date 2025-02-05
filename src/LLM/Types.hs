@@ -9,7 +9,7 @@
 
 module LLM.Types where
 
-import ScrubPrefix
+import LLM.ScrubPrefix
 
 import Control.Monad.Trans.State
 import Data.Default

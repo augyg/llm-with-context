@@ -9,7 +9,7 @@
 
 module LLM.LLM where
 
-import Types
+import LLM.Types
 
 import Scrappy.Elem as S hiding (Tag)
 
