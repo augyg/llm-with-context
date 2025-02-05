@@ -272,34 +272,6 @@ data RelevantContextDS
 
 newtype DeepSeekQuestion = DeepSeekQuestion [ContentWithRole]
 
-                         
-data ScriptSectionPlan = ScriptSectionPlan
-  { _sectionPlan_title :: T.Text
-  , _sectionPlan_wordCount :: Int
-  , _sectionPlan_numberOfSeconds :: Int
-  , _sectionPlan_outline :: T.Text 
-  } deriving (Show,Generic)
-
-data ScriptSectionComplete = ScriptSectionComplete
-  { _section_title :: T.Text
-  , _section_wordCount :: Int
-  , _section_numberOfSeconds :: Int
-  , _section_text :: T.Text 
-  } deriving (Show,Generic) 
-
-instance Default ScriptSectionPlan where
-  def = ScriptSectionPlan
-    { _sectionPlan_title = ""
-    , _sectionPlan_wordCount = 0
-    , _sectionPlan_numberOfSeconds = 0
-    , _sectionPlan_outline = ""
-    }
-
-instance ToJSON ScriptSectionPlan
-instance FromJSON ScriptSectionPlan
-instance ToJSON ScriptSectionComplete 
-instance FromJSON ScriptSectionComplete
-
 data ThoughtResponse = ThoughtResponse
   { _thoughtResponse_think :: [T.Text]
   , _thoughtResponse_answer :: [T.Text]
