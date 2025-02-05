@@ -18,7 +18,9 @@ common warnings
 
 library
     import:           warnings
-    exposed-modules:  LLM
+    exposed-modules:  LLM.LLM
+                      LLM.ScrubPrefix
+                      LLM.Types
                       ScrubPrefix
                       Types
     -- other-modules:

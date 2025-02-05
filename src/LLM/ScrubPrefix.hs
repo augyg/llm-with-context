@@ -1,4 +1,4 @@
-module ScrubPrefix where
+module LLM.ScrubPrefix where
 
 import Data.Aeson
 
