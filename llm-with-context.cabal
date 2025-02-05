@@ -21,8 +21,6 @@ library
     exposed-modules:  LLM.LLM
                       LLM.ScrubPrefix
                       LLM.Types
-                      ScrubPrefix
-                      Types
     -- other-modules:
     -- other-extensions:
     build-depends:    base
