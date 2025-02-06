@@ -177,7 +177,7 @@ instance Default DeepSeekRequestBody where
     -- , _deepSeekRequest_top_logprobs      = Nothing
     }
 
-data DeepSeekModel = DS_1_5b | DS_7b | DS_8b | DS_14b | DS_32b | DS_70b | DS_671b deriving (Eq, Show, Generic)
+data DeepSeekModel = DS_1_5b | DS_7b | DS_8b | DS_14b | DS_32b | DS_70b | DS_671b deriving (Eq, Ord, Enum, Show, Generic)
 instance ToJSON DeepSeekModel where
   toJSON = \case
     DS_1_5b -> "deepseek-r1:1.5b"
@@ -288,6 +288,7 @@ instance FromJSON GPTType where
     "json_object" -> pure GPT_JSON
     t -> fail . T.unpack $ "unknown GPT type" <> t
 
+data OllamaError = OllamaError { _ollama_error :: T.Text } 
 
 deriveJSON (scrubPrefix "_errorOpenAI_") ''ErrorOpenAI
 deriveJSON (scrubPrefix "_errorResponseOpenAI_") ''ErrorResponseOpenAI
@@ -296,6 +297,7 @@ deriveJSON (scrubPrefix "_gptResponseFormat_") ''GPTResponseFormat
 deriveJSON (scrubPrefix "_cwr_") ''ContentWithRole
 deriveJSON (scrubPrefix "_deepSeekRequest_") ''DeepSeekRequestBody
 deriveJSON (scrubPrefix "_deepSeekResponse_") ''DeepSeekResponse
+deriveJSON (scrubPrefix "_ollama_") ''OllamaError
 
 instance FromJSON Usage
 instance ToJSON Usage
