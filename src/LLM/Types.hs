@@ -15,7 +15,7 @@ import Control.Monad.Trans.State
 import Data.Default
 import Data.Aeson
 import Data.Aeson.TH
-import Data.Text as T
+import qualified Data.Text as T
 import Data.ByteString.Lazy as LBS
 import GHC.Generics
 
