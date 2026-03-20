@@ -4,21 +4,32 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
+-- | Provider-agnostic LLM execution layer.
+--
+-- Defines the 'LLMT' (stateless) and 'ConvoT' (stateful conversation) monad
+-- transformers, backend dispatch via 'askBackend', and convenience functions
+-- for JSON and Parsec extraction from LLM responses.
 module LLM.Provider
-  ( WebProvider(..)
+  ( -- * Provider identifiers
+    WebProvider(..)
+    -- * Backend configuration
   , LLMAPI(..)
   , LLMBackend(..)
   , LLMEnv(..)
+    -- * Errors
   , LLMError(..)
+    -- * Monad transformers
   , LLMT(..)
   , ConvoT(..)
+    -- * Running
+  , runLLM
+  , runConvo
+    -- * Querying
   , askBackend
   , askLLM
   , askLLMJSON
   , askLLMParsec
   , parseLLMJSON
-  , runLLM
-  , runConvo
   ) where
 
 import LLM.Types
@@ -43,13 +54,15 @@ import System.Environment (getEnvironment)
 import System.Exit (ExitCode(..))
 import System.Process (readCreateProcessWithExitCode, proc, CreateProcess(..))
 
+-- | Which HTTP-based LLM provider a backend targets.
 data WebProvider = ProviderOpenAI | ProviderAnthropic | ProviderOllama
   deriving (Show, Eq, Generic)
 
+-- | Errors that can occur when calling an LLM backend.
 data LLMError
-  = LLMHttpError T.Text
-  | LLMParseError T.Text
-  | LLMProcessError Int T.Text
+  = LLMHttpError T.Text       -- ^ HTTP or network-level failure
+  | LLMParseError T.Text      -- ^ Could not decode the provider's response
+  | LLMProcessError Int T.Text -- ^ CLI subprocess exited with a non-zero code
   deriving (Show, Eq, Generic)
 
 -- | Transport + provider data for an LLM backend.
@@ -62,11 +75,13 @@ data LLMAPI
   | APICLI FilePath T.Text
   | APIMock ([ContentWithRole] -> IO (Either LLMError T.Text))
 
+-- | A named LLM backend (display name + transport details).
 data LLMBackend = LLMBackend
-  { _llmBackend_name :: T.Text
-  , _llmBackend_api  :: LLMAPI
+  { _llmBackend_name :: T.Text  -- ^ Human-readable name, e.g. @\"openai\/gpt-4o\"@
+  , _llmBackend_api  :: LLMAPI  -- ^ Transport and credentials
   }
 
+-- | Environment for the 'LLMT' monad — holds the active backend.
 data LLMEnv = LLMEnv
   { _llmEnv_backend :: LLMBackend
   }
@@ -92,14 +107,19 @@ askBackend backend msgs = case _llmBackend_api backend of
   APICLI exec model   -> askCLI exec model msgs
   APIMock f            -> f msgs
 
+-- | Send messages to the configured backend and return the raw text response.
 askLLM :: MonadIO m => [ContentWithRole] -> LLMT m (Either LLMError T.Text)
 askLLM msgs = LLMT $ do
   backend <- asks _llmEnv_backend
   liftIO $ askBackend backend msgs
 
+-- | Try to extract a JSON value from LLM output text. Scrapes through prose
+-- and code fences to find the first valid JSON object, then converts via 'FromJValue'.
 parseLLMJSON :: FromJValue a => T.Text -> Maybe a
 parseLLMJSON txt = scrapeFirst' parseJValue (T.unpack txt) >>= fromJValue
 
+-- | Like 'askLLM' but parses the response as JSON via scrappy-json's 'FromJValue'.
+-- Returns @Right Nothing@ when the LLM responds but no valid JSON is found.
 askLLMJSON :: (MonadIO m, FromJValue a) => [ContentWithRole] -> LLMT m (Either LLMError (Maybe a))
 askLLMJSON msgs = do
   result <- askLLM msgs
@@ -118,11 +138,13 @@ askLLMParsec msgs = do
         Just (x:_) -> Just x
         _          -> Nothing
 
+-- | Run a stateless LLM computation with the given environment.
 runLLM :: LLMEnv -> LLMT m a -> m a
-runLLM env (LLMT action) = runReaderT action env
+runLLM llmEnv (LLMT action) = runReaderT action llmEnv
 
+-- | Run a stateful conversation, starting with empty history.
 runConvo :: Monad m => LLMEnv -> ConvoT m a -> m a
-runConvo env (ConvoT action) = runReaderT (evalStateT action []) env
+runConvo llmEnv (ConvoT action) = runReaderT (evalStateT action []) llmEnv
 
 -- ============================================================
 -- Provider-specific HTTP/CLI implementations

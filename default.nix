@@ -1,7 +1,9 @@
 { aeson, base, bytestring, containers, data-default
 , directory, http-client, http-client-tls, http-types, lib, parsec
+, network-uri, process
 , text, transformers
 , scrappy-core
+, scrappy-json
 , pkgs, mkDerivation
 }:
 mkDerivation {
@@ -10,7 +12,8 @@ mkDerivation {
   src = ./.;
   libraryHaskellDepends = [
     aeson base bytestring containers data-default directory http-client
-    http-client-tls http-types parsec scrappy-core text transformers
+    http-client-tls http-types network-uri parsec process scrappy-core
+    scrappy-json text transformers
   ];
   license = lib.licenses.mit;
 }

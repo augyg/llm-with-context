@@ -1,6 +1,15 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE TemplateHaskell #-}
 
+-- | Pre-built 'LLMBackend' constructors for each supported provider.
+--
+-- Use these to create a backend and pass it to 'LLM.Provider.runLLM':
+--
+-- @
+-- backend <- mkOpenAI apiKey mgr "gpt-4o" Nothing
+-- result  <- runLLM (LLMEnv backend) $ askLLM [cwr User "Hello"]
+-- @
 module LLM.Provider.Backends
   ( mkOpenAI
   , mkDeepSeek
@@ -11,14 +20,16 @@ module LLM.Provider.Backends
 import LLM.Types (APIKey(..), APIProvider(..), DeepSeekModel, unAPIKey)
 import LLM.Provider (LLMAPI(..), LLMBackend(..), WebProvider(..))
 
+import LLM.StaticURI (staticURI)
+
 import Data.Aeson (toJSON, Value(..))
-import Data.Maybe (fromJust)
 import Network.HTTP.Client (Manager)
-import Network.URI (parseURI)
 import qualified Data.Text as T
 
+-- | Optional max-token limit for a request. 'Nothing' = provider default.
 type TokenLimit = Maybe Int
 
+-- | Render a 'DeepSeekModel' to the text the Ollama API expects.
 dsModelToText :: DeepSeekModel -> T.Text
 dsModelToText m = case toJSON m of
   String s -> s
@@ -29,7 +40,7 @@ mkOpenAI :: APIKey 'OpenAI -> Manager -> T.Text -> TokenLimit -> LLMBackend
 mkOpenAI apiKey mgr modelName tokenLimit = LLMBackend
   { _llmBackend_name = "openai/" <> modelName
   , _llmBackend_api  = APIWeb mgr
-      (fromJust $ parseURI "https://api.openai.com/v1/chat/completions")
+      $(staticURI "https://api.openai.com/v1/chat/completions")
       (unAPIKey apiKey) modelName tokenLimit ProviderOpenAI
   }
 
@@ -38,7 +49,7 @@ mkDeepSeek :: Manager -> DeepSeekModel -> LLMBackend
 mkDeepSeek mgr modelDS = LLMBackend
   { _llmBackend_name = "deepseek/" <> dsModelToText modelDS
   , _llmBackend_api  = APIWeb mgr
-      (fromJust $ parseURI "http://localhost:11434/api/chat")
+      $(staticURI "http://localhost:11434/api/chat")
       "" (dsModelToText modelDS) Nothing ProviderOllama
   }
 
@@ -47,7 +58,7 @@ mkClaudeAPI :: APIKey 'Anthropic -> Manager -> T.Text -> LLMBackend
 mkClaudeAPI apiKey mgr modelName = LLMBackend
   { _llmBackend_name = "claude-api/" <> modelName
   , _llmBackend_api  = APIWeb mgr
-      (fromJust $ parseURI "https://api.anthropic.com/v1/messages")
+      $(staticURI "https://api.anthropic.com/v1/messages")
       (unAPIKey apiKey) modelName Nothing ProviderAnthropic
   }
 

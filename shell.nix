@@ -5,14 +5,21 @@ let
   haskellPackages = if compiler == "default"
                        then pkgs.haskellPackages
                        else pkgs.haskell.packages.${compiler};
+  haskellLib = pkgs.haskell.lib;
+  scrappy-core = haskellLib.dontCheck (haskellLib.doJailbreak (haskellPackages.callCabal2nix "scrappy-core" ../scrappy-core {}));
+  scrappy-json-src =
+    let thunkDir = ./thunks/scrappy-json;
+        hasThunkNix = builtins.pathExists (thunkDir + "/thunk.nix");
+    in if hasThunkNix then import (thunkDir + "/thunk.nix") else thunkDir;
+  scrappy-json = haskellLib.dontCheck (haskellLib.doJailbreak (haskellPackages.callCabal2nix "scrappy-json" scrappy-json-src {}));
   variant = if doBenchmark then pkgs.haskell.lib.doBenchmark else pkgs.lib.id;
   pkg = import ./default.nix;
-  drv = variant (haskellPackages.callPackage pkg {}); 
+  drv = variant (haskellPackages.callPackage pkg { inherit scrappy-core scrappy-json; });
 in
 pkgs.mkShell {
   buildInputs = [ pkgs.cabal-install ];
   inputsFrom = [ (if pkgs.lib.inNixShell then drv.env else drv) ];
-} 
+}
 
 
 
