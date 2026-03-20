@@ -18,7 +18,11 @@ common warnings
 
 library
     import:           warnings
-    exposed-modules:  LLM.LLM
+    exposed-modules:  LLM.JsonExample
+                      LLM.LLM
+                      LLM.Provider
+                      LLM.Provider.Backends
+                      LLM.ReadLLM
                       LLM.ScrubPrefix
                       LLM.Types
     -- other-modules:
@@ -32,10 +36,13 @@ library
                     , http-client
                     , http-types
                     , http-client-tls
+                    , network-uri
                     , parsec
                     , scrappy-core
+                    , scrappy-json
                     , text
                     , transformers
+                    , process
 
                     
 
@@ -43,4 +50,23 @@ library
                     
                     
     hs-source-dirs:   src
+    default-language: Haskell2010
+
+test-suite tests
+    import:           warnings
+    type:             exitcode-stdio-1.0
+    main-is:          Main.hs
+    hs-source-dirs:   test
+    build-depends:    base
+                    , llm-with-context
+                    , aeson
+                    , bytestring
+                    , directory
+                    , hedgehog
+                    , parsec
+                    , scrappy-json
+                    , tasty
+                    , tasty-hedgehog
+                    , text
+                    , transformers
     default-language: Haskell2010

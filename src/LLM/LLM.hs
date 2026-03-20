@@ -10,13 +10,16 @@
 module LLM.LLM where
 
 import LLM.Types
+import LLM.Provider (askLLM, LLMT(..), LLMError(..), ConvoT(..), parseLLMJSON)
 
 import Scrappy.Elem as S hiding (Tag)
+import Scrappy.JSON.Value (FromJValue)
 
 import Network.HTTP.Client hiding (Proxy)
 import Network.HTTP.Types.Header
 
 import Control.Monad.IO.Class
+import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.State
 import Control.Exception as CE
 import Data.Bifunctor
@@ -50,23 +53,23 @@ getRelevant = LastNRelevant 10 $ \(Tag t) -> T.isPrefixOf "html" t
 renderHistory :: ConversationHistory -> ContentWithRole
 renderHistory = cwr Assistant . ((<>) "Our conversation history so far:") . T.intercalate "\n" . fmap renderItem
   where
-    renderItem (GPTQuery _ (GPTQuestion q) (GPTAnswer a)) =
-      "Me: " <> (T.decodeUtf8 . LBS.toStrict . Aeson.encode) q <> "\n" <> "ChatGPT: " <> a
+    renderItem (ConvoQuery _ (ConvoQuestion q) (ConvoAnswer a)) =
+      "Me: " <> (T.decodeUtf8 . LBS.toStrict . Aeson.encode) q <> "\n" <> "Assistant: " <> a
 
 
 
 
-getRelevantCtx :: MonadIO m => RelevantContext -> MonadGPT m ConversationHistory
+getRelevantCtx :: Monad m => RelevantContext -> StateT ConversationHistory m ConversationHistory
 getRelevantCtx = \case
   LastN n -> gets (take n)
   Relevants tags -> gets (flip finds tags)
   LastNRelevant n anonF -> gets (\x ->
                                take n
-                               . filter (anonF . _gptQuery_tag) $ x
+                               . filter (anonF . _convoQuery_tag) $ x
                             )
   where
     finds hist tags =
-      catMaybes $ fmap (\t -> L.find (\h -> t == _gptQuery_tag h) hist) tags
+      catMaybes $ fmap (\t -> L.find (\h -> t == _convoQuery_tag h) hist) tags
 
 getRelevantCtxDeepSeek :: MonadIO m => RelevantContextDS -> MonadDeepSeek m ConversationHistoryDeepSeek
 getRelevantCtxDeepSeek = \case
@@ -111,9 +114,9 @@ askGPTWithContextTyped
   -> Manager
   -> TokenLimit
   -> RelevantContext
-  -> (Tag, GPTQuestion)
-  -> MonadGPT m (Either GPTError (GPTAnswer a))
-askGPTWithContextTyped key mgr tokenLimit relCtx (thisTag, GPTQuestion contents) = do
+  -> (Tag, ConvoQuestion)
+  -> ConvoT m (Either ConvoError (ConvoAnswer a))
+askGPTWithContextTyped key mgr tokenLimit relCtx (thisTag, ConvoQuestion contents) = ConvoT $ do
   let typeProxy = Proxy :: Proxy a
   let returnT = gptReturnType typeProxy
   let
@@ -127,18 +130,18 @@ askGPTWithContextTyped key mgr tokenLimit relCtx (thisTag, GPTQuestion contents)
             Left _ -> readEither $ "\"" <> (T.unpack $ escapeText $ T.pack x) <> "\""
 
   ctx <- renderHistory <$> getRelevantCtx relCtx
-  askGPT key mgr tokenLimit (ctx : contents <> returnT) >>= \case
-    Left e -> pure . Left . GPTError $ e
+  askGPT key mgr gptModel tokenLimit (ctx : contents <> returnT) >>= \case
+    Left e -> pure . Left . ConvoError $ e
     Right txt -> case readEitherText txt of
-      Left e -> pure . Left . GPTError $
+      Left e -> pure . Left . ConvoError $
         e <> "When reading return type: (x :: "  <> (T.pack . show $ typeRep proxy ) <> ") from base response: " <> txt
         <> "From Prompt: "
         <> (T.pack $ show (ctx : contents <> returnT))
 
       Right typed -> do
-        let new = GPTQuery thisTag (GPTQuestion contents) (GPTAnswer txt)
+        let new = ConvoQuery thisTag (ConvoQuestion contents) (ConvoAnswer txt)
         modify ((:) new)
-        pure . Right . GPTAnswer $ typed
+        pure . Right . ConvoAnswer $ typed
 
 askGPTWithContext
   :: MonadIO m
@@ -146,16 +149,16 @@ askGPTWithContext
   -> Manager
   -> TokenLimit
   -> RelevantContext
-  -> (Tag, GPTQuestion)
-  -> MonadGPT m (Either GPTError (GPTAnswer T.Text))
-askGPTWithContext key mgr maxTokens relCtx (thisTag, GPTQuestion contents) = do
+  -> (Tag, ConvoQuestion)
+  -> ConvoT m (Either ConvoError (ConvoAnswer T.Text))
+askGPTWithContext key mgr maxTokens relCtx (thisTag, ConvoQuestion contents) = ConvoT $ do
   histItems <- getRelevantCtx relCtx
-  askGPT key mgr maxTokens (renderHistory histItems : contents) >>= \case
-    Left e -> pure $ Left $ GPTError e
+  askGPT key mgr gptModel maxTokens (renderHistory histItems : contents) >>= \case
+    Left e -> pure $ Left $ ConvoError e
     Right answer -> do
-      let new = GPTQuery thisTag (GPTQuestion contents) (GPTAnswer answer)
+      let new = ConvoQuery thisTag (ConvoQuestion contents) (ConvoAnswer answer)
       modify ((:) new)
-      pure $ Right $ GPTAnswer answer
+      pure $ Right $ ConvoAnswer answer
 
 
 
@@ -187,11 +190,9 @@ askDeepSeekWithContext
   -> DeepSeekModel
   -> RelevantContextDS
   -> (TagDS, DeepSeekQuestion)
-  -> MonadDeepSeek m (Either GPTError DeepSeekAnswer)
+  -> MonadDeepSeek m (Either ConvoError DeepSeekAnswer)
 askDeepSeekWithContext mgr modelDS relCtx (thisTag, DeepSeekQuestion contents) = do
 
-  
-  
   histItems <- getRelevantCtxDeepSeek relCtx
   let
     historyAtNow = (mconcat $ reverse $ fmap snd histItems)
@@ -200,16 +201,16 @@ askDeepSeekWithContext mgr modelDS relCtx (thisTag, DeepSeekQuestion contents) =
   deepSeekResult <- askDeepSeek mgr modelDS $ fullCWRs
 
   case deepSeekResult of
-    Left e -> pure $ Left . GPTError $ e
+    Left e -> pure $ Left . ConvoError $ e
     Right res -> do
       let newAnswer = _deepSeekResponse_message res
       modify (\state_ ->
                 let question = (thisTag, contents)
                     answer = (TagDS (unTagDS thisTag) True, [newAnswer])
                 in
-                  answer : question : state_ 
-             )  
-      pure $ Right . GPTAnswer $ newAnswer
+                  answer : question : state_
+             )
+      pure $ Right . ConvoAnswer $ newAnswer
 
 -- | TODO: Configure temperature for less variability
 -- | Todo: we should probably use scrappy here so that we dont care about prefixing/position
@@ -222,9 +223,9 @@ askGPTTyped
   => APIKey 'OpenAI
   -> Manager
   -> TokenLimit
-  -> GPTQuestion
-  -> m (Either GPTError (GPTAnswer a))
-askGPTTyped apiKey mgr maxTokens (GPTQuestion prompt) = do
+  -> ConvoQuestion
+  -> m (Either ConvoError (ConvoAnswer a))
+askGPTTyped apiKey mgr maxTokens (ConvoQuestion prompt) = do
   let typeProxy = Proxy :: Proxy a
   let returnT = gptReturnType typeProxy -- "Please only respond with nothing but the haskell type Map Int Int"
   let
@@ -233,11 +234,9 @@ askGPTTyped apiKey mgr maxTokens (GPTQuestion prompt) = do
       where readEither2 x = case readEither x of
               Right a -> Right a
               Left _ -> readEither $ "\"" <> escape x <> "\""
-                --Right a -> Right a
 
-
-  r <- askGPT apiKey mgr maxTokens $ prompt <> returnT
-  pure . bimap GPTError GPTAnswer $ readEitherText =<< r
+  r <- askGPT apiKey mgr gptModel maxTokens $ prompt <> returnT
+  pure . bimap ConvoError ConvoAnswer $ readEitherText =<< r
 
 escapeText :: T.Text -> T.Text
 escapeText = T.concatMap escapeChar
@@ -266,8 +265,8 @@ gptReturnType typeProxy =
 
 type TokenLimit = Maybe Int
 -- | TODO: change to gptPrim
-askGPT :: MonadIO m => APIKey 'OpenAI -> Manager -> TokenLimit -> [ContentWithRole] -> m (Either T.Text T.Text)
-askGPT apiKey mgr maxTokens contents = liftIO $ do
+askGPT :: MonadIO m => APIKey 'OpenAI -> Manager -> T.Text -> TokenLimit -> [ContentWithRole] -> m (Either T.Text T.Text)
+askGPT apiKey mgr modelName maxTokens contents = liftIO $ do
   putStrLn "askGPT"
   let url = "https://api.openai.com/v1/chat/completions"
   req <- parseRequest url
@@ -277,7 +276,7 @@ askGPT apiKey mgr maxTokens contents = liftIO $ do
   let promptLen = maybe [] (\_len -> [cwr System $ "Please limit response to " <> (T.pack $ show (50 :: Integer)) <> " tokens"]) maxTokens
   -- We add 50 to limit because as the request gets larger GPT is worse at knowing when to stop
   -- This should not affect shorter responses
-  let prompt = GPTRequestBody gptModel ((+ 50) <$> maxTokens) $ promptLen <> contents
+  let prompt = GPTRequestBody modelName ((+ 50) <$> maxTokens) $ promptLen <> contents
   let req' = req { requestHeaders = (fmap . fmap) (T.encodeUtf8 . T.pack) headers
                  , method = "POST"
                  , requestBody = RequestBodyLBS $ Aeson.encode prompt --txt
@@ -367,10 +366,36 @@ askGPTJSON
   -> [ContentWithRole]
   -> IO (Either T.Text (Maybe b))
 askGPTJSON apiKey mgr tokenLimit contents = do
-  content_ <- askGPT apiKey mgr tokenLimit contents
+  content_ <- askGPT apiKey mgr gptModel tokenLimit contents
   print content_
   pure $ flip fmap content_ (Aeson.decode . LBS.fromStrict . T.encodeUtf8)
 
+
+-- ============================================================
+-- Generic conversation layer (provider-agnostic via LLM.Provider)
+-- ============================================================
+
+askWithContext :: MonadIO m
+  => RelevantContext -> (Tag, ConvoQuestion)
+  -> ConvoT m (Either LLMError (ConvoAnswer T.Text))
+askWithContext relCtx (thisTag, ConvoQuestion contents) = ConvoT $ do
+  histItems <- getRelevantCtx relCtx
+  result <- lift $ unLLMT $ askLLM (renderHistory histItems : contents)
+  case result of
+    Left e -> pure $ Left e
+    Right answer -> do
+      let new = ConvoQuery thisTag (ConvoQuestion contents) (ConvoAnswer answer)
+      modify ((:) new)
+      pure $ Right $ ConvoAnswer answer
+
+askJSONWithContext :: (MonadIO m, FromJValue a)
+  => RelevantContext -> (Tag, ConvoQuestion)
+  -> ConvoT m (Either LLMError (Maybe a))
+askJSONWithContext relCtx tq = do
+  result <- askWithContext relCtx tq
+  return $ case result of
+    Left e -> Left e
+    Right (ConvoAnswer txt) -> Right (parseLLMJSON txt)
 
 gptModel :: T.Text
 gptModel = "gpt-4o-2024-05-13" -- "gpt-4"

@@ -20,7 +20,7 @@ import Data.ByteString.Lazy as LBS
 import GHC.Generics
 
 
-data APIProvider = OpenAI | Google | AWS
+data APIProvider = OpenAI | Google | AWS | Anthropic
 -- Define the APIKey type with a phantom type parameter
 newtype APIKey (api :: APIProvider) = APIKey { unAPIKey :: T.Text }
 
@@ -51,7 +51,7 @@ data ContentWithRole = ContentWithRole
 
 data GPTRole = System -- we provide some context: "Pretend you are an Interviewer"
              | User -- we ask some question
-             | Assistant deriving (Show, Generic)
+             | Assistant deriving (Show, Eq, Generic)
              -- We tell GPT something : "The assistant messages help store prior responses.
              -- They can also be written by a developer to help give examples of desired behavior."
 
@@ -220,12 +220,8 @@ data DeepSeekResponse = DeepSeekResponse
 
 
 
--- todo: use readerT for Manager and ApiKey
--- then create this monad as a newtype with getter funcs
--- and a put for history
-type MonadGPT m a = StateT ConversationHistory m a
-type MonadDeepSeek m a = StateT ConversationHistoryDeepSeek m a 
-type ConversationHistory = [GPTQuery T.Text]
+type MonadDeepSeek m a = StateT ConversationHistoryDeepSeek m a
+type ConversationHistory = [ConvoQuery T.Text]
 --type ConversationHistoryCWR = [GPTQuery ContentWithRole]
 
 type ConversationHistoryDeepSeek = [(TagDS, [ContentWithRole])]
@@ -234,10 +230,10 @@ type ConversationHistoryDeepSeek = [(TagDS, [ContentWithRole])]
 -- a == x ++ "-answer"
 
 
-data GPTQuery a = GPTQuery
-  { _gptQuery_tag :: Tag
-  , _gptQuery_question :: GPTQuestion
-  , _gptQuery_answer ::  GPTAnswer a
+data ConvoQuery a = ConvoQuery
+  { _convoQuery_tag :: Tag
+  , _convoQuery_question :: ConvoQuestion
+  , _convoQuery_answer ::  ConvoAnswer a
   }
 newtype Tag = Tag { unTag :: T.Text } deriving (Eq,Show)
 data TagDS = TagDS { unTagDS :: T.Text, isAnswerDS :: Bool } deriving (Eq,Show, Generic)
@@ -245,15 +241,15 @@ data TagDS = TagDS { unTagDS :: T.Text, isAnswerDS :: Bool } deriving (Eq,Show, 
 instance ToJSON TagDS
 instance FromJSON TagDS
 
-newtype GPTQuestion = GPTQuestion [ContentWithRole]
-newtype GPTAnswer a = GPTAnswer { unGPTAnswer :: a } deriving (Generic, Show)
+newtype ConvoQuestion = ConvoQuestion [ContentWithRole]
+newtype ConvoAnswer a = ConvoAnswer { unConvoAnswer :: a } deriving (Generic, Show)
 
-instance ToJSON a => ToJSON (GPTAnswer a)
-instance FromJSON a => FromJSON (GPTAnswer a)
+instance ToJSON a => ToJSON (ConvoAnswer a)
+instance FromJSON a => FromJSON (ConvoAnswer a)
 
-type DeepSeekAnswer = GPTAnswer ContentWithRole
+type DeepSeekAnswer = ConvoAnswer ContentWithRole
 
-newtype GPTError = GPTError T.Text deriving Show
+newtype ConvoError = ConvoError T.Text deriving Show
 
 data RelevantContext
   = LastN Int
@@ -288,8 +284,21 @@ instance FromJSON GPTType where
     "json_object" -> pure GPT_JSON
     t -> fail . T.unpack $ "unknown GPT type" <> t
 
-data OllamaError = OllamaError { _ollama_error :: T.Text } 
+data OllamaError = OllamaError { _ollama_error :: T.Text }
 
+data AnthropicContent = AnthropicContent
+  { _anthropicContent_type :: T.Text
+  , _anthropicContent_text :: T.Text
+  } deriving (Show, Generic)
+
+data AnthropicResponse = AnthropicResponse
+  { _anthropicResponse_id      :: T.Text
+  , _anthropicResponse_content :: [AnthropicContent]
+  , _anthropicResponse_model   :: T.Text
+  } deriving (Show, Generic)
+
+deriveJSON (scrubPrefix "_anthropicContent_") ''AnthropicContent
+deriveJSON (scrubPrefix "_anthropicResponse_") ''AnthropicResponse
 deriveJSON (scrubPrefix "_errorOpenAI_") ''ErrorOpenAI
 deriveJSON (scrubPrefix "_errorResponseOpenAI_") ''ErrorResponseOpenAI
 deriveJSON (scrubPrefix "_textToSpeech_") ''TextToSpeechBody
