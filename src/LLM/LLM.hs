@@ -7,16 +7,64 @@
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
-module LLM.LLM where
+-- | High-level functions for calling OpenAI (GPT) and DeepSeek\/Ollama models.
+--
+-- Two backends are supported:
+--
+-- * __OpenAI__ — 'askGPT', 'askGPTTyped', 'askGPTJSON', 'askGPTWithContext',
+--   'askGPTWithContextTyped'.  Requires an @'APIKey' \'OpenAI@ and an
+--   @http-client@ 'Manager'.
+--
+-- * __DeepSeek \/ Ollama__ — 'askDeepSeek', 'askDeepSeekWithContext'.
+--   Talks to a local Ollama instance on @localhost:11434@.
+--
+-- Both backends support stateful multi-turn conversations via 'MonadGPT' and
+-- 'MonadDeepSeek', with pluggable context-selection through 'RelevantContext'
+-- and 'RelevantContextDS'.
+module LLM.LLM
+  ( -- * OpenAI (GPT) direct calls
+    askGPT
+  , askGPTJSON
+  , askGPTTyped
+    -- * OpenAI with conversation context
+  , askGPTWithContext
+  , askGPTWithContextTyped
+    -- * DeepSeek \/ Ollama
+  , askDeepSeek
+  , askDeepSeekWithContext
+    -- * Provider-agnostic conversation layer
+  , askWithContext
+  , askJSONWithContext
+    -- * Context selection
+  , getRelevantCtx
+  , getRelevantCtxDeepSeek
+    -- * History rendering
+  , renderHistory
+    -- * DeepSeek response parsing
+  , toThoughtResponse
+  , codeBlock
+    -- * Helpers
+  , mkDSPrompt
+  , gptReturnType
+  , tshow
+  , escapeText
+  , escape
+  , gptModel
+  , getRelevant
+  , TokenLimit
+  ) where
 
 import LLM.Types
+import LLM.Provider (askLLM, LLMT(..), LLMError(..), ConvoT(..), parseLLMJSON)
 
 import Scrappy.Elem as S hiding (Tag)
+import Scrappy.JSON.Value (FromJValue)
 
 import Network.HTTP.Client hiding (Proxy)
 import Network.HTTP.Types.Header
 
 import Control.Monad.IO.Class
+import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.State
 import Control.Exception as CE
 import Data.Bifunctor
@@ -31,11 +79,14 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
 import qualified Data.ByteString.Lazy as LBS
 
+-- | 'show' a value directly to 'T.Text'.
 tshow :: Show a => a -> T.Text
-tshow = T.pack . show 
+tshow = T.pack . show
 
 
 
+-- | Build a 'DeepSeekRequestBody' from a model size and message list,
+-- using 'Default' for all other fields.
 mkDSPrompt :: DeepSeekModel -> [ContentWithRole] -> DeepSeekRequestBody
 mkDSPrompt dsModel cwrs = def
   { _deepSeekRequest_model = dsModel
@@ -44,30 +95,35 @@ mkDSPrompt dsModel cwrs = def
   
 
 
+-- | Example 'RelevantContext': keep the last 10 items whose tag starts with @\"html\"@.
 getRelevant :: RelevantContext
 getRelevant = LastNRelevant 10 $ \(Tag t) -> T.isPrefixOf "html" t
 
+-- | Render the full conversation history into a single 'Assistant' message
+-- suitable for injecting as context before a new prompt.
 renderHistory :: ConversationHistory -> ContentWithRole
 renderHistory = cwr Assistant . ((<>) "Our conversation history so far:") . T.intercalate "\n" . fmap renderItem
   where
-    renderItem (GPTQuery _ (GPTQuestion q) (GPTAnswer a)) =
-      "Me: " <> (T.decodeUtf8 . LBS.toStrict . Aeson.encode) q <> "\n" <> "ChatGPT: " <> a
+    renderItem (ConvoQuery _ (ConvoQuestion q) (ConvoAnswer a)) =
+      "Me: " <> (T.decodeUtf8 . LBS.toStrict . Aeson.encode) q <> "\n" <> "Assistant: " <> a
 
 
 
 
-getRelevantCtx :: MonadIO m => RelevantContext -> MonadGPT m ConversationHistory
+-- | Select conversation history items matching a 'RelevantContext' strategy.
+getRelevantCtx :: Monad m => RelevantContext -> StateT ConversationHistory m ConversationHistory
 getRelevantCtx = \case
   LastN n -> gets (take n)
   Relevants tags -> gets (flip finds tags)
   LastNRelevant n anonF -> gets (\x ->
                                take n
-                               . filter (anonF . _gptQuery_tag) $ x
+                               . filter (anonF . _convoQuery_tag) $ x
                             )
   where
     finds hist tags =
-      catMaybes $ fmap (\t -> L.find (\h -> t == _gptQuery_tag h) hist) tags
+      catMaybes $ fmap (\t -> L.find (\h -> t == _convoQuery_tag h) hist) tags
 
+-- | Select DeepSeek conversation history items matching a 'RelevantContextDS' strategy.
 getRelevantCtxDeepSeek :: MonadIO m => RelevantContextDS -> MonadDeepSeek m ConversationHistoryDeepSeek
 getRelevantCtxDeepSeek = \case
   LastN_DS n -> gets (take n)
@@ -101,6 +157,10 @@ getRelevantCtxDeepSeek = \case
 --   liftIO $ print r6
 --   pure ()
 
+-- | Ask GPT with conversation context and parse the response into a typed
+-- Haskell value via 'Read'. The type to parse into is inferred from the
+-- call site. Appends a system message instructing the model to return
+-- only the requested Haskell type.
 askGPTWithContextTyped
   :: forall m a.
   ( Typeable a
@@ -111,9 +171,9 @@ askGPTWithContextTyped
   -> Manager
   -> TokenLimit
   -> RelevantContext
-  -> (Tag, GPTQuestion)
-  -> MonadGPT m (Either GPTError (GPTAnswer a))
-askGPTWithContextTyped key mgr tokenLimit relCtx (thisTag, GPTQuestion contents) = do
+  -> (Tag, ConvoQuestion)
+  -> ConvoT m (Either ConvoError (ConvoAnswer a))
+askGPTWithContextTyped key mgr tokenLimit relCtx (thisTag, ConvoQuestion contents) = ConvoT $ do
   let typeProxy = Proxy :: Proxy a
   let returnT = gptReturnType typeProxy
   let
@@ -127,35 +187,38 @@ askGPTWithContextTyped key mgr tokenLimit relCtx (thisTag, GPTQuestion contents)
             Left _ -> readEither $ "\"" <> (T.unpack $ escapeText $ T.pack x) <> "\""
 
   ctx <- renderHistory <$> getRelevantCtx relCtx
-  askGPT key mgr tokenLimit (ctx : contents <> returnT) >>= \case
-    Left e -> pure . Left . GPTError $ e
+  askGPT key mgr gptModel tokenLimit (ctx : contents <> returnT) >>= \case
+    Left e -> pure . Left . ConvoError $ e
     Right txt -> case readEitherText txt of
-      Left e -> pure . Left . GPTError $
+      Left e -> pure . Left . ConvoError $
         e <> "When reading return type: (x :: "  <> (T.pack . show $ typeRep proxy ) <> ") from base response: " <> txt
         <> "From Prompt: "
         <> (T.pack $ show (ctx : contents <> returnT))
 
       Right typed -> do
-        let new = GPTQuery thisTag (GPTQuestion contents) (GPTAnswer txt)
+        let new = ConvoQuery thisTag (ConvoQuestion contents) (ConvoAnswer txt)
         modify ((:) new)
-        pure . Right . GPTAnswer $ typed
+        pure . Right . ConvoAnswer $ typed
 
+-- | Ask GPT with conversation context injected. Retrieves relevant history
+-- via 'getRelevantCtx', prepends it to the prompt, and stores the Q&A pair
+-- in state on success.
 askGPTWithContext
   :: MonadIO m
   => APIKey 'OpenAI
   -> Manager
   -> TokenLimit
   -> RelevantContext
-  -> (Tag, GPTQuestion)
-  -> MonadGPT m (Either GPTError (GPTAnswer T.Text))
-askGPTWithContext key mgr maxTokens relCtx (thisTag, GPTQuestion contents) = do
+  -> (Tag, ConvoQuestion)
+  -> ConvoT m (Either ConvoError (ConvoAnswer T.Text))
+askGPTWithContext key mgr maxTokens relCtx (thisTag, ConvoQuestion contents) = ConvoT $ do
   histItems <- getRelevantCtx relCtx
-  askGPT key mgr maxTokens (renderHistory histItems : contents) >>= \case
-    Left e -> pure $ Left $ GPTError e
+  askGPT key mgr gptModel maxTokens (renderHistory histItems : contents) >>= \case
+    Left e -> pure $ Left $ ConvoError e
     Right answer -> do
-      let new = GPTQuery thisTag (GPTQuestion contents) (GPTAnswer answer)
+      let new = ConvoQuery thisTag (ConvoQuestion contents) (ConvoAnswer answer)
       modify ((:) new)
-      pure $ Right $ GPTAnswer answer
+      pure $ Right $ ConvoAnswer answer
 
 
 
@@ -181,17 +244,18 @@ askGPTWithContext key mgr maxTokens relCtx (thisTag, GPTQuestion contents) = do
 -- runStateAction mgr modelChoice cwrs = askDeepSeekWithContext mgr modelChoice (LastN_DS 1000) (TagDS "sometag" False, DeepSeekQuestion cwrs)
 
 
+-- | Ask DeepSeek with conversation context. Concatenates relevant history
+-- messages before the new prompt and stores both the question and answer
+-- in state on success.
 askDeepSeekWithContext
   :: MonadIO m
   => Manager
   -> DeepSeekModel
   -> RelevantContextDS
   -> (TagDS, DeepSeekQuestion)
-  -> MonadDeepSeek m (Either GPTError DeepSeekAnswer)
+  -> MonadDeepSeek m (Either ConvoError DeepSeekAnswer)
 askDeepSeekWithContext mgr modelDS relCtx (thisTag, DeepSeekQuestion contents) = do
 
-  
-  
   histItems <- getRelevantCtxDeepSeek relCtx
   let
     historyAtNow = (mconcat $ reverse $ fmap snd histItems)
@@ -200,19 +264,21 @@ askDeepSeekWithContext mgr modelDS relCtx (thisTag, DeepSeekQuestion contents) =
   deepSeekResult <- askDeepSeek mgr modelDS $ fullCWRs
 
   case deepSeekResult of
-    Left e -> pure $ Left . GPTError $ e
+    Left e -> pure $ Left . ConvoError $ e
     Right res -> do
       let newAnswer = _deepSeekResponse_message res
       modify (\state_ ->
                 let question = (thisTag, contents)
                     answer = (TagDS (unTagDS thisTag) True, [newAnswer])
                 in
-                  answer : question : state_ 
-             )  
-      pure $ Right . GPTAnswer $ newAnswer
+                  answer : question : state_
+             )
+      pure $ Right . ConvoAnswer $ newAnswer
 
--- | TODO: Configure temperature for less variability
--- | Todo: we should probably use scrappy here so that we dont care about prefixing/position
+-- | Ask GPT and parse the response into a typed Haskell value (no context).
+-- Appends a system message telling the model to return only the Haskell type @a@.
+--
+-- TODO: Configure temperature for less variability.
 askGPTTyped
   :: forall m a.
   ( MonadIO m
@@ -222,9 +288,9 @@ askGPTTyped
   => APIKey 'OpenAI
   -> Manager
   -> TokenLimit
-  -> GPTQuestion
-  -> m (Either GPTError (GPTAnswer a))
-askGPTTyped apiKey mgr maxTokens (GPTQuestion prompt) = do
+  -> ConvoQuestion
+  -> m (Either ConvoError (ConvoAnswer a))
+askGPTTyped apiKey mgr maxTokens (ConvoQuestion prompt) = do
   let typeProxy = Proxy :: Proxy a
   let returnT = gptReturnType typeProxy -- "Please only respond with nothing but the haskell type Map Int Int"
   let
@@ -233,12 +299,11 @@ askGPTTyped apiKey mgr maxTokens (GPTQuestion prompt) = do
       where readEither2 x = case readEither x of
               Right a -> Right a
               Left _ -> readEither $ "\"" <> escape x <> "\""
-                --Right a -> Right a
 
+  r <- askGPT apiKey mgr gptModel maxTokens $ prompt <> returnT
+  pure . bimap ConvoError ConvoAnswer $ readEitherText =<< r
 
-  r <- askGPT apiKey mgr maxTokens $ prompt <> returnT
-  pure . bimap GPTError GPTAnswer $ readEitherText =<< r
-
+-- | Escape double-quotes and backslashes in 'T.Text' for safe embedding in JSON strings.
 escapeText :: T.Text -> T.Text
 escapeText = T.concatMap escapeChar
   where
@@ -247,6 +312,7 @@ escapeText = T.concatMap escapeChar
     escapeChar c    = T.singleton c
 
 
+-- | Escape regex-special characters in a 'String'.
 escape :: String -> String
 escape = concatMap esc
     where
@@ -255,6 +321,8 @@ escape = concatMap esc
         esc c   | c `elem` escchars = ['\\',c]
                 | otherwise         = [c]
 
+-- | Generate a system message instructing the model to return only a value
+-- of Haskell type @a@. Returns @[]@ for 'T.Text' and 'String' (no constraint needed).
 gptReturnType :: forall a. Typeable a => Proxy a -> [ContentWithRole]
 gptReturnType typeProxy =
   let
@@ -264,10 +332,13 @@ gptReturnType typeProxy =
     then []
     else [ cwr System $ "In responding to the above question, give me only the Haskell type:" <> typeInfo <> " and nothing else in your response: Format should be parsable as the Haskell type:" <> typeInfo ]
 
+-- | Optional max-token limit for a request. 'Nothing' = model default.
 type TokenLimit = Maybe Int
--- | TODO: change to gptPrim
-askGPT :: MonadIO m => APIKey 'OpenAI -> Manager -> TokenLimit -> [ContentWithRole] -> m (Either T.Text T.Text)
-askGPT apiKey mgr maxTokens contents = liftIO $ do
+
+-- | Low-level OpenAI chat-completion call. Sends messages to
+-- @\/v1\/chat\/completions@ and returns the first choice's content or an error.
+askGPT :: MonadIO m => APIKey 'OpenAI -> Manager -> T.Text -> TokenLimit -> [ContentWithRole] -> m (Either T.Text T.Text)
+askGPT apiKey mgr modelName maxTokens contents = liftIO $ do
   putStrLn "askGPT"
   let url = "https://api.openai.com/v1/chat/completions"
   req <- parseRequest url
@@ -277,7 +348,11 @@ askGPT apiKey mgr maxTokens contents = liftIO $ do
   let promptLen = maybe [] (\_len -> [cwr System $ "Please limit response to " <> (T.pack $ show (50 :: Integer)) <> " tokens"]) maxTokens
   -- We add 50 to limit because as the request gets larger GPT is worse at knowing when to stop
   -- This should not affect shorter responses
-  let prompt = GPTRequestBody gptModel ((+ 50) <$> maxTokens) $ promptLen <> contents
+  let prompt = GPTRequestBody
+        { _gptRequest_model = modelName
+        , _gptRequest_max_tokens = (+ 50) <$> maxTokens
+        , _gptRequest_messages = promptLen <> contents
+        }
   let req' = req { requestHeaders = (fmap . fmap) (T.encodeUtf8 . T.pack) headers
                  , method = "POST"
                  , requestBody = RequestBodyLBS $ Aeson.encode prompt --txt
@@ -293,7 +368,7 @@ askGPT apiKey mgr maxTokens contents = liftIO $ do
           pure $ Left "Unknown AI Error"
       Right r -> case choices r of
         [] -> pure $ Left "No choices"
-        chcs -> pure . Right . _cwr_content . message . head $ chcs
+        (c:_) -> pure . Right . _cwr_content . message $ c
 
 
 -- curl -X POST http://localhost:11434/api/generate      -d '{
@@ -304,6 +379,8 @@ askGPT apiKey mgr maxTokens contents = liftIO $ do
 
 
 
+-- | Parse a DeepSeek-R1 response that contains @\<think\>...\<\/think\>@ reasoning
+-- into a structured 'ThoughtResponse' with separate think and answer sections.
 toThoughtResponse :: ContentWithRole -> Either Psc.ParseError ThoughtResponse
 toThoughtResponse r =
   let
@@ -318,6 +395,8 @@ toThoughtResponse r =
 
 -- import Text.Parsec as Psc
 
+-- | Parsec parser for a fenced code block (@\`\`\`lang ... \`\`\`@).
+-- Returns @(language, code)@.
 codeBlock :: Psc.Stream s m Char => Psc.ParsecT s u m (String,String)
 codeBlock = do
   _ <- Psc.count 3 (Psc.char '`')
@@ -334,6 +413,8 @@ codeBlock = do
 
 
 
+-- | Low-level Ollama chat call. Sends messages to @localhost:11434\/api\/chat@
+-- (non-streaming) and returns the parsed 'DeepSeekResponse' or an error.
 askDeepSeek :: MonadIO m => Manager -> DeepSeekModel -> [ContentWithRole] -> m (Either T.Text DeepSeekResponse)
 askDeepSeek mgr modelDS contents = liftIO $ do
   putStrLn "askDeepSeek"
@@ -353,12 +434,15 @@ askDeepSeek mgr modelDS contents = liftIO $ do
     Left (e :: HttpException) -> pure $ Left $ T.pack $ (show e)
     Right resBody -> do
       case eitherDecode resBody :: Either String DeepSeekResponse of
-        Left e -> pure . Left . T.pack $ e
+        Left e -> do
+          pure . Left . T.pack $ e
         Right a -> pure $ Right  a 
 
 
 
 
+-- | Ask GPT and decode the response as JSON into type @b@.
+-- Returns @Right Nothing@ if the response is valid text but not valid JSON for @b@.
 askGPTJSON
   :: FromJSON b
   => APIKey 'OpenAI
@@ -367,11 +451,41 @@ askGPTJSON
   -> [ContentWithRole]
   -> IO (Either T.Text (Maybe b))
 askGPTJSON apiKey mgr tokenLimit contents = do
-  content_ <- askGPT apiKey mgr tokenLimit contents
+  content_ <- askGPT apiKey mgr gptModel tokenLimit contents
   print content_
   pure $ flip fmap content_ (Aeson.decode . LBS.fromStrict . T.encodeUtf8)
 
 
+-- ============================================================
+-- Generic conversation layer (provider-agnostic via LLM.Provider)
+-- ============================================================
+
+-- | Ask any LLM backend (via 'LLM.Provider.askLLM') with conversation context.
+-- Retrieves relevant history, prepends it, and stores the Q&A pair on success.
+askWithContext :: MonadIO m
+  => RelevantContext -> (Tag, ConvoQuestion)
+  -> ConvoT m (Either LLMError (ConvoAnswer T.Text))
+askWithContext relCtx (thisTag, ConvoQuestion contents) = ConvoT $ do
+  histItems <- getRelevantCtx relCtx
+  result <- lift $ unLLMT $ askLLM (renderHistory histItems : contents)
+  case result of
+    Left e -> pure $ Left e
+    Right answer -> do
+      let new = ConvoQuery thisTag (ConvoQuestion contents) (ConvoAnswer answer)
+      modify ((:) new)
+      pure $ Right $ ConvoAnswer answer
+
+-- | Like 'askWithContext' but parses the response as JSON into type @a@.
+askJSONWithContext :: (MonadIO m, FromJValue a)
+  => RelevantContext -> (Tag, ConvoQuestion)
+  -> ConvoT m (Either LLMError (Maybe a))
+askJSONWithContext relCtx tq = do
+  result <- askWithContext relCtx tq
+  return $ case result of
+    Left e -> Left e
+    Right (ConvoAnswer txt) -> Right (parseLLMJSON txt)
+
+-- | Default GPT model used by 'askGPT' and friends.
 gptModel :: T.Text
 gptModel = "gpt-4o-2024-05-13" -- "gpt-4"
 
