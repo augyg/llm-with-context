@@ -221,7 +221,18 @@ data DeepSeekResponse = DeepSeekResponse
 
 
 type MonadDeepSeek m a = StateT ConversationHistoryDeepSeek m a
-type ConversationHistory = [ConvoQuery T.Text]
+-- | A single entry in conversation history — either a real Q&A exchange
+-- or a summary of prior context produced by context compaction.
+data ConvoEntry a
+  = ConvoExchange (ConvoQuery a)   -- ^ Normal question → answer exchange
+  | ConvoSummary Tag a             -- ^ Summarized context (tag + summary text)
+
+-- | Get the tag from any history entry.
+entryTag :: ConvoEntry a -> Tag
+entryTag (ConvoExchange q) = _convoQuery_tag q
+entryTag (ConvoSummary t _) = t
+
+type ConversationHistory = [ConvoEntry T.Text]
 --type ConversationHistoryCWR = [GPTQuery ContentWithRole]
 
 type ConversationHistoryDeepSeek = [(TagDS, [ContentWithRole])]
