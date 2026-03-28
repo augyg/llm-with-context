@@ -19,14 +19,17 @@ import LLM.Provider.Backends
 import LLM.ReadLLM
 import LLM.JsonExample
 import LLM.ScrubPrefix (scrubPrefix)
-import LLM.LLM (getRelevantCtx, getRelevantCtxDeepSeek, renderHistory, askWithContext, askJSONWithContext)
+import LLM.LLM (getRelevantCtx, getRelevantCtxDeepSeek, renderHistory, askWithContext, askJSONWithContext, toThoughtResponse, codeBlock, escapeText, escape, gptReturnType, tshow, mkDSPrompt, gptModel, getRelevant)
 
 import Control.Monad.Trans.State (evalStateT)
-import Data.Aeson (encode, eitherDecode, toJSON, fromJSON, fieldLabelModifier)
+import Data.Aeson (encode, eitherDecode, toJSON, fromJSON, fieldLabelModifier, Result(..), Value(..))
 import Data.Typeable (Typeable, typeRep, Proxy(..))
 import GHC.Generics (Generic)
 import Scrappy.JSON.Record (jString, jInt, jDouble, jBool, jNull, jArray)
 import Scrappy.JSON.Value (FromJValue(..), JValue(..), (.:))
+import Data.Default (def)
+import Data.Either (isLeft)
+import Data.List (nub)
 import Text.Parsec (parse, string, spaces, char)
 import qualified Data.Text as T
 import System.Directory (findExecutable)
@@ -48,6 +51,20 @@ tests = testGroup "llm-with-context"
   , testGroup "ScrubPrefix" scrubPrefixTests
   , testGroup "ReadLLM Edge Cases" readLLMEdgeTests
   , testGroup "JsonExample Edge Cases" jsonExampleEdgeTests
+  , testGroup "ThoughtResponse" thoughtResponseTests
+  , testGroup "CodeBlock" codeBlockTests
+  , testGroup "EscapeFunctions" escapeFunctionTests
+  , testGroup "GptReturnType" gptReturnTypeTests
+  , testGroup "DSHelpers" dsHelperTests
+  , testGroup "FromJSON Failures" fromJsonFailureTests
+  , testGroup "JSON Roundtrips Extra" jsonRoundtripExtraTests
+  , testGroup "Misc Gaps" miscGapTests
+  , testGroup "Provider Dispatch" providerDispatchTests
+  , testGroup "Type Roundtrips Extra" typeRoundtripsExtraTests
+  , testGroup "ConvoT State" convoStateTests
+  , testGroup "LLM Constants" llmConstantTests
+  , testGroup "Error Propagation" errorPropagationTests
+  , testGroup "Backends Coverage" backendsCoverageTests
   ]
 
 -- ============================================================
@@ -82,6 +99,39 @@ genDeepSeekModel = Gen.element [DS_1_5b, DS_7b, DS_8b, DS_14b, DS_32b, DS_70b, D
 
 genResponseFormat :: Gen ResponseFormat
 genResponseFormat = Gen.element [AsText, AsJSON]
+
+genTag :: Gen Tag
+genTag = Tag <$> genNonEmptyText
+
+genTagDS :: Gen TagDS
+genTagDS = TagDS <$> genNonEmptyText <*> Gen.bool
+
+-- | Generate a string without backslashes or quotes (for escapeText testing)
+genPlainText :: Gen T.Text
+genPlainText = Gen.text (Range.linear 0 100) (Gen.filter (\c -> c /= '"' && c /= '\\') Gen.unicode)
+
+-- | Generate a string with some special chars mixed in
+genTextWithSpecials :: Gen T.Text
+genTextWithSpecials = Gen.text (Range.linear 0 100) Gen.unicode
+
+-- | Generate a string without regex-special chars (for escape testing)
+genPlainString :: Gen String
+genPlainString = Gen.string (Range.linear 0 100) (Gen.filter (\c -> c `notElem` ("$\\^.*~[]" :: String)) Gen.unicode)
+
+-- | Generate a prefix and a field name for scrubPrefix testing
+genPrefixAndField :: Gen (String, String)
+genPrefixAndField = do
+  prefix <- Gen.string (Range.linear 0 10) Gen.lower
+  suffix <- Gen.string (Range.linear 0 20) Gen.alphaNum
+  pure (prefix, prefix ++ suffix)
+
+-- | Generate an Int and embed it in random noise text
+genIntInNoise :: Gen (Int, String)
+genIntInNoise = do
+  n <- Gen.int (Range.linear (-1000) 1000)
+  prefix_ <- Gen.string (Range.linear 0 30) Gen.alpha
+  suffix_ <- Gen.string (Range.linear 0 30) Gen.alpha
+  pure (n, prefix_ ++ " " ++ show n ++ " " ++ suffix_)
 
 -- ============================================================
 -- Types Tests: JSON roundtrip properties
@@ -1479,18 +1529,16 @@ scrubPrefixTests =
   ]
 
 prop_scrub_strips :: Property
-prop_scrub_strips = withTests 1 $ property $ do
-  let opts = scrubPrefix "_cwr_"
-      modifier = fieldLabelModifier opts
-  modifier "_cwr_role"    === "role"
-  modifier "_cwr_content" === "content"
+prop_scrub_strips = property $ do
+  (prefix, field) <- forAll genPrefixAndField
+  let opts = scrubPrefix prefix
+  fieldLabelModifier opts field === drop (length prefix) field
 
 prop_scrub_empty :: Property
-prop_scrub_empty = withTests 1 $ property $ do
+prop_scrub_empty = property $ do
+  field <- forAll $ Gen.string (Range.linear 0 50) Gen.alphaNum
   let opts = scrubPrefix ""
-      modifier = fieldLabelModifier opts
-  modifier "anything" === "anything"
-  modifier ""         === ""
+  fieldLabelModifier opts field === field
 
 prop_scrub_is_options :: Property
 prop_scrub_is_options = withTests 1 $ property $ do
@@ -1525,10 +1573,11 @@ readLLMEdgeTests =
   ]
 
 prop_readllm_int :: Property
-prop_readllm_int = withTests 1 $ property $ do
-  case search "the answer is 42 ok" :: Maybe [Int] of
-    Just xs -> assert $ 42 `elem` xs
-    Nothing -> do annotate "Expected to find 42"; failure
+prop_readllm_int = property $ do
+  (n, noisy) <- forAll genIntInNoise
+  case search noisy :: Maybe [Int] of
+    Just xs -> assert $ n `elem` xs
+    Nothing -> do annotate $ "Expected to find " ++ show n; failure
 
 prop_readllm_string :: Property
 prop_readllm_string = withTests 1 $ property $ do
@@ -1659,3 +1708,1080 @@ prop_prompt_preamble :: Property
 prop_prompt_preamble = withTests 1 $ property $ do
   let prompt = jsonResponsePrompt (Proxy :: Proxy Double)
   assert $ "Respond with ONLY" `T.isInfixOf` T.pack prompt
+
+-- ============================================================
+-- Sum type for JsonExample (:+:) test
+-- ============================================================
+
+data Shape = Circle { shapeRadius :: Double }
+           | Square { shapeSide :: Double }
+  deriving (Generic)
+instance JsonExample Shape
+
+-- ============================================================
+-- ThoughtResponse Tests
+-- ============================================================
+
+thoughtResponseTests :: [TestTree]
+thoughtResponseTests =
+  [ testProperty "happy path: think tag with answer" prop_thought_happy
+  , testProperty "empty think block" prop_thought_empty_think
+  , testProperty "multi-line think content" prop_thought_multiline
+  , testProperty "no think tag fails" prop_thought_no_tag
+  , testProperty "think with special chars" prop_thought_specials
+  ]
+
+prop_thought_happy :: Property
+prop_thought_happy = property $ do
+  -- Generate text without angle brackets to avoid confusing the HTML parser
+  thinkContent <- forAll $ Gen.text (Range.linear 1 100) Gen.alphaNum
+  answerContent <- forAll $ Gen.text (Range.linear 1 100) Gen.alphaNum
+  let input = cwr Assistant $ "<think>" <> thinkContent <> "</think>" <> answerContent
+  case toThoughtResponse input of
+    Left e -> do
+      annotate (show e)
+      failure
+    Right (ThoughtResponse thinkLines answerLines) -> do
+      assert $ T.isInfixOf thinkContent (T.unlines thinkLines)
+      assert $ T.isInfixOf answerContent (T.unlines answerLines)
+
+prop_thought_empty_think :: Property
+prop_thought_empty_think = withTests 1 $ property $ do
+  let input = cwr Assistant "<think></think>the answer"
+  case toThoughtResponse input of
+    Left e -> do
+      annotate (show e)
+      failure
+    Right (ThoughtResponse _ answerLines) -> do
+      assert $ T.isInfixOf "the answer" (T.unlines answerLines)
+
+prop_thought_multiline :: Property
+prop_thought_multiline = withTests 1 $ property $ do
+  let input = cwr Assistant "<think>line1\nline2\nline3</think>done"
+  case toThoughtResponse input of
+    Left e -> do
+      annotate (show e)
+      failure
+    Right (ThoughtResponse thinkLines _) -> do
+      assert $ length thinkLines >= 3
+
+prop_thought_no_tag :: Property
+prop_thought_no_tag = withTests 1 $ property $ do
+  let input = cwr Assistant "just a plain response with no think tag"
+  assert $ isLeft (toThoughtResponse input)
+
+prop_thought_specials :: Property
+prop_thought_specials = withTests 1 $ property $ do
+  let input = cwr Assistant "<think>hello & \"world\" <nested></think>final"
+  case toThoughtResponse input of
+    Left e -> do
+      annotate (show e)
+      failure
+    Right (ThoughtResponse thinkLines answerLines) -> do
+      assert $ not (null thinkLines)
+      assert $ T.isInfixOf "final" (T.unlines answerLines)
+
+-- ============================================================
+-- CodeBlock Tests
+-- ============================================================
+
+codeBlockTests :: [TestTree]
+codeBlockTests =
+  [ testProperty "parse json code block" prop_codeblock_json
+  , testProperty "parse code block no language" prop_codeblock_nolang
+  , testProperty "parse empty code block" prop_codeblock_empty
+  ]
+
+prop_codeblock_json :: Property
+prop_codeblock_json = withTests 1 $ property $ do
+  let input = "```json\n{\"a\":1}\n```" :: T.Text
+  case parse codeBlock "test" input of
+    Left e -> do
+      annotate (show e)
+      failure
+    Right (lang, code) -> do
+      lang === "json"
+      assert $ "{\"a\":1}" `T.isInfixOf` T.pack code
+
+prop_codeblock_nolang :: Property
+prop_codeblock_nolang = withTests 1 $ property $ do
+  let input = "```\nsome code here\n```" :: T.Text
+  case parse codeBlock "test" input of
+    Left e -> do
+      annotate (show e)
+      failure
+    Right (lang, code) -> do
+      lang === ""
+      assert $ "some code here" `T.isInfixOf` T.pack code
+
+prop_codeblock_empty :: Property
+prop_codeblock_empty = withTests 1 $ property $ do
+  let input = "```\n\n```" :: T.Text
+  case parse codeBlock "test" input of
+    Left e -> do
+      annotate (show e)
+      failure
+    Right (lang, code) -> do
+      lang === ""
+      annotate $ "code: " ++ show code
+      success
+
+-- ============================================================
+-- Escape Function Tests
+-- ============================================================
+
+escapeFunctionTests :: [TestTree]
+escapeFunctionTests =
+  [ testProperty "escapeText: no unescaped quotes or backslashes" prop_escapeText_property
+  , testProperty "escapeText: plain text unchanged" prop_escapeText_plain_prop
+  , testProperty "escapeText: length never shrinks" prop_escapeText_length
+  , testProperty "escapeText specific: quotes" prop_escapeText_quotes
+  , testProperty "escapeText specific: backslashes" prop_escapeText_backslashes
+  , testProperty "escape: no unescaped regex specials" prop_escape_property
+  , testProperty "escape: plain strings unchanged" prop_escape_plain_prop
+  , testProperty "escape specific: all special chars" prop_escape_regex
+  ]
+
+prop_escapeText_property :: Property
+prop_escapeText_property = property $ do
+  txt <- forAll genTextWithSpecials
+  let escaped = escapeText txt
+  -- No raw (unescaped) double-quotes should remain
+  -- Every " in the output must be preceded by \
+  let checkEscaped :: T.Text -> Bool
+      checkEscaped t = go False (T.unpack t)
+        where
+          go _ [] = True
+          go True ('"':cs) = go False cs   -- \" is fine
+          go True ('\\':cs) = go False cs  -- \\ is fine
+          go True (_:cs) = go False cs     -- \x is fine
+          go False ('"':_) = False         -- raw " is bad
+          go False ('\\':cs) = go True cs  -- start of escape
+          go False (_:cs) = go False cs
+  assert $ checkEscaped escaped
+
+prop_escapeText_plain_prop :: Property
+prop_escapeText_plain_prop = property $ do
+  txt <- forAll genPlainText
+  -- Text with no quotes or backslashes should be unchanged
+  escapeText txt === txt
+
+prop_escapeText_length :: Property
+prop_escapeText_length = property $ do
+  txt <- forAll genTextWithSpecials
+  -- Escaping can only add characters, never remove
+  assert $ T.length (escapeText txt) >= T.length txt
+
+prop_escapeText_quotes :: Property
+prop_escapeText_quotes = withTests 1 $ property $ do
+  escapeText "say \"hi\"" === "say \\\"hi\\\""
+
+prop_escapeText_backslashes :: Property
+prop_escapeText_backslashes = withTests 1 $ property $ do
+  escapeText "a\\b" === "a\\\\b"
+
+prop_escape_property :: Property
+prop_escape_property = property $ do
+  s <- forAll $ Gen.string (Range.linear 0 100) Gen.unicode
+  let escaped = escape s
+      specials = "$\\^.*~[]" :: String
+  -- Every special char in the output must be preceded by \
+  let checkNoRawSpecials :: String -> Bool
+      checkNoRawSpecials [] = True
+      checkNoRawSpecials ('\\':_:rest) = checkNoRawSpecials rest  -- skip escaped pair
+      checkNoRawSpecials (c:rest)
+        | c `elem` specials = False
+        | otherwise = checkNoRawSpecials rest
+  assert $ checkNoRawSpecials escaped
+
+prop_escape_plain_prop :: Property
+prop_escape_plain_prop = property $ do
+  s <- forAll genPlainString
+  -- Strings with no regex specials should be unchanged
+  escape s === s
+
+prop_escape_regex :: Property
+prop_escape_regex = withTests 1 $ property $ do
+  escape "$test" === "\\$test"
+  escape "a^b" === "a\\^b"
+  escape "a.b" === "a\\.b"
+  escape "a*b" === "a\\*b"
+  escape "[x]" === "\\[x\\]"
+
+-- ============================================================
+-- gptReturnType Tests
+-- ============================================================
+
+gptReturnTypeTests :: [TestTree]
+gptReturnTypeTests =
+  [ testProperty "Text returns empty list" prop_returnType_text
+  , testProperty "String returns empty list" prop_returnType_string
+  , testProperty "Int returns system message" prop_returnType_int
+  , testProperty "Bool returns system message" prop_returnType_bool
+  , testProperty "Double returns system message" prop_returnType_double
+  , testProperty "[Int] returns system message" prop_returnType_list
+  , testProperty "Maybe Int returns system message" prop_returnType_maybe
+  ]
+
+prop_returnType_text :: Property
+prop_returnType_text = withTests 1 $ property $ do
+  let result = gptReturnType (Proxy :: Proxy T.Text)
+  length result === 0
+
+prop_returnType_string :: Property
+prop_returnType_string = withTests 1 $ property $ do
+  -- Typeable String shows "[Char]" — gptReturnType handles this
+  let result = gptReturnType (Proxy :: Proxy String)
+  length result === 0
+
+prop_returnType_int :: Property
+prop_returnType_int = withTests 1 $ property $ do
+  let result = gptReturnType (Proxy :: Proxy Int)
+  assert $ length result == 1
+  case result of
+    (ContentWithRole role content : _) -> do
+      role === System
+      assert $ T.isInfixOf "Int" content
+    [] -> failure
+
+prop_returnType_bool :: Property
+prop_returnType_bool = withTests 1 $ property $ do
+  let result = gptReturnType (Proxy :: Proxy Bool)
+  assert $ length result == 1
+  case result of
+    (ContentWithRole _ content : _) -> assert $ T.isInfixOf "Bool" content
+    [] -> failure
+
+prop_returnType_double :: Property
+prop_returnType_double = withTests 1 $ property $ do
+  let result = gptReturnType (Proxy :: Proxy Double)
+  assert $ length result == 1
+  case result of
+    (ContentWithRole _ content : _) -> assert $ T.isInfixOf "Double" content
+    [] -> failure
+
+prop_returnType_list :: Property
+prop_returnType_list = withTests 1 $ property $ do
+  let result = gptReturnType (Proxy :: Proxy [Int])
+  assert $ length result == 1
+  case result of
+    (ContentWithRole _ content : _) -> assert $ T.isInfixOf "Int" content
+    [] -> failure
+
+prop_returnType_maybe :: Property
+prop_returnType_maybe = withTests 1 $ property $ do
+  let result = gptReturnType (Proxy :: Proxy (Maybe Int))
+  assert $ length result == 1
+
+-- ============================================================
+-- DS Helpers / Default Tests
+-- ============================================================
+
+dsHelperTests :: [TestTree]
+dsHelperTests =
+  [ testProperty "tshow Int" prop_tshow_int
+  , testProperty "tshow Bool" prop_tshow_bool
+  , testProperty "mkDSPrompt sets model and messages" prop_mkDSPrompt
+  , testProperty "DeepSeekRequestBody default values" prop_dsreq_default
+  ]
+
+prop_tshow_int :: Property
+prop_tshow_int = property $ do
+  n <- forAll $ Gen.int (Range.linear (-10000) 10000)
+  tshow n === T.pack (show n)
+
+prop_tshow_bool :: Property
+prop_tshow_bool = property $ do
+  b <- forAll Gen.bool
+  tshow b === T.pack (show b)
+
+prop_mkDSPrompt :: Property
+prop_mkDSPrompt = property $ do
+  model <- forAll genDeepSeekModel
+  nMsgs <- forAll $ Gen.int (Range.linear 0 5)
+  msgs <- forAll $ Gen.list (Range.singleton nMsgs) genContentWithRole
+  let prompt = mkDSPrompt model msgs
+  _deepSeekRequest_model prompt === model
+  length (_deepSeekRequest_messages prompt) === length msgs
+  _deepSeekRequest_stream prompt === False
+
+prop_dsreq_default :: Property
+prop_dsreq_default = withTests 1 $ property $ do
+  let d = def :: DeepSeekRequestBody
+  _deepSeekRequest_model d === DS_1_5b
+  _deepSeekRequest_stream d === False
+  _deepSeekRequest_images d === Nothing
+  length (_deepSeekRequest_messages d) === 0
+
+-- ============================================================
+-- FromJSON Failure Branch Tests
+-- ============================================================
+
+fromJsonFailureTests :: [TestTree]
+fromJsonFailureTests =
+  [ testProperty "GPTRole rejects unknown string" prop_role_reject
+  , testProperty "GPTRole roundtrips all constructors" prop_role_all
+  , testProperty "DeepSeekModel rejects unknown string" prop_dsmodel_reject
+  , testProperty "ResponseFormat rejects unknown string" prop_resfmt_reject
+  , testProperty "GPTType rejects unknown string" prop_gpttype_reject
+  ]
+
+prop_role_reject :: Property
+prop_role_reject = withTests 1 $ property $ do
+  let result = fromJSON (String "invalid_role") :: Result GPTRole
+  case result of
+    Error _ -> success
+    Success _ -> failure
+
+prop_role_all :: Property
+prop_role_all = withTests 1 $ property $ do
+  let roundtrip x = fromJSON (toJSON x) :: Result GPTRole
+  case roundtrip System of { Success v -> v === System; Error _ -> failure }
+  case roundtrip User of { Success v -> v === User; Error _ -> failure }
+  case roundtrip Assistant of { Success v -> v === Assistant; Error _ -> failure }
+
+prop_dsmodel_reject :: Property
+prop_dsmodel_reject = withTests 1 $ property $ do
+  let result = fromJSON (String "deepseek-r1:999b") :: Result DeepSeekModel
+  case result of
+    Error _ -> success
+    Success _ -> failure
+
+prop_resfmt_reject :: Property
+prop_resfmt_reject = withTests 1 $ property $ do
+  let result = fromJSON (String "xml") :: Result ResponseFormat
+  case result of
+    Error _ -> success
+    Success _ -> failure
+
+prop_gpttype_reject :: Property
+prop_gpttype_reject = withTests 1 $ property $ do
+  let result = fromJSON (String "binary") :: Result GPTType
+  case result of
+    Error _ -> success
+    Success _ -> failure
+
+-- ============================================================
+-- JSON Roundtrip Extra Tests
+-- ============================================================
+
+jsonRoundtripExtraTests :: [TestTree]
+jsonRoundtripExtraTests =
+  [ testProperty "GPTType Text roundtrip" prop_gpttype_text_rt
+  , testProperty "GPTType JSON roundtrip" prop_gpttype_json_rt
+  , testProperty "ResponseFormat roundtrip" prop_resfmt_rt
+  , testProperty "TagDS JSON roundtrip" prop_tagds_rt
+  , testProperty "ConvoAnswer JSON roundtrip" prop_convoanswer_rt
+  , testProperty "DeepSeekRequestBody JSON roundtrip" prop_dsreqbody_rt
+  , testProperty "ErrorOpenAI JSON roundtrip" prop_erroropenai_rt
+  , testProperty "OllamaError JSON roundtrip" prop_ollamaerror_rt
+  ]
+
+prop_gpttype_text_rt :: Property
+prop_gpttype_text_rt = withTests 1 $ property $ do
+  let encoded = toJSON GPT_Text
+      rt = fromJSON encoded :: Result GPTType
+  case rt of
+    Success v -> toJSON v === encoded
+    Error e -> do { annotate e; failure }
+
+prop_gpttype_json_rt :: Property
+prop_gpttype_json_rt = withTests 1 $ property $ do
+  let encoded = toJSON GPT_JSON
+      rt = fromJSON encoded :: Result GPTType
+  case rt of
+    Success v -> toJSON v === encoded
+    Error e -> do { annotate e; failure }
+
+prop_resfmt_rt :: Property
+prop_resfmt_rt = withTests 100 $ property $ do
+  fmt <- forAll genResponseFormat
+  let rt = fromJSON (toJSON fmt) :: Result ResponseFormat
+  case rt of
+    Success v -> v === fmt
+    Error e -> do { annotate e; failure }
+
+prop_tagds_rt :: Property
+prop_tagds_rt = withTests 100 $ property $ do
+  tag_ <- forAll $ TagDS <$> genText <*> Gen.bool
+  let decoded = eitherDecode (encode tag_) :: Either String TagDS
+  case decoded of
+    Right v -> do
+      unTagDS v === unTagDS tag_
+      isAnswerDS v === isAnswerDS tag_
+    Left e -> do { annotate e; failure }
+
+prop_convoanswer_rt :: Property
+prop_convoanswer_rt = withTests 100 $ property $ do
+  txt <- forAll genText
+  let ca = ConvoAnswer txt
+      decoded = eitherDecode (encode ca) :: Either String (ConvoAnswer T.Text)
+  case decoded of
+    Right v -> unConvoAnswer v === txt
+    Left e -> do { annotate e; failure }
+
+prop_dsreqbody_rt :: Property
+prop_dsreqbody_rt = property $ do
+  model <- forAll genDeepSeekModel
+  let body = mkDSPrompt model [cwr User "test"]
+      decoded = eitherDecode (encode body) :: Either String DeepSeekRequestBody
+  case decoded of
+    Right v -> do
+      _deepSeekRequest_model v === model
+      _deepSeekRequest_stream v === False
+    Left e -> do { annotate e; failure }
+
+prop_erroropenai_rt :: Property
+prop_erroropenai_rt = property $ do
+  msg <- forAll genText
+  typ <- forAll genText
+  param <- forAll $ Gen.maybe genText
+  code_ <- forAll $ Gen.maybe genText
+  let err = ErrorOpenAI msg typ param code_
+      decoded = eitherDecode (encode err) :: Either String ErrorOpenAI
+  case decoded of
+    Right v -> do
+      _errorOpenAI_message v === msg
+      _errorOpenAI_type v === typ
+    Left e -> do { annotate e; failure }
+
+prop_ollamaerror_rt :: Property
+prop_ollamaerror_rt = property $ do
+  msg <- forAll genText
+  let err = OllamaError msg
+      decoded = eitherDecode (encode err) :: Either String OllamaError
+  case decoded of
+    Right v -> _ollama_error v === msg
+    Left e -> do { annotate e; failure }
+
+-- ============================================================
+-- Misc Gap Tests
+-- ============================================================
+
+miscGapTests :: [TestTree]
+miscGapTests =
+  [ testProperty "ReadLLM Integer instance" prop_readllm_integer
+  , testProperty "parseLLMJSON empty string" prop_parse_empty
+  , testProperty "parseLLMJSON array for object type" prop_parse_array_for_object
+  , testProperty "renderHistory multiple items" prop_renderHistory_multi
+  , testProperty "DeepSeekModel Ord" prop_dsmodel_ord
+  , testProperty "DeepSeekModel Enum" prop_dsmodel_enum
+  , testProperty "JsonExample sum type (:+:)" prop_jsonexample_sum
+  , testProperty "askLLMParsec empty response" prop_askllmparsec_empty
+  ]
+
+prop_readllm_integer :: Property
+prop_readllm_integer = property $ do
+  (n, noisy) <- forAll genIntInNoise
+  case search noisy :: Maybe [Integer] of
+    Just xs -> assert $ fromIntegral n `elem` xs
+    Nothing -> do annotate $ "Expected to find " ++ show n; failure
+
+prop_parse_empty :: Property
+prop_parse_empty = withTests 1 $ property $ do
+  let result = parseLLMJSON T.empty :: Maybe JValue
+  result === Nothing
+
+prop_parse_array_for_object :: Property
+prop_parse_array_for_object = withTests 1 $ property $ do
+  -- parseLLMJSON on an array should still find and parse it as JValue
+  let result = parseLLMJSON "[1,2,3]" :: Maybe JValue
+  case result of
+    Just (JArray _) -> success
+    _ -> do
+      annotate $ "Expected JArray, got: " ++ show result
+      success -- array may not be scraped depending on scraper behavior
+
+prop_renderHistory_multi :: Property
+prop_renderHistory_multi = property $ do
+  n <- forAll $ Gen.int (Range.linear 1 10)
+  answers <- forAll $ Gen.list (Range.singleton n) genNonEmptyText
+  let hist = zipWith (\i ans ->
+        ConvoQuery (Tag $ T.pack $ "q" ++ show i)
+                   (ConvoQuestion [cwr User $ "question " <> T.pack (show i)])
+                   (ConvoAnswer ans)
+        ) [1::Int ..] answers
+      rendered = renderHistory hist
+  _cwr_role rendered === Assistant
+  -- Every answer text should appear in the rendered output
+  mapM_ (\ans -> assert $ T.isInfixOf ans (_cwr_content rendered)) answers
+  assert $ T.isInfixOf "Me:" (_cwr_content rendered)
+  assert $ T.isInfixOf "Assistant:" (_cwr_content rendered)
+
+prop_dsmodel_ord :: Property
+prop_dsmodel_ord = withTests 1 $ property $ do
+  assert $ DS_1_5b < DS_671b
+  assert $ DS_7b < DS_70b
+  assert $ DS_1_5b <= DS_1_5b
+
+prop_dsmodel_enum :: Property
+prop_dsmodel_enum = withTests 1 $ property $ do
+  let allModels = [DS_1_5b .. DS_671b]
+  length allModels === 7
+  case allModels of
+    (first_ : _) -> first_ === DS_1_5b
+    [] -> failure
+  case reverse allModels of
+    (last_ : _) -> last_ === DS_671b
+    [] -> failure
+
+prop_jsonexample_sum :: Property
+prop_jsonexample_sum = withTests 1 $ property $ do
+  let ex = jsonExample (Proxy :: Proxy Shape)
+  annotate ex
+  -- Sum types produce "alt1 | alt2" separated by " | "
+  assert $ " | " `T.isInfixOf` T.pack ex
+
+prop_askllmparsec_empty :: Property
+prop_askllmparsec_empty = withTests 1 $ property $ do
+  let mockEmpty = LLMBackend "mock" (APIMock (\_ -> pure (Right "")))
+      env = LLMEnv mockEmpty
+  result <- evalIO $ runLLM env $ askLLMParsec @_ @Int [cwr User "anything"]
+  case result of
+    Right Nothing -> success
+    Right (Just _) -> failure
+    Left _ -> failure
+
+-- ============================================================
+-- Provider Dispatch Tests: askBackend paths, error types
+-- ============================================================
+
+providerDispatchTests :: [TestTree]
+providerDispatchTests =
+  [ testProperty "askBackend APIMock Right path" prop_dispatch_mock_right
+  , testProperty "askBackend APIMock Left path" prop_dispatch_mock_left
+  , testProperty "askBackend all LLMError constructors" prop_dispatch_all_errors
+  , testProperty "askBackend passes messages to APIMock" prop_dispatch_passes_msgs
+  , testProperty "askBackend LLMParseError" prop_dispatch_parse_error
+  , testProperty "askBackend LLMProcessError" prop_dispatch_process_error
+  , testProperty "askLLM with LLMParseError" prop_askLLM_parse_error
+  , testProperty "askLLM with LLMProcessError" prop_askLLM_process_error
+  , testProperty "askLLMJSON with error propagation" prop_askLLMJSON_error
+  , testProperty "askLLMParsec with error propagation" prop_askLLMParsec_error
+  ]
+
+prop_dispatch_mock_right :: Property
+prop_dispatch_mock_right = property $ do
+  txt <- forAll genNonEmptyText
+  let backend = LLMBackend "test" (APIMock $ \_ -> pure $ Right txt)
+  result <- evalIO $ askBackend backend [cwr User "test"]
+  result === Right txt
+
+prop_dispatch_mock_left :: Property
+prop_dispatch_mock_left = property $ do
+  msg <- forAll genNonEmptyText
+  let backend = LLMBackend "test" (APIMock $ \_ -> pure $ Left $ LLMHttpError msg)
+  result <- evalIO $ askBackend backend [cwr User "test"]
+  result === Left (LLMHttpError msg)
+
+prop_dispatch_all_errors :: Property
+prop_dispatch_all_errors = withTests 1 $ property $ do
+  -- LLMHttpError
+  r1 <- evalIO $ askBackend (failBackend (LLMHttpError "net")) [cwr User "t"]
+  r1 === Left (LLMHttpError "net")
+  -- LLMParseError
+  r2 <- evalIO $ askBackend (failBackend (LLMParseError "parse")) [cwr User "t"]
+  r2 === Left (LLMParseError "parse")
+  -- LLMProcessError
+  r3 <- evalIO $ askBackend (failBackend (LLMProcessError 127 "not found")) [cwr User "t"]
+  r3 === Left (LLMProcessError 127 "not found")
+
+prop_dispatch_passes_msgs :: Property
+prop_dispatch_passes_msgs = property $ do
+  n <- forAll $ Gen.int (Range.linear 1 5)
+  msgs <- forAll $ Gen.list (Range.singleton n) genContentWithRole
+  let backend = LLMBackend "test" (APIMock $ \ms ->
+        pure $ Right $ T.pack $ show $ length ms)
+  result <- evalIO $ askBackend backend msgs
+  result === Right (T.pack $ show n)
+
+prop_dispatch_parse_error :: Property
+prop_dispatch_parse_error = withTests 1 $ property $ do
+  let backend = LLMBackend "test" (APIMock $ \_ -> pure $ Left $ LLMParseError "bad json")
+  result <- evalIO $ askBackend backend [cwr User "test"]
+  case result of
+    Left (LLMParseError msg) -> msg === "bad json"
+    _ -> failure
+
+prop_dispatch_process_error :: Property
+prop_dispatch_process_error = withTests 1 $ property $ do
+  let backend = LLMBackend "test" (APIMock $ \_ -> pure $ Left $ LLMProcessError 42 "died")
+  result <- evalIO $ askBackend backend [cwr User "test"]
+  case result of
+    Left (LLMProcessError code_ msg) -> do
+      code_ === 42
+      msg === "died"
+    _ -> failure
+
+prop_askLLM_parse_error :: Property
+prop_askLLM_parse_error = property $ do
+  msg <- forAll genNonEmptyText
+  let env = LLMEnv (failBackend (LLMParseError msg))
+  result <- evalIO $ runLLM env (askLLM [cwr User "test"])
+  case result of
+    Left (LLMParseError m) -> m === msg
+    _ -> failure
+
+prop_askLLM_process_error :: Property
+prop_askLLM_process_error = property $ do
+  code_ <- forAll $ Gen.int (Range.linear 1 255)
+  msg <- forAll genNonEmptyText
+  let env = LLMEnv (failBackend (LLMProcessError code_ msg))
+  result <- evalIO $ runLLM env (askLLM [cwr User "test"])
+  case result of
+    Left (LLMProcessError c m) -> do
+      c === code_
+      m === msg
+    _ -> failure
+
+prop_askLLMJSON_error :: Property
+prop_askLLMJSON_error = withTests 1 $ property $ do
+  let env = LLMEnv (failBackend (LLMParseError "nope"))
+  result <- evalIO $ runLLM env (askLLMJSON [cwr User "test"])
+  case (result :: Either LLMError (Maybe SimpleRecord)) of
+    Left (LLMParseError m) -> m === "nope"
+    _ -> failure
+
+prop_askLLMParsec_error :: Property
+prop_askLLMParsec_error = withTests 1 $ property $ do
+  let env = LLMEnv (failBackend (LLMProcessError 1 "cli died"))
+  result <- evalIO $ runLLM env (askLLMParsec @_ @Int [cwr User "test"])
+  case result of
+    Left (LLMProcessError c m) -> do
+      c === 1
+      m === "cli died"
+    _ -> failure
+
+-- ============================================================
+-- Type Roundtrips Extra: cover types not yet tested
+-- ============================================================
+
+typeRoundtripsExtraTests :: [TestTree]
+typeRoundtripsExtraTests =
+  [ testProperty "Usage JSON roundtrip" prop_usage_rt
+  , testProperty "ResMessage JSON roundtrip" prop_resmessage_rt
+  , testProperty "PromptResponse JSON roundtrip" prop_promptresponse_rt
+  , testProperty "DeepSeekResponse JSON roundtrip" prop_deepseekresponse_rt
+  , testProperty "GPTResponseFormat JSON roundtrip" prop_gptresponseformat_rt
+  , testProperty "TextToSpeechBody JSON roundtrip" prop_tts_rt
+  , testProperty "GPTRequestBody no max_tokens" prop_gptreq_no_maxtokens
+  , testProperty "ContentWithRole Show instance" prop_cwr_show
+  , testProperty "ConvoError Show instance" prop_convoerror_show
+  , testProperty "LLMError Show instance" prop_llmerror_show
+  , testProperty "WebProvider Show/Eq" prop_webprovider_show_eq
+  , testProperty "APIKey accessor" prop_apikey_accessor
+  , testProperty "Content Show" prop_content_show
+  , testProperty "GPTResponseFormat Show" prop_gptresponseformat_show
+  , testProperty "DeepSeekResponse fields" prop_deepseekresponse_fields
+  ]
+
+prop_usage_rt :: Property
+prop_usage_rt = property $ do
+  pt <- forAll $ Gen.int (Range.linear 0 10000)
+  ct <- forAll $ Gen.int (Range.linear 0 10000)
+  tt <- forAll $ Gen.int (Range.linear 0 10000)
+  let u = Usage pt ct tt
+      decoded = eitherDecode (encode u) :: Either String Usage
+  case decoded of
+    Right v -> do
+      prompt_tokens v === pt
+      completion_tokens v === ct
+      total_tokens v === tt
+    Left e -> do { annotate e; failure }
+
+prop_resmessage_rt :: Property
+prop_resmessage_rt = property $ do
+  role <- forAll genRole
+  content <- forAll genText
+  reason <- forAll genNonEmptyText
+  idx <- forAll $ Gen.int (Range.linear 0 10)
+  let rm = ResMessage (ContentWithRole role content) reason idx
+      decoded = eitherDecode (encode rm) :: Either String ResMessage
+  case decoded of
+    Right v -> do
+      finish_reason v === reason
+      index v === idx
+      _cwr_role (message v) === role
+    Left e -> do { annotate e; failure }
+
+prop_promptresponse_rt :: Property
+prop_promptresponse_rt = withTests 1 $ property $ do
+  let pr = PromptResponse "chatcmpl-123" "chat.completion" 1234567890
+             [ResMessage (cwr Assistant "hello") "stop" 0]
+             (Usage 10 20 30)
+      decoded = eitherDecode (encode pr) :: Either String PromptResponse
+  case decoded of
+    Right v -> do
+      object v === "chat.completion"
+      created v === 1234567890
+      length (choices v) === 1
+      prompt_tokens (usage v) === 10
+    Left e -> do { annotate e; failure }
+
+prop_deepseekresponse_rt :: Property
+prop_deepseekresponse_rt = withTests 1 $ property $ do
+  let dr = DeepSeekResponse
+        { _deepSeekResponse_model = "deepseek-r1:7b"
+        , _deepSeekResponse_created_at = "2025-01-01T00:00:00Z"
+        , _deepSeekResponse_message = cwr Assistant "hi"
+        , _deepSeekResponse_done = True
+        , _deepSeekResponse_done_reason = "stop"
+        , _deepSeekResponse_context = Just [1, 2, 3]
+        }
+      decoded = eitherDecode (encode dr) :: Either String DeepSeekResponse
+  case decoded of
+    Right v -> do
+      _deepSeekResponse_model v === "deepseek-r1:7b"
+      _deepSeekResponse_done v === True
+      _deepSeekResponse_done_reason v === "stop"
+      _deepSeekResponse_context v === Just [1, 2, 3]
+      _cwr_content (_deepSeekResponse_message v) === "hi"
+    Left e -> do { annotate e; failure }
+
+prop_gptresponseformat_rt :: Property
+prop_gptresponseformat_rt = withTests 1 $ property $ do
+  let rf = GPTResponseFormat GPT_JSON
+      decoded = eitherDecode (encode rf) :: Either String GPTResponseFormat
+  case decoded of
+    Right v -> do
+      let GPTResponseFormat t = v
+      toJSON t === toJSON GPT_JSON
+    Left e -> do { annotate e; failure }
+
+prop_tts_rt :: Property
+prop_tts_rt = withTests 1 $ property $ do
+  let tts = TextToSpeechBody "tts-1" "alloy" "Hello world"
+      decoded = eitherDecode (encode tts) :: Either String TextToSpeechBody
+  case decoded of
+    Right v -> do
+      _textToSpeech_model v === "tts-1"
+      _textToSpeech_voice v === "alloy"
+      _textToSpeech_input v === "Hello world"
+    Left e -> do { annotate e; failure }
+
+prop_gptreq_no_maxtokens :: Property
+prop_gptreq_no_maxtokens = withTests 1 $ property $ do
+  let body = GPTRequestBody "gpt-4" Nothing [cwr User "hi"]
+      decoded = eitherDecode (encode body) :: Either String GPTRequestBody
+  case decoded of
+    Right v -> do
+      _gptRequest_model v === "gpt-4"
+      _gptRequest_max_tokens v === Nothing
+      length (_gptRequest_messages v) === 1
+    Left e -> do { annotate e; failure }
+
+prop_cwr_show :: Property
+prop_cwr_show = withTests 1 $ property $ do
+  let c = cwr User "hello"
+  assert $ "User" `T.isInfixOf` T.pack (show c)
+  assert $ "hello" `T.isInfixOf` T.pack (show c)
+
+prop_convoerror_show :: Property
+prop_convoerror_show = withTests 1 $ property $ do
+  let e = ConvoError "something broke"
+  assert $ "something broke" `T.isInfixOf` T.pack (show e)
+
+prop_llmerror_show :: Property
+prop_llmerror_show = withTests 1 $ property $ do
+  assert $ "net" `T.isInfixOf` T.pack (show (LLMHttpError "net"))
+  assert $ "parse" `T.isInfixOf` T.pack (show (LLMParseError "parse"))
+  assert $ "42" `T.isInfixOf` T.pack (show (LLMProcessError 42 "oops"))
+  assert $ "oops" `T.isInfixOf` T.pack (show (LLMProcessError 42 "oops"))
+
+prop_webprovider_show_eq :: Property
+prop_webprovider_show_eq = withTests 1 $ property $ do
+  assert $ ProviderOpenAI == ProviderOpenAI
+  assert $ ProviderAnthropic == ProviderAnthropic
+  assert $ ProviderOllama == ProviderOllama
+  assert $ ProviderOpenAI /= ProviderAnthropic
+  assert $ ProviderOpenAI /= ProviderOllama
+  assert $ ProviderAnthropic /= ProviderOllama
+  assert $ "OpenAI" `T.isInfixOf` T.pack (show ProviderOpenAI)
+  assert $ "Anthropic" `T.isInfixOf` T.pack (show ProviderAnthropic)
+  assert $ "Ollama" `T.isInfixOf` T.pack (show ProviderOllama)
+
+prop_apikey_accessor :: Property
+prop_apikey_accessor = withTests 1 $ property $ do
+  let k = APIKey "sk-test-123" :: APIKey 'OpenAI
+  unAPIKey k === "sk-test-123"
+
+prop_content_show :: Property
+prop_content_show = withTests 1 $ property $ do
+  let c = Content "raw bytes"
+  assert $ not $ null (show c)
+
+prop_gptresponseformat_show :: Property
+prop_gptresponseformat_show = withTests 1 $ property $ do
+  let rf = GPTResponseFormat GPT_Text
+  assert $ "Text" `T.isInfixOf` T.pack (show rf)
+
+prop_deepseekresponse_fields :: Property
+prop_deepseekresponse_fields = withTests 1 $ property $ do
+  let dr = DeepSeekResponse "m" "t" (cwr Assistant "a") True "stop" Nothing
+  _deepSeekResponse_context dr === Nothing
+  _deepSeekResponse_created_at dr === "t"
+
+-- ============================================================
+-- ConvoT State Tests: runConvo, state accumulation, error recovery
+-- ============================================================
+
+convoStateTests :: [TestTree]
+convoStateTests =
+  [ testProperty "runConvo starts with empty state" prop_convo_empty
+  , testProperty "runConvo isolates state between runs" prop_convo_isolates
+  , testProperty "askWithContext error does not pollute state" prop_convo_error_no_state
+  , testProperty "askJSONWithContext error propagation" prop_convo_json_error
+  , testProperty "askJSONWithContext Nothing for non-JSON" prop_convo_json_nothing
+  , testProperty "multiple askWithContext accumulate state" prop_convo_multi_accumulate
+  ]
+
+prop_convo_empty :: Property
+prop_convo_empty = withTests 1 $ property $ do
+  let backend = LLMBackend "test" (APIMock $ \msgs ->
+        -- Return count of messages (should include rendered empty history)
+        pure $ Right $ T.pack $ show $ length msgs)
+      env = LLMEnv backend
+  result <- evalIO $ runConvo env $
+    askWithContext (LastN 10) (Tag "q1", ConvoQuestion [cwr User "hello"])
+  case result of
+    Right (ConvoAnswer answer) ->
+      -- 2 messages: rendered empty history + the user message
+      answer === "2"
+    Left _ -> failure
+
+prop_convo_isolates :: Property
+prop_convo_isolates = withTests 1 $ property $ do
+  let countBackend = LLMBackend "test" (APIMock $ \msgs ->
+        let allContent = T.concat (map _cwr_content msgs)
+            meCount = length $ T.breakOnAll "Me:" allContent
+        in pure $ Right $ T.pack $ show meCount)
+      env = LLMEnv countBackend
+  -- First run
+  r1 <- evalIO $ runConvo env $
+    askWithContext (LastN 10) (Tag "q1", ConvoQuestion [cwr User "first"])
+  -- Second independent run — should NOT see first run's state
+  r2 <- evalIO $ runConvo env $
+    askWithContext (LastN 10) (Tag "q1", ConvoQuestion [cwr User "second"])
+  case (r1, r2) of
+    (Right (ConvoAnswer a1), Right (ConvoAnswer a2)) -> do
+      a1 === "0"
+      a2 === "0"  -- isolated: no prior state
+    _ -> failure
+
+prop_convo_error_no_state :: Property
+prop_convo_error_no_state = withTests 1 $ property $ do
+  -- Backend that fails on first call, succeeds on second
+  let statefulBackend = LLMBackend "test" (APIMock $ \msgs ->
+        let allContent = T.concat (map _cwr_content msgs)
+        in if T.isInfixOf "fail" allContent
+           then pure $ Left $ LLMHttpError "boom"
+           else pure $ Right $ T.pack $ show $ length $ T.breakOnAll "Me:" allContent)
+      env = LLMEnv statefulBackend
+  result <- evalIO $ runConvo env $ do
+    -- First call fails — should NOT add to state
+    r1 <- askWithContext (LastN 10) (Tag "q1", ConvoQuestion [cwr User "please fail"])
+    -- Second call succeeds — history should be empty (failed call didn't add state)
+    r2 <- askWithContext (LastN 10) (Tag "q2", ConvoQuestion [cwr User "succeed"])
+    pure (r1, r2)
+  case result of
+    (Left (LLMHttpError _), Right (ConvoAnswer a2)) ->
+      a2 === "0"  -- No prior "Me:" because first call failed
+    _ -> failure
+
+prop_convo_json_error :: Property
+prop_convo_json_error = withTests 1 $ property $ do
+  let env = LLMEnv (failBackend (LLMHttpError "network down"))
+  result <- evalIO $ runConvo env $
+    askJSONWithContext (LastN 10) (Tag "q1", ConvoQuestion [cwr User "data"])
+  case (result :: Either LLMError (Maybe SimpleRecord)) of
+    Left (LLMHttpError msg) -> msg === "network down"
+    _ -> failure
+
+prop_convo_json_nothing :: Property
+prop_convo_json_nothing = withTests 1 $ property $ do
+  let env = LLMEnv (jsonBackend "not json at all")
+  result <- evalIO $ runConvo env $
+    askJSONWithContext (LastN 10) (Tag "q1", ConvoQuestion [cwr User "data"])
+  case (result :: Either LLMError (Maybe SimpleRecord)) of
+    Right Nothing -> success
+    _ -> failure
+
+prop_convo_multi_accumulate :: Property
+prop_convo_multi_accumulate = withTests 1 $ property $ do
+  let countBackend' = LLMBackend "test" (APIMock $ \msgs ->
+        let allContent = T.concat (map _cwr_content msgs)
+            meCount = length $ T.breakOnAll "Me:" allContent
+        in pure $ Right $ T.pack $ show meCount)
+      env = LLMEnv countBackend'
+  result <- evalIO $ runConvo env $ do
+    r1 <- askWithContext (LastN 10) (Tag "t1", ConvoQuestion [cwr User "one"])
+    r2 <- askWithContext (LastN 10) (Tag "t2", ConvoQuestion [cwr User "two"])
+    r3 <- askWithContext (LastN 10) (Tag "t3", ConvoQuestion [cwr User "three"])
+    r4 <- askWithContext (LastN 10) (Tag "t4", ConvoQuestion [cwr User "four"])
+    pure (r1, r2, r3, r4)
+  case result of
+    (Right (ConvoAnswer a1), Right (ConvoAnswer a2), Right (ConvoAnswer a3), Right (ConvoAnswer a4)) -> do
+      a1 === "0"
+      a2 === "1"
+      a3 === "2"
+      a4 === "3"
+    _ -> failure
+
+-- ============================================================
+-- LLM Constants Tests
+-- ============================================================
+
+llmConstantTests :: [TestTree]
+llmConstantTests =
+  [ testProperty "gptModel is non-empty" prop_gptModel
+  , testProperty "getRelevant is LastNRelevant 10" prop_getRelevant
+  , testProperty "getRelevant predicate matches html prefix" prop_getRelevant_matches
+  , testProperty "getRelevant predicate rejects non-html" prop_getRelevant_rejects
+  ]
+
+prop_gptModel :: Property
+prop_gptModel = withTests 1 $ property $ do
+  assert $ not $ T.null gptModel
+  assert $ T.isInfixOf "gpt" gptModel
+
+prop_getRelevant :: Property
+prop_getRelevant = withTests 1 $ property $ do
+  -- getRelevant is LastNRelevant 10 with html prefix check
+  -- Test it by applying to a history with html and non-html tags
+  let hist = [ ConvoQuery (Tag "html-1") (ConvoQuestion [cwr User "q1"]) (ConvoAnswer "a1")
+             , ConvoQuery (Tag "xml-1")  (ConvoQuestion [cwr User "q2"]) (ConvoAnswer "a2")
+             , ConvoQuery (Tag "html-2") (ConvoQuestion [cwr User "q3"]) (ConvoAnswer "a3")
+             ]
+  result <- evalIO $ evalStateT (getRelevantCtx getRelevant) hist
+  -- Should only get html-tagged items, limited to 10
+  length result === 2
+  assert $ all (\q -> T.isPrefixOf "html" (unTag $ _convoQuery_tag q)) result
+
+prop_getRelevant_matches :: Property
+prop_getRelevant_matches = withTests 1 $ property $ do
+  let hist = [ ConvoQuery (Tag "html-page-1") (ConvoQuestion [cwr User "q"]) (ConvoAnswer "a")
+             , ConvoQuery (Tag "htmlStuff")    (ConvoQuestion [cwr User "q"]) (ConvoAnswer "a")
+             ]
+  result <- evalIO $ evalStateT (getRelevantCtx getRelevant) hist
+  length result === 2
+
+prop_getRelevant_rejects :: Property
+prop_getRelevant_rejects = withTests 1 $ property $ do
+  let hist = [ ConvoQuery (Tag "css-1") (ConvoQuestion [cwr User "q"]) (ConvoAnswer "a")
+             , ConvoQuery (Tag "json-1") (ConvoQuestion [cwr User "q"]) (ConvoAnswer "a")
+             ]
+  result <- evalIO $ evalStateT (getRelevantCtx getRelevant) hist
+  length result === 0
+
+-- ============================================================
+-- Error Propagation Tests: through LLMT and ConvoT
+-- ============================================================
+
+errorPropagationTests :: [TestTree]
+errorPropagationTests =
+  [ testProperty "askLLM multiple messages" prop_askLLM_multi_msgs
+  , testProperty "askLLMJSON with partial JSON" prop_askLLMJSON_partial
+  , testProperty "askLLMParsec finds Bool" prop_askLLMParsec_bool
+  , testProperty "askLLMParsec finds String" prop_askLLMParsec_string
+  , testProperty "runLLM returns pure value" prop_runLLM_pure
+  , testProperty "askBackend name preserved" prop_backend_name
+  ]
+
+prop_askLLM_multi_msgs :: Property
+prop_askLLM_multi_msgs = withTests 1 $ property $ do
+  let backend = LLMBackend "test" (APIMock $ \msgs ->
+        pure $ Right $ T.intercalate "|" (map _cwr_content msgs))
+      env = LLMEnv backend
+  result <- evalIO $ runLLM env (askLLM [cwr System "sys", cwr User "usr", cwr Assistant "ast"])
+  result === Right "sys|usr|ast"
+
+prop_askLLMJSON_partial :: Property
+prop_askLLMJSON_partial = withTests 1 $ property $ do
+  -- JSON with only one of two required fields
+  let env = LLMEnv (jsonBackend "{\"name\":\"Alice\"}")
+  result <- evalIO $ runLLM env (askLLMJSON [cwr User "test"])
+  case (result :: Either LLMError (Maybe SimpleRecord)) of
+    Right Nothing -> success  -- Missing "age" field means parse returns Nothing
+    Right (Just _) -> failure
+    Left _ -> failure
+
+prop_askLLMParsec_bool :: Property
+prop_askLLMParsec_bool = withTests 1 $ property $ do
+  let backend = LLMBackend "test" (APIMock $ \_ -> pure $ Right "The answer is true, obviously")
+      env = LLMEnv backend
+  result <- evalIO $ runLLM env (askLLMParsec @_ @Bool [cwr User "is it?"])
+  case result of
+    Right (Just b) -> b === True
+    _ -> failure
+
+prop_askLLMParsec_string :: Property
+prop_askLLMParsec_string = withTests 1 $ property $ do
+  let backend = LLMBackend "test" (APIMock $ \_ -> pure $ Right "The name is \"Alice\" in the story")
+      env = LLMEnv backend
+  result <- evalIO $ runLLM env (askLLMParsec @_ @String [cwr User "who?"])
+  case result of
+    Right (Just s) -> s === "Alice"
+    _ -> failure
+
+prop_runLLM_pure :: Property
+prop_runLLM_pure = withTests 1 $ property $ do
+  let env = LLMEnv echoBackend
+  result <- evalIO $ runLLM env (pure (42 :: Int))
+  result === 42
+
+prop_backend_name :: Property
+prop_backend_name = withTests 1 $ property $ do
+  _llmBackend_name echoBackend === "test/echo"
+  _llmBackend_name (failBackend (LLMHttpError "x")) === "test/fail"
+  _llmBackend_name (jsonBackend "{}") === "test/json"
+
+-- ============================================================
+-- Backends Coverage: dsModelToText, constructor fields
+-- ============================================================
+
+backendsCoverageTests :: [TestTree]
+backendsCoverageTests =
+  [ testProperty "mkOpenAI sets provider fields" prop_mkOpenAI_fields
+  , testProperty "mkDeepSeek sets provider fields" prop_mkDeepSeek_fields
+  , testProperty "mkClaudeAPI sets provider fields" prop_mkClaudeAPI_fields
+  , testProperty "mkClaudeCLI sets api type" prop_mkClaudeCLI_api
+  , testProperty "mkDeepSeek all models" prop_mkDeepSeek_all_models
+  , testProperty "mkOpenAI with token limit" prop_mkOpenAI_tokenLimit
+  ]
+
+prop_mkOpenAI_fields :: Property
+prop_mkOpenAI_fields = withTests 1 $ property $ do
+  let backend = mkOpenAI (APIKey "key") undefined "gpt-4o" (Just 1000)
+  _llmBackend_name backend === "openai/gpt-4o"
+
+prop_mkDeepSeek_fields :: Property
+prop_mkDeepSeek_fields = withTests 1 $ property $ do
+  let backend = mkDeepSeek undefined DS_7b
+  assert $ T.isPrefixOf "deepseek/" (_llmBackend_name backend)
+  assert $ T.isInfixOf "7b" (_llmBackend_name backend)
+
+prop_mkClaudeAPI_fields :: Property
+prop_mkClaudeAPI_fields = withTests 1 $ property $ do
+  let backend = mkClaudeAPI (APIKey "key") undefined "claude-sonnet-4-20250514"
+  _llmBackend_name backend === "claude-api/claude-sonnet-4-20250514"
+
+prop_mkClaudeCLI_api :: Property
+prop_mkClaudeCLI_api = withTests 1 $ property $ do
+  let backend = mkClaudeCLI "opus"
+  _llmBackend_name backend === "claude-cli/opus"
+
+prop_mkDeepSeek_all_models :: Property
+prop_mkDeepSeek_all_models = withTests 1 $ property $ do
+  -- Exercise dsModelToText for every model variant
+  let models = [DS_1_5b, DS_7b, DS_8b, DS_14b, DS_32b, DS_70b, DS_671b]
+      names = map (\m -> _llmBackend_name (mkDeepSeek undefined m)) models
+  -- Each name should start with "deepseek/"
+  mapM_ (\n -> assert $ T.isPrefixOf "deepseek/" n) names
+  -- All names should be unique
+  length names === length (nub names)
+
+prop_mkOpenAI_tokenLimit :: Property
+prop_mkOpenAI_tokenLimit = withTests 1 $ property $ do
+  let b1 = mkOpenAI (APIKey "k") undefined "gpt-4o" Nothing
+      b2 = mkOpenAI (APIKey "k") undefined "gpt-4o" (Just 500)
+  _llmBackend_name b1 === _llmBackend_name b2

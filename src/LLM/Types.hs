@@ -7,7 +7,10 @@
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
--- | Core types for the llm-with-context library.
+-- | Description: Core types for the llm-with-context library.
+-- Copyright: (c) lazyLambda, 2024-2026
+-- License: MIT
+-- Maintainer: galen.sprout@gmail.com
 --
 -- Provides request\/response types for both the OpenAI (GPT) and DeepSeek\/Ollama
 -- backends, a type-safe phantom-typed 'APIKey', conversation history management
@@ -15,15 +18,15 @@
 -- ('RelevantContext', 'RelevantContextDS') for stateful multi-turn conversations.
 module LLM.Types where
 
-import LLM.ScrubPrefix
+import LLM.ScrubPrefix (scrubPrefix)
 
-import Control.Monad.Trans.State
-import Data.Default
+import Control.Monad.Trans.State (StateT)
+import Data.Default (Default(..))
 import Data.Aeson
-import Data.Aeson.TH
+import Data.Aeson.TH (deriveJSON)
 import qualified Data.Text as T
-import Data.ByteString.Lazy as LBS
-import GHC.Generics
+import qualified Data.ByteString.Lazy as BL
+import GHC.Generics (Generic)
 
 
 -- | Supported API providers, used as a phantom type on 'APIKey'.
@@ -108,7 +111,7 @@ data Usage = Usage { prompt_tokens :: Int
 
 
 -- | Wrapper for a raw GPT response body (unparsed JSON bytes).
-data Content = Content { unContent :: LBS.ByteString } deriving Show
+data Content = Content { unContent :: BL.ByteString } deriving Show
 
 -- | Request body for the OpenAI text-to-speech endpoint.
 data TextToSpeechBody = TextToSpeechBody

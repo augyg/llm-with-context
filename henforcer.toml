@@ -1,0 +1,97 @@
+[forAnyModule]
+# Require all module header fields
+moduleHeaderDescriptionMustExistNonEmpty = true
+moduleHeaderCopyrightMustExistNonEmpty = true
+moduleHeaderLicenseMustExistNonEmpty = true
+moduleHeaderMaintainerMustExistNonEmpty = true
+
+# Documentation: all exports must be documented
+maximumExportsPlusHeaderUndocumented = 0
+
+# Tight open import limit — nearly everything must use explicit import lists
+allowedOpenUnaliasedImports = 2
+
+# Import aliases must be unique across a module
+allowedAliasUniqueness = { allAliasesUniqueExcept = [], note = "All import aliases must be unique" }
+
+# Standard qualified import conventions
+[[forAnyModule.allowedQualifications]]
+module = "Data.Text"
+[[forAnyModule.allowedQualifications.importScheme]]
+qualified = { qualifiedPre = true, qualifiedPost = true }
+alias = "T"
+
+[[forAnyModule.allowedQualifications]]
+module = "Data.Map"
+[[forAnyModule.allowedQualifications.importScheme]]
+qualified = { qualifiedPre = true, qualifiedPost = true }
+alias = "Map"
+
+[[forAnyModule.allowedQualifications]]
+module = "Data.Map.Strict"
+[[forAnyModule.allowedQualifications.importScheme]]
+qualified = { qualifiedPre = true, qualifiedPost = true }
+alias = "Map"
+
+[[forAnyModule.allowedQualifications]]
+module = "Data.ByteString.Lazy"
+[[forAnyModule.allowedQualifications.importScheme]]
+qualified = { qualifiedPre = true, qualifiedPost = true }
+alias = "BL"
+
+[[forAnyModule.allowedQualifications]]
+module = "Data.Text.Encoding"
+[[forAnyModule.allowedQualifications.importScheme]]
+qualified = { qualifiedPre = true, qualifiedPost = true }
+alias = "TE"
+
+[[forAnyModule.allowedQualifications]]
+module = "Data.Aeson"
+[[forAnyModule.allowedQualifications.importScheme]]
+qualified = { qualifiedPre = true, qualifiedPost = true }
+alias = "Aeson"
+[[forAnyModule.allowedQualifications.importScheme]]
+qualified = { qualifiedPre = true, qualifiedPost = true, unqualified = true }
+
+[[forAnyModule.allowedQualifications]]
+module = "Control.Exception"
+[[forAnyModule.allowedQualifications.importScheme]]
+qualified = { qualifiedPre = true, qualifiedPost = true }
+alias = "CE"
+
+[[forAnyModule.allowedQualifications]]
+module = "Text.Parsec"
+[[forAnyModule.allowedQualifications.importScheme]]
+qualified = { qualifiedPre = true, qualifiedPost = true }
+alias = "Psc"
+[[forAnyModule.allowedQualifications.importScheme]]
+qualified = { qualifiedPre = true, qualifiedPost = true, unqualified = true }
+
+# Encapsulate Provider internals — only LLM.Provider is the public interface
+encapsulatedTrees = ["LLM.Provider"]
+
+# Module tree dependency enforcement
+[[forAnyModule.treeDependencies]]
+moduleTree = "LLM.Types"
+dependencies = ["LLM.ScrubPrefix"]
+note = "Types may only depend on ScrubPrefix"
+
+[[forAnyModule.treeDependencies]]
+moduleTree = "LLM.ScrubPrefix"
+dependencies = []
+note = "ScrubPrefix is a leaf — no LLM.* dependencies"
+
+[[forAnyModule.treeDependencies]]
+moduleTree = "LLM.StaticURI"
+dependencies = []
+note = "StaticURI is a leaf — no LLM.* dependencies"
+
+[[forAnyModule.treeDependencies]]
+moduleTree = "LLM.ReadLLM"
+dependencies = []
+note = "ReadLLM is a leaf — no LLM.* dependencies"
+
+[[forAnyModule.treeDependencies]]
+moduleTree = "LLM.JsonExample"
+dependencies = []
+note = "JsonExample is a leaf — no LLM.* dependencies"
