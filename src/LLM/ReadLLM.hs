@@ -1,5 +1,9 @@
 {-# LANGUAGE FlexibleInstances #-}
 
+-- | Description: Parsec-based typeclass for extracting typed values from LLM output.
+-- Copyright: (c) lazyLambda, 2024-2026
+-- License: MIT
+-- Maintainer: galen.sprout@gmail.com
 module LLM.ReadLLM
   ( ReadLLM(..)
   ) where

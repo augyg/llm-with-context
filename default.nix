@@ -4,6 +4,7 @@
 , text, transformers
 , scrappy-core
 , scrappy-json
+, henforcer
 , pkgs, mkDerivation
 }:
 mkDerivation {
@@ -13,7 +14,7 @@ mkDerivation {
   libraryHaskellDepends = [
     aeson base bytestring containers data-default directory http-client
     http-client-tls http-types network-uri parsec process scrappy-core
-    scrappy-json text transformers
+    scrappy-json henforcer text transformers
   ];
   license = lib.licenses.mit;
 }
