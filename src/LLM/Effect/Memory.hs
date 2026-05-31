@@ -54,9 +54,9 @@ import LLM.LLM (selectRelevant)
 import LLM.Types
   ( ContentWithRole (..)
   , ConversationHistory
-  , GPTAnswer (..)
-  , GPTQuery (..)
-  , GPTQuestion (..)
+  , ConvoAnswer (..)
+  , ConvoQuery (..)
+  , ConvoQuestion (..)
   , RelevantContext
   , Tag (..)
   )
@@ -86,7 +86,7 @@ data Memory :: Effect where
   Recall :: RelevantContext -> Memory m ConversationHistory
   RecallAll :: Memory m ConversationHistory
   RecallPinned :: Memory m ConversationHistory
-  Remember :: GPTQuery T.Text -> Memory m ()
+  Remember :: ConvoQuery T.Text -> Memory m ()
   Forget :: Memory m ()
   Prune :: Int -> Memory m ()
   ForgetWhere :: (Tag -> Bool) -> Memory m ()
@@ -115,7 +115,7 @@ recallPinned :: (Memory :> es) => Eff es ConversationHistory
 recallPinned = send RecallPinned
 
 -- | Append a question/answer turn to the history.
-remember :: (Memory :> es) => GPTQuery T.Text -> Eff es ()
+remember :: (Memory :> es) => ConvoQuery T.Text -> Eff es ()
 remember = send . Remember
 
 -- | Clear ALL history (pin set retained).
@@ -140,7 +140,7 @@ unpin = send . Unpin
 
 -- | Inject a synthetic turn carrying free-form text (e.g. a fact to seed, or a
 -- compaction summary). NOTE: the originally-proposed 'GPTRole' argument is
--- dropped — 'GPTQuery' has no role field and 'LLM.LLM.renderHistory' ignores
+-- dropped — 'ConvoQuery' has no role field and 'LLM.LLM.renderHistory' ignores
 -- role, so a role here would be a silent no-op. The note is stored as a turn
 -- tagged @"note"@ with an empty question and the text as the answer.
 note :: (Memory :> es) => T.Text -> Eff es ()
@@ -180,16 +180,16 @@ estimateTokens t
   | otherwise = max 1 (T.length t `div` 4)
 
 -- | Estimated tokens of one turn (its question contents + its answer).
-queryTokens :: GPTQuery T.Text -> Int
-queryTokens (GPTQuery _ (GPTQuestion q) (GPTAnswer a)) =
+queryTokens :: ConvoQuery T.Text -> Int
+queryTokens (ConvoQuery _ (ConvoQuestion q) (ConvoAnswer a)) =
   sum (map (estimateTokens . _cwr_content) q) + estimateTokens a
 
 -- | Estimated tokens of an entire history.
 historyTokens :: ConversationHistory -> Int
 historyTokens = sum . map queryTokens
 
-isPinned :: [Tag] -> GPTQuery T.Text -> Bool
-isPinned pinned q = _gptQuery_tag q `elem` pinned
+isPinned :: [Tag] -> ConvoQuery T.Text -> Bool
+isPinned pinned q = _convoQuery_tag q `elem` pinned
 
 -- | Default in-memory backend: interpret 'Memory' over effectful's 'State'.
 -- The 'State' is left in @es@ for a later @evalState emptyMemoryStore@.
@@ -210,7 +210,7 @@ runMemoryState = interpret $ \_ -> \case
   Unpin t -> modify (\ms -> ms { _memoryStore_pinned = filter (/= t) (_memoryStore_pinned ms) })
   Note txt -> modify (\ms ->
     ms { _memoryStore_history =
-           GPTQuery (Tag "note") (GPTQuestion []) (GPTAnswer txt) : _memoryStore_history ms })
+           ConvoQuery (Tag "note") (ConvoQuestion []) (ConvoAnswer txt) : _memoryStore_history ms })
   TrimToTokens n -> modify (trimToTokens' n)
   TokenCount -> gets (historyTokens . _memoryStore_history)
   TurnCount -> gets (length . _memoryStore_history)
@@ -229,12 +229,12 @@ runMemoryState = interpret $ \_ -> \case
       ms { _memoryStore_history =
              [ q
              | q <- _memoryStore_history ms
-             , isPinned (_memoryStore_pinned ms) q || not (p (_gptQuery_tag q))
+             , isPinned (_memoryStore_pinned ms) q || not (p (_convoQuery_tag q))
              ] }
     amendLast' txt ms = case _memoryStore_history ms of
       [] -> ms
-      (GPTQuery t q _ : rest) ->
-        ms { _memoryStore_history = GPTQuery t q (GPTAnswer txt) : rest }
+      (ConvoQuery t q _ : rest) ->
+        ms { _memoryStore_history = ConvoQuery t q (ConvoAnswer txt) : rest }
     -- drop oldest unpinned turns one at a time until under budget; stop if only
     -- pinned turns remain. O(n^2) but conversation histories are small.
     trimToTokens' budget ms = ms { _memoryStore_history = go (_memoryStore_history ms) }

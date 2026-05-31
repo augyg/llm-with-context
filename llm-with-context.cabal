@@ -74,6 +74,13 @@ library
                     , parsec
                     , process
                     , scrappy-core
+                    -- scrappy-json: locate + extract JSON from noisy LLM output
+                    -- (LLM.Provider / LLM.ReadLLM / LLM.JsonExample, merged from
+                    -- upstream master).
+                    , scrappy-json
+                    -- network-uri + template-haskell: LLM.StaticURI (upstream).
+                    , network-uri
+                    , template-haskell
                     , temporary
                     , text
                     , transformers

@@ -287,6 +287,11 @@ instance FromJSON a => FromJSON (ConvoAnswer a)
 -- | Convenience alias — DeepSeek answers carry the full 'ContentWithRole'.
 type DeepSeekAnswer = ConvoAnswer ContentWithRole
 
+-- | Error wrapper for a conversational ask (parse/transport failure surfaced to
+-- the caller). Re-added in the effectful↔upstream merge: the @-X ours@ merge
+-- dropped upstream's definition where our tool types were inserted.
+newtype ConvoError = ConvoError T.Text deriving (Show)
+
 -- | A tool definition advertised to the model (provider-neutral). The schema is
 -- a JSON-Schema 'Value'; each provider serialises it into its own @tools@ shape.
 data ToolDef = ToolDef

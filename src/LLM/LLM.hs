@@ -52,6 +52,14 @@ module LLM.LLM
   , gptModel
   , getRelevant
   , TokenLimit
+    -- * Provider-agnostic typed / context helpers (used by the effectful layer
+    -- and the servant providers)
+  , askTypedBy
+  , askWithContextBy
+  , askGPTWithContextTypedBy
+  , renderHistoryWithRole
+  , readTypedAnswer
+  , selectRelevant
   ) where
 
 import LLM.Types
@@ -117,7 +125,7 @@ renderHistoryWithRole :: GPTRole -> ConversationHistory -> ContentWithRole
 renderHistoryWithRole role =
   cwr role . ((<>) "Our conversation history so far:") . T.intercalate "\n" . fmap renderItem
   where
-    renderItem (GPTQuery _ (GPTQuestion q) (GPTAnswer a)) =
+    renderItem (ConvoQuery _ (ConvoQuestion q) (ConvoAnswer a)) =
       "Me: " <> (T.decodeUtf8 . LBS.toStrict . Aeson.encode) q <> "\n" <> "ChatGPT: " <> a
 
 
@@ -156,12 +164,12 @@ getRelevantCtxDeepSeek = \case
 -- testctx = do
 --   mgr <- liftIO $ newManager tlsManagerSettings
 --   k <- liftIO $ fmap T.pack $ readFile "config/backend/gptAPIKey"
---   r1 <- askGPTWithContext k mgr (LastN 10) (Tag "Name", GPTQuestion [cwr User "my name is galen"])
---   r2 <- askGPTWithContext k mgr (LastN 10) (Tag "Hey", GPTQuestion [cwr User "please tell me what my name is"])
---   r3 :: Either GPTError (GPTAnswer Int) <- askGPTWithContextTyped k mgr (LastN 10) (Tag "Hey", GPTQuestion [cwr User "how many letters in my name"])
---   r4 :: Either GPTError (GPTAnswer Int) <- askGPTWithContextTyped k mgr (Relevants [Tag "Name"]) (Tag "Hey", GPTQuestion [cwr User "how many letters in my name"])
---   r5 :: Either GPTError (GPTAnswer Int) <- askGPTWithContextTyped k mgr (Relevants []) (Tag "Hey", GPTQuestion [cwr User "how many letters in my name"])
---   r6 :: Either GPTError (GPTAnswer Int) <- askGPTWithContextTyped k mgr (LastN 0) (Tag "Hey", GPTQuestion [cwr User "how many letters in my name"])
+--   r1 <- askGPTWithContext k mgr (LastN 10) (Tag "Name", ConvoQuestion [cwr User "my name is galen"])
+--   r2 <- askGPTWithContext k mgr (LastN 10) (Tag "Hey", ConvoQuestion [cwr User "please tell me what my name is"])
+--   r3 :: Either ConvoError (ConvoAnswer Int) <- askGPTWithContextTyped k mgr (LastN 10) (Tag "Hey", ConvoQuestion [cwr User "how many letters in my name"])
+--   r4 :: Either ConvoError (ConvoAnswer Int) <- askGPTWithContextTyped k mgr (Relevants [Tag "Name"]) (Tag "Hey", ConvoQuestion [cwr User "how many letters in my name"])
+--   r5 :: Either ConvoError (ConvoAnswer Int) <- askGPTWithContextTyped k mgr (Relevants []) (Tag "Hey", ConvoQuestion [cwr User "how many letters in my name"])
+--   r6 :: Either ConvoError (ConvoAnswer Int) <- askGPTWithContextTyped k mgr (LastN 0) (Tag "Hey", ConvoQuestion [cwr User "how many letters in my name"])
 --   liftIO $ print r1
 --   liftIO $ print r2
 --   liftIO $ print r3
@@ -242,19 +250,19 @@ askGPTWithContext key mgr maxTokens relCtx (thisTag, ConvoQuestion contents) = C
 askWithContextBy
   :: MonadIO m
   => (ConversationHistory -> [ContentWithRole])
-  -> (TokenLimit -> [ContentWithRole] -> MonadGPT m (Either T.Text T.Text))
+  -> (forall n. MonadIO n => TokenLimit -> [ContentWithRole] -> n (Either T.Text T.Text))
   -> TokenLimit
   -> RelevantContext
-  -> (Tag, GPTQuestion)
-  -> MonadGPT m (Either GPTError (GPTAnswer T.Text))
-askWithContextBy injectHistory prim maxTokens relCtx (thisTag, GPTQuestion contents) = do
+  -> (Tag, ConvoQuestion)
+  -> ConvoT m (Either ConvoError (ConvoAnswer T.Text))
+askWithContextBy injectHistory prim maxTokens relCtx (thisTag, ConvoQuestion contents) = ConvoT $ do
   histItems <- getRelevantCtx relCtx
   prim maxTokens (injectHistory histItems <> contents) >>= \case
-    Left e -> pure $ Left $ GPTError e
+    Left e -> pure $ Left $ ConvoError e
     Right answer -> do
-      let new = GPTQuery thisTag (GPTQuestion contents) (GPTAnswer answer)
+      let new = ConvoQuery thisTag (ConvoQuestion contents) (ConvoAnswer answer)
       modify ((:) new)
-      pure $ Right $ GPTAnswer answer
+      pure $ Right $ ConvoAnswer answer
 
 -- | Transport-agnostic version of 'askGPTWithContextTyped', parameterised over
 -- the stateless prim. The typed-decode logic lives here (rather than in a
@@ -267,12 +275,12 @@ askGPTWithContextTypedBy
   , Read a
   , MonadIO m
   )
-  => (TokenLimit -> [ContentWithRole] -> MonadGPT m (Either T.Text T.Text))
+  => (forall n. MonadIO n => TokenLimit -> [ContentWithRole] -> n (Either T.Text T.Text))
   -> TokenLimit
   -> RelevantContext
-  -> (Tag, GPTQuestion)
-  -> MonadGPT m (Either GPTError (GPTAnswer a))
-askGPTWithContextTypedBy prim tokenLimit relCtx (thisTag, GPTQuestion contents) = do
+  -> (Tag, ConvoQuestion)
+  -> ConvoT m (Either ConvoError (ConvoAnswer a))
+askGPTWithContextTypedBy prim tokenLimit relCtx (thisTag, ConvoQuestion contents) = ConvoT $ do
   let typeProxy = Proxy :: Proxy a
   let returnT = gptReturnType typeProxy
   let
@@ -287,17 +295,17 @@ askGPTWithContextTypedBy prim tokenLimit relCtx (thisTag, GPTQuestion contents) 
 
   ctx <- renderHistory <$> getRelevantCtx relCtx
   prim tokenLimit (ctx : contents <> returnT) >>= \case
-    Left e -> pure . Left . GPTError $ e
+    Left e -> pure . Left . ConvoError $ e
     Right txt -> case readEitherText txt of
-      Left e -> pure . Left . GPTError $
+      Left e -> pure . Left . ConvoError $
         e <> "When reading return type: (x :: "  <> (T.pack . show $ typeRep typeProxy ) <> ") from base response: " <> txt
         <> "From Prompt: "
         <> (T.pack $ show (ctx : contents <> returnT))
 
       Right typed -> do
-        let new = GPTQuery thisTag (GPTQuestion contents) (GPTAnswer txt)
+        let new = ConvoQuery thisTag (ConvoQuestion contents) (ConvoAnswer txt)
         modify ((:) new)
-        pure . Right . GPTAnswer $ typed
+        pure . Right . ConvoAnswer $ typed
 
 
 
@@ -319,7 +327,7 @@ askGPTWithContextTypedBy prim tokenLimit relCtx (thisTag, GPTQuestion contents) 
   -- }                        
 
 
--- runStateAction :: MonadIO m => Manager -> DeepSeekModel -> [ContentWithRole] -> MonadDeepSeek m (Either GPTError DeepSeekAnswer)
+-- runStateAction :: MonadIO m => Manager -> DeepSeekModel -> [ContentWithRole] -> MonadDeepSeek m (Either ConvoError DeepSeekAnswer)
 -- runStateAction mgr modelChoice cwrs = askDeepSeekWithContext mgr modelChoice (LastN_DS 1000) (TagDS "sometag" False, DeepSeekQuestion cwrs)
 
 
@@ -417,8 +425,8 @@ gptReturnType typeProxy =
 selectRelevant :: RelevantContext -> ConversationHistory -> ConversationHistory
 selectRelevant = \case
   LastN n -> take n
-  Relevants tags -> \hist -> catMaybes $ fmap (\t -> L.find (\h -> t == _gptQuery_tag h) hist) tags
-  LastNRelevant n anonF -> take n . filter (anonF . _gptQuery_tag)
+  Relevants tags -> \hist -> catMaybes $ fmap (\t -> L.find (\h -> t == _convoQuery_tag h) hist) tags
+  LastNRelevant n anonF -> take n . filter (anonF . _convoQuery_tag)
 
 -- | The three-tier read used by the typed variants, factored out of
 -- 'askGPTWithContextTyped' so the plain typed prim ('askTypedBy') and the
@@ -443,11 +451,11 @@ askTypedBy
   :: forall m a. (Monad m, Typeable a, Read a)
   => ([ContentWithRole] -> m (Either T.Text T.Text))
   -> [ContentWithRole]
-  -> m (Either GPTError (GPTAnswer a))
+  -> m (Either ConvoError (ConvoAnswer a))
 askTypedBy prim contents = do
   let returnT = gptReturnType (Proxy :: Proxy a)
   r <- prim (contents <> returnT)
-  pure . bimap GPTError GPTAnswer $ readTypedAnswer =<< r
+  pure . bimap ConvoError ConvoAnswer $ readTypedAnswer =<< r
 
 type TokenLimit = Maybe Int
 

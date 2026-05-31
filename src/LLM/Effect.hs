@@ -44,10 +44,10 @@ import LLM.Types
   ( APIProvider (..)
   , ContentWithRole
   , ConversationHistory
-  , GPTAnswer (..)
-  , GPTError (..)
-  , GPTQuery (..)
-  , GPTQuestion (..)
+  , ConvoAnswer (..)
+  , ConvoError (..)
+  , ConvoQuery (..)
+  , ConvoQuestion (..)
   , RelevantContext
   , RichMessage
   , Tag
@@ -66,9 +66,9 @@ import Effectful.Dispatch.Dynamic (send)
 -- the constructors are shared across providers and each interpreter pins @p@.
 data LLM (p :: APIProvider) :: Effect where
   Ask :: [ContentWithRole] -> LLM p m (Either T.Text T.Text)
-  AskTyped :: (Typeable a, Read a) => [ContentWithRole] -> LLM p m (Either GPTError (GPTAnswer a))
-  AskWithContext :: RelevantContext -> (Tag, GPTQuestion) -> LLM p m (Either GPTError (GPTAnswer T.Text))
-  AskWithContextTyped :: (Typeable a, Read a) => RelevantContext -> (Tag, GPTQuestion) -> LLM p m (Either GPTError (GPTAnswer a))
+  AskTyped :: (Typeable a, Read a) => [ContentWithRole] -> LLM p m (Either ConvoError (ConvoAnswer a))
+  AskWithContext :: RelevantContext -> (Tag, ConvoQuestion) -> LLM p m (Either ConvoError (ConvoAnswer T.Text))
+  AskWithContextTyped :: (Typeable a, Read a) => RelevantContext -> (Tag, ConvoQuestion) -> LLM p m (Either ConvoError (ConvoAnswer a))
   AskTools :: [ToolDef] -> [RichMessage] -> LLM p m (Either T.Text ToolTurn)
 
 type instance DispatchOf (LLM p) = Dynamic
@@ -80,22 +80,22 @@ ask contents = send (Ask contents :: LLM p (Eff es) (Either T.Text T.Text))
 -- | Typed ask against provider @p@ (e.g. @askTyped \@'Anthropic \@Int ...@).
 askTyped
   :: forall p a es. (LLM p :> es, Typeable a, Read a)
-  => [ContentWithRole] -> Eff es (Either GPTError (GPTAnswer a))
-askTyped contents = send (AskTyped contents :: LLM p (Eff es) (Either GPTError (GPTAnswer a)))
+  => [ContentWithRole] -> Eff es (Either ConvoError (ConvoAnswer a))
+askTyped contents = send (AskTyped contents :: LLM p (Eff es) (Either ConvoError (ConvoAnswer a)))
 
 -- | Context-aware ask against provider @p@.
 askWithContext
   :: forall p es. (LLM p :> es)
-  => RelevantContext -> (Tag, GPTQuestion) -> Eff es (Either GPTError (GPTAnswer T.Text))
+  => RelevantContext -> (Tag, ConvoQuestion) -> Eff es (Either ConvoError (ConvoAnswer T.Text))
 askWithContext relCtx q =
-  send (AskWithContext relCtx q :: LLM p (Eff es) (Either GPTError (GPTAnswer T.Text)))
+  send (AskWithContext relCtx q :: LLM p (Eff es) (Either ConvoError (ConvoAnswer T.Text)))
 
 -- | Typed context-aware ask against provider @p@.
 askWithContextTyped
   :: forall p a es. (LLM p :> es, Typeable a, Read a)
-  => RelevantContext -> (Tag, GPTQuestion) -> Eff es (Either GPTError (GPTAnswer a))
+  => RelevantContext -> (Tag, ConvoQuestion) -> Eff es (Either ConvoError (ConvoAnswer a))
 askWithContextTyped relCtx q =
-  send (AskWithContextTyped relCtx q :: LLM p (Eff es) (Either GPTError (GPTAnswer a)))
+  send (AskWithContextTyped relCtx q :: LLM p (Eff es) (Either ConvoError (ConvoAnswer a)))
 
 -- | @ask@ pinned to Anthropic.
 askAnthropic :: (LLM 'Anthropic :> es) => [ContentWithRole] -> Eff es (Either T.Text T.Text)
@@ -123,16 +123,16 @@ runCtx
   => (ConversationHistory -> [ContentWithRole])
   -> ([ContentWithRole] -> Eff es (Either T.Text T.Text))
   -> RelevantContext
-  -> (Tag, GPTQuestion)
-  -> Eff es (Either GPTError (GPTAnswer T.Text))
-runCtx injectHistory prim relCtx (thisTag, GPTQuestion contents) = do
+  -> (Tag, ConvoQuestion)
+  -> Eff es (Either ConvoError (ConvoAnswer T.Text))
+runCtx injectHistory prim relCtx (thisTag, ConvoQuestion contents) = do
   histItems <- recall relCtx
   res <- prim (injectHistory histItems <> contents)
   case res of
-    Left e -> pure (Left (GPTError e))
+    Left e -> pure (Left (ConvoError e))
     Right answer -> do
-      remember (GPTQuery thisTag (GPTQuestion contents) (GPTAnswer answer))
-      pure (Right (GPTAnswer answer))
+      remember (ConvoQuery thisTag (ConvoQuestion contents) (ConvoAnswer answer))
+      pure (Right (ConvoAnswer answer))
 
 -- | Typed shared context loop. Stores the raw text answer in history but
 -- returns the decoded @a@.
@@ -141,16 +141,16 @@ runCtxTyped
   => (ConversationHistory -> [ContentWithRole])
   -> ([ContentWithRole] -> Eff es (Either T.Text T.Text))
   -> RelevantContext
-  -> (Tag, GPTQuestion)
-  -> Eff es (Either GPTError (GPTAnswer a))
-runCtxTyped injectHistory prim relCtx (thisTag, GPTQuestion contents) = do
+  -> (Tag, ConvoQuestion)
+  -> Eff es (Either ConvoError (ConvoAnswer a))
+runCtxTyped injectHistory prim relCtx (thisTag, ConvoQuestion contents) = do
   histItems <- recall relCtx
   let returnT = gptReturnType (Proxy :: Proxy a)
   res <- prim (injectHistory histItems <> contents <> returnT)
   case res of
-    Left e -> pure (Left (GPTError e))
+    Left e -> pure (Left (ConvoError e))
     Right txt -> case readTypedAnswer txt of
-      Left e -> pure (Left (GPTError e))
+      Left e -> pure (Left (ConvoError e))
       Right typed -> do
-        remember (GPTQuery thisTag (GPTQuestion contents) (GPTAnswer txt))
-        pure (Right (GPTAnswer typed))
+        remember (ConvoQuery thisTag (ConvoQuestion contents) (ConvoAnswer txt))
+        pure (Right (ConvoAnswer typed))

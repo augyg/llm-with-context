@@ -46,9 +46,9 @@ import LLM.Effect.Tool.Sandbox
 import Data.List (isInfixOf)
 import LLM.Types
   ( APIProvider (..)
-  , GPTAnswer (..)
-  , GPTQuery (..)
-  , GPTQuestion (..)
+  , ConvoAnswer (..)
+  , ConvoQuery (..)
+  , ConvoQuestion (..)
   , GPTRole (User)
   , RelevantContext (..)
   , Tag (..)
@@ -74,19 +74,19 @@ main = do
 -- Two remembered turns should both be recallable.
 memCount :: Int
 memCount = runPureEff . evalState emptyMemoryStore . runMemoryState $ do
-  remember (GPTQuery (Tag "a") (GPTQuestion []) (GPTAnswer "first"))
-  remember (GPTQuery (Tag "b") (GPTQuestion []) (GPTAnswer "second"))
+  remember (ConvoQuery (Tag "a") (ConvoQuestion []) (ConvoAnswer "first"))
+  remember (ConvoQuery (Tag "b") (ConvoQuestion []) (ConvoAnswer "second"))
   length <$> recallAll
 
 -- prune 0 drops everything unpinned; the pinned turn must remain.
 pinnedTags :: [Text]
 pinnedTags = runPureEff . evalState emptyMemoryStore . runMemoryState $ do
-  remember (GPTQuery (Tag "keep") (GPTQuestion []) (GPTAnswer "x"))
+  remember (ConvoQuery (Tag "keep") (ConvoQuestion []) (ConvoAnswer "x"))
   pin (Tag "keep")
-  remember (GPTQuery (Tag "t1") (GPTQuestion []) (GPTAnswer "y"))
-  remember (GPTQuery (Tag "t2") (GPTQuestion []) (GPTAnswer "y"))
+  remember (ConvoQuery (Tag "t1") (ConvoQuestion []) (ConvoAnswer "y"))
+  remember (ConvoQuery (Tag "t2") (ConvoQuestion []) (ConvoAnswer "y"))
   prune 0
-  map (unTag . _gptQuery_tag) <$> recallAll
+  map (unTag . _convoQuery_tag) <$> recallAll
 
 -- Two context-aware asks against the mock provider should leave two turns in
 -- memory. Fully pure: mock LLM + Memory + State, run with runPureEff.
@@ -97,8 +97,8 @@ ctxTurns =
     . runMemoryState
     . runLLMMock @'Anthropic (\_ -> Right "ok")
     $ do
-        _ <- askWithContext @'Anthropic (LastN 10) (Tag "q1", GPTQuestion [cwr User "hi"])
-        _ <- askWithContext @'Anthropic (LastN 10) (Tag "q2", GPTQuestion [cwr User "again"])
+        _ <- askWithContext @'Anthropic (LastN 10) (Tag "q1", ConvoQuestion [cwr User "hi"])
+        _ <- askWithContext @'Anthropic (LastN 10) (Tag "q2", ConvoQuestion [cwr User "again"])
         length <$> recallAll
 
 -- A custom (pure) Tool backend: stdout is just the rendered command name.

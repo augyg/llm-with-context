@@ -51,8 +51,8 @@ import LLM.Types
   , APIProvider (..)
   , Block (..)
   , ContentWithRole (..)
-  , GPTAnswer
-  , GPTError
+  , ConvoAnswer
+  , ConvoError
   , GPTRole (..)
   , RichMessage (..)
   , ToolDef (..)
@@ -234,7 +234,7 @@ askClaudeTyped
   :: (MonadIO m, Typeable a, Read a)
   => ClaudeConfig
   -> [ContentWithRole]
-  -> m (Either GPTError (GPTAnswer a))
+  -> m (Either ConvoError (ConvoAnswer a))
 askClaudeTyped cfg = askTypedBy (askClaude cfg)
 
 -- Tool-use translation layer ------------------------------------------------

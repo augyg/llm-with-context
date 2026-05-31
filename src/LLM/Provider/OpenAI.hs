@@ -36,8 +36,8 @@ import LLM.Types
   , ContentWithRole (..)
   , ErrorOpenAI (..)
   , ErrorResponseOpenAI (..)
-  , GPTAnswer
-  , GPTError
+  , ConvoAnswer
+  , ConvoError
   , GPTRequestBody (..)
   , GPTRole (..)
   , PromptResponse (choices)
@@ -134,7 +134,7 @@ askGPTServantTyped
   :: (MonadIO m, Typeable a, Read a)
   => GPTConfig
   -> [ContentWithRole]
-  -> m (Either GPTError (GPTAnswer a))
+  -> m (Either ConvoError (ConvoAnswer a))
 askGPTServantTyped cfg = askTypedBy (askGPTServant cfg)
 
 -- Tool-use translation layer ------------------------------------------------
