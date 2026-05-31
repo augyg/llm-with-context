@@ -16,11 +16,38 @@ extra-doc-files:    CHANGELOG.md
 common warnings
     ghc-options: -Wall
 
+-- When on (the default), LLM.Effect.Tool.Sandbox bakes the sandbox executable's
+-- absolute path at COMPILE time via staticWhich (bwrap on Linux, sandbox-exec on
+-- macOS) — making it a build- and runtime dependency. Turn it OFF
+-- (-f-static-sandbox-exe) to resolve the executable on PATH at runtime instead,
+-- so a build needs no sandbox tool present (the CPP branch with the splice is
+-- elided before GHC sees it).
+flag static-sandbox-exe
+    description: Bake the sandbox executable path at compile time via staticWhich.
+    default:     True
+    manual:      True
+
 library
     import:           warnings
     exposed-modules:  LLM.LLM
                       LLM.ScrubPrefix
                       LLM.Types
+                      LLM.ProviderMeta
+                      LLM.Provider.Servant
+                      LLM.Provider.Anthropic
+                      LLM.Provider.OpenAI
+                      LLM.Effect
+                      LLM.Effect.Memory
+                      LLM.Effect.Anthropic
+                      LLM.Effect.OpenAI
+                      LLM.Effect.Mock
+                      LLM.Effect.Compaction
+                      LLM.Effect.BrainMd
+                      LLM.Effect.BrainGraph
+                      LLM.Effect.MemoryGraph
+                      LLM.Effect.Tool
+                      LLM.Effect.Tool.Sandbox
+                      LLM.Tooling
     -- other-modules:
     -- other-extensions:
     build-depends:    base
@@ -29,13 +56,28 @@ library
                     , containers
                     , data-default
                     , directory
+                    , fgl
+                    , filepath
                     , http-client
                     , http-types
                     , http-client-tls
                     , parsec
+                    , process
                     , scrappy-core
+                    , temporary
                     , text
                     , transformers
+                    -- staticWhich: bake the sandbox executable's absolute path
+                    -- at compile time (CPP-conditional per platform).
+                    , which
+                    -- servant-client transport for the OpenAI / Anthropic providers
+                    , servant
+                    , servant-client
+                    , servant-client-core
+                    -- the LLM effect layer (effectful). Pin a version whose
+                    -- tested-with still lists GHC 8.10.7 (the 2.2 / 2.3 line);
+                    -- newer releases may have raised the GHC floor.
+                    , effectful-core
 
                     
 
@@ -43,4 +85,32 @@ library
                     
                     
     hs-source-dirs:   src
+    default-language: Haskell2010
+    if flag(static-sandbox-exe)
+        cpp-options: -DSTATIC_SANDBOX_EXE
+
+-- Pure tests for the effect layer (mock LLM + Memory/Tool over pure
+-- interpreters, run with runPureEff — no network, no IO). Hand-rolled harness,
+-- no test framework, to keep the dependency/nix footprint minimal.
+-- Compile-only examples (real provider interpreter + a placeholder key). Built
+-- by nix so the wiring can't drift from the API; never executed.
+executable example
+    import:           warnings
+    main-is:          Main.hs
+    hs-source-dirs:   examples
+    build-depends:    base
+                    , effectful-core
+                    , http-client-tls
+                    , llm-with-context
+    default-language: Haskell2010
+
+test-suite llm-with-context-test
+    import:           warnings
+    type:             exitcode-stdio-1.0
+    main-is:          Spec.hs
+    hs-source-dirs:   test
+    build-depends:    base
+                    , text
+                    , effectful-core
+                    , llm-with-context
     default-language: Haskell2010

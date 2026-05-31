@@ -20,7 +20,7 @@ import Data.ByteString.Lazy as LBS
 import GHC.Generics
 
 
-data APIProvider = OpenAI | Google | AWS
+data APIProvider = OpenAI | Google | AWS | Anthropic
 -- Define the APIKey type with a phantom type parameter
 newtype APIKey (api :: APIProvider) = APIKey { unAPIKey :: T.Text }
 
@@ -254,6 +254,45 @@ instance FromJSON a => FromJSON (GPTAnswer a)
 type DeepSeekAnswer = GPTAnswer ContentWithRole
 
 newtype GPTError = GPTError T.Text deriving Show
+
+-- | A tool definition advertised to the model (provider-neutral). The schema is
+-- a JSON-Schema 'Value'; each provider serialises it into its own @tools@ shape.
+data ToolDef = ToolDef
+  { _toolDef_name :: T.Text
+  , _toolDef_description :: T.Text
+  , _toolDef_inputSchema :: Value
+  } deriving (Show, Generic)
+
+-- | A tool call the model asked for.
+data ToolUse = ToolUse
+  { _toolUse_id :: T.Text
+  , _toolUse_name :: T.Text
+  , _toolUse_input :: Value
+  } deriving (Show, Generic)
+
+-- | A content block in a tool-capable message: assistant text, an assistant
+-- tool call, or a user-supplied tool result.
+data Block
+  = BlockText T.Text
+  | BlockToolUse ToolUse
+  | BlockToolResult T.Text T.Text Bool -- ^ tool_use id, result content, is-error
+  deriving (Show, Generic)
+
+-- | A message in the tool-use conversation (richer than 'ContentWithRole',
+-- which is text-only).
+data RichMessage = RichMessage
+  { _richMessage_role :: GPTRole
+  , _richMessage_blocks :: [Block]
+  } deriving (Show, Generic)
+
+-- | The assistant's turn from a tool-capable ask: any text it emitted, the tool
+-- calls it requested (empty = it's done), and the raw assistant blocks to
+-- append to the conversation before sending tool results back.
+data ToolTurn = ToolTurn
+  { _toolTurn_text :: Maybe T.Text
+  , _toolTurn_toolUses :: [ToolUse]
+  , _toolTurn_assistantBlocks :: [Block]
+  } deriving (Show, Generic)
 
 data RelevantContext
   = LastN Int

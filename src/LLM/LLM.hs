@@ -53,6 +53,19 @@ renderHistory = cwr Assistant . ((<>) "Our conversation history so far:") . T.in
     renderItem (GPTQuery _ (GPTQuestion q) (GPTAnswer a)) =
       "Me: " <> (T.decodeUtf8 . LBS.toStrict . Aeson.encode) q <> "\n" <> "ChatGPT: " <> a
 
+-- | Like 'renderHistory' but lets the caller choose which role the rendered
+-- history is attached to. OpenAI/DeepSeek inject history as an 'Assistant'
+-- turn; Anthropic requires the first message to be a 'User' turn, so the
+-- Anthropic provider injects history as a 'System' turn instead (which
+-- 'LLM.Provider.Anthropic.splitSystem' hoists into the top-level "system"
+-- field).
+renderHistoryWithRole :: GPTRole -> ConversationHistory -> ContentWithRole
+renderHistoryWithRole role =
+  cwr role . ((<>) "Our conversation history so far:") . T.intercalate "\n" . fmap renderItem
+  where
+    renderItem (GPTQuery _ (GPTQuestion q) (GPTAnswer a)) =
+      "Me: " <> (T.decodeUtf8 . LBS.toStrict . Aeson.encode) q <> "\n" <> "ChatGPT: " <> a
+
 
 
 
@@ -156,6 +169,72 @@ askGPTWithContext key mgr maxTokens relCtx (thisTag, GPTQuestion contents) = do
       let new = GPTQuery thisTag (GPTQuestion contents) (GPTAnswer answer)
       modify ((:) new)
       pure $ Right $ GPTAnswer answer
+
+-- | Transport-agnostic version of the "with context" loop, parameterised over
+-- how history is injected and which stateless prim does the request. This lets
+-- the OpenAI and Anthropic servant providers reuse the exact same StateT
+-- bookkeeping without touching 'askGPTWithContext'. @injectHistory@ turns the
+-- recalled turns into prompt messages (an 'Assistant' turn for OpenAI/DeepSeek,
+-- a 'System' turn for Anthropic); @prim@ is the provider's stateless ask.
+askWithContextBy
+  :: MonadIO m
+  => (ConversationHistory -> [ContentWithRole])
+  -> (TokenLimit -> [ContentWithRole] -> MonadGPT m (Either T.Text T.Text))
+  -> TokenLimit
+  -> RelevantContext
+  -> (Tag, GPTQuestion)
+  -> MonadGPT m (Either GPTError (GPTAnswer T.Text))
+askWithContextBy injectHistory prim maxTokens relCtx (thisTag, GPTQuestion contents) = do
+  histItems <- getRelevantCtx relCtx
+  prim maxTokens (injectHistory histItems <> contents) >>= \case
+    Left e -> pure $ Left $ GPTError e
+    Right answer -> do
+      let new = GPTQuery thisTag (GPTQuestion contents) (GPTAnswer answer)
+      modify ((:) new)
+      pure $ Right $ GPTAnswer answer
+
+-- | Transport-agnostic version of 'askGPTWithContextTyped', parameterised over
+-- the stateless prim. The typed-decode logic lives here (rather than in a
+-- provider module) so it keeps the same imports and behaviour as
+-- 'askGPTWithContextTyped'. History is injected as an 'Assistant' turn, as the
+-- OpenAI-style typed flow expects.
+askGPTWithContextTypedBy
+  :: forall m a.
+  ( Typeable a
+  , Read a
+  , MonadIO m
+  )
+  => (TokenLimit -> [ContentWithRole] -> MonadGPT m (Either T.Text T.Text))
+  -> TokenLimit
+  -> RelevantContext
+  -> (Tag, GPTQuestion)
+  -> MonadGPT m (Either GPTError (GPTAnswer a))
+askGPTWithContextTypedBy prim tokenLimit relCtx (thisTag, GPTQuestion contents) = do
+  let typeProxy = Proxy :: Proxy a
+  let returnT = gptReturnType typeProxy
+  let
+    readEitherText :: T.Text -> Either T.Text a
+    readEitherText = first T.pack . readEither2 . T.unpack
+      where
+        readEither2 x = case readEither x of
+          Right a -> Right a
+          Left _ -> case readEither $ "\"" <> x <> "\"" of
+            Right a -> Right a
+            Left _ -> readEither $ "\"" <> (T.unpack $ escapeText $ T.pack x) <> "\""
+
+  ctx <- renderHistory <$> getRelevantCtx relCtx
+  prim tokenLimit (ctx : contents <> returnT) >>= \case
+    Left e -> pure . Left . GPTError $ e
+    Right txt -> case readEitherText txt of
+      Left e -> pure . Left . GPTError $
+        e <> "When reading return type: (x :: "  <> (T.pack . show $ typeRep typeProxy ) <> ") from base response: " <> txt
+        <> "From Prompt: "
+        <> (T.pack $ show (ctx : contents <> returnT))
+
+      Right typed -> do
+        let new = GPTQuery thisTag (GPTQuestion contents) (GPTAnswer txt)
+        modify ((:) new)
+        pure . Right . GPTAnswer $ typed
 
 
 
@@ -263,6 +342,44 @@ gptReturnType typeProxy =
     if typeInfo == "Text" || typeInfo == "String"
     then []
     else [ cwr System $ "In responding to the above question, give me only the Haskell type:" <> typeInfo <> " and nothing else in your response: Format should be parsable as the Haskell type:" <> typeInfo ]
+
+-- | Pure core of 'getRelevantCtx': the history-selection logic without the
+-- 'StateT' wrapper, so the effect interpreters (which carry history in an
+-- effectful 'State') can reuse the exact same selection rules.
+selectRelevant :: RelevantContext -> ConversationHistory -> ConversationHistory
+selectRelevant = \case
+  LastN n -> take n
+  Relevants tags -> \hist -> catMaybes $ fmap (\t -> L.find (\h -> t == _gptQuery_tag h) hist) tags
+  LastNRelevant n anonF -> take n . filter (anonF . _gptQuery_tag)
+
+-- | The three-tier read used by the typed variants, factored out of
+-- 'askGPTWithContextTyped' so the plain typed prim ('askTypedBy') and the
+-- effect interpreters share one decoder. Tries the raw text, then quoted, then
+-- escaped-and-quoted.
+readTypedAnswer :: forall a. Read a => T.Text -> Either T.Text a
+readTypedAnswer = first T.pack . readEither2 . T.unpack
+  where
+    readEither2 x = case readEither x of
+      Right a -> Right a
+      Left _ -> case readEither $ "\"" <> x <> "\"" of
+        Right a -> Right a
+        Left _ -> readEither $ "\"" <> (T.unpack $ escapeText $ T.pack x) <> "\""
+
+-- | Transport-agnostic typed prim: append the return-type instruction, run the
+-- supplied stateless text prim, and decode the answer to @a@. Mirrors
+-- 'askGPTTyped' but parameterised over the prim so any provider can reuse it.
+-- The token cap is decided by the prim's own config (Reader), so it is not a
+-- parameter here. 'Monad' rather than 'MonadIO' since this touches no IO — that
+-- also lets the pure mock interpreter reuse it.
+askTypedBy
+  :: forall m a. (Monad m, Typeable a, Read a)
+  => ([ContentWithRole] -> m (Either T.Text T.Text))
+  -> [ContentWithRole]
+  -> m (Either GPTError (GPTAnswer a))
+askTypedBy prim contents = do
+  let returnT = gptReturnType (Proxy :: Proxy a)
+  r <- prim (contents <> returnT)
+  pure . bimap GPTError GPTAnswer $ readTypedAnswer =<< r
 
 type TokenLimit = Maybe Int
 -- | TODO: change to gptPrim
