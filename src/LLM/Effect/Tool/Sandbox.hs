@@ -68,7 +68,11 @@ import System.Environment (lookupEnv)
 import System.FilePath (isAbsolute, splitDirectories, (</>))
 import System.IO.Temp (withSystemTempDirectory)
 import System.Process (CreateProcess (cwd, env), proc, readCreateProcessWithExitCode)
+#if defined(STATIC_SANDBOX_EXE)
+-- Only imported when the staticWhich splices below are compiled in; otherwise
+-- it would be an unused import (and -Werror=unused-imports is on).
 import System.Which (staticWhich)
+#endif
 
 import Effectful (Eff, IOE, (:>))
 
