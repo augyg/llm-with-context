@@ -1,8 +1,10 @@
 cabal-version:      3.0
 name:               llm-with-context
 version:            0.1.0.0
--- synopsis:
--- description:
+synopsis:
+        Typified interactions with LLMs             
+description:
+        Using Proxy and StateT we manage a typed conversation with conversation history. We can also perform more customized qqueries of history to be included in the next response.
 license:            MIT
 license-file:       LICENSE
 author:             lazyLambda
@@ -12,9 +14,12 @@ category:           AI
 build-type:         Simple
 extra-doc-files:    CHANGELOG.md
 -- extra-source-files:
+source-repository head
+  type: git                                
+  location: https://github.com/augyg/llm-with-context                  
 
 common warnings
-    ghc-options: -Wall
+    ghc-options: -Wall -Werror
 
 -- When on (the default), LLM.Effect.Tool.Sandbox bakes the sandbox executable's
 -- absolute path at COMPILE time via staticWhich (bwrap on Linux, sandbox-exec on
@@ -29,8 +34,13 @@ flag static-sandbox-exe
 
 library
     import:           warnings
-    exposed-modules:  LLM.LLM
+    exposed-modules:  LLM.JsonExample
+                      LLM.LLM
+                      LLM.Provider
+                      LLM.Provider.Backends
+                      LLM.ReadLLM
                       LLM.ScrubPrefix
+                      LLM.StaticURI
                       LLM.Types
                       LLM.ProviderMeta
                       LLM.Provider.Servant

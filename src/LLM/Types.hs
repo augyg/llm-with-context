@@ -7,6 +7,12 @@
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
+-- | Core types for the llm-with-context library.
+--
+-- Provides request\/response types for both the OpenAI (GPT) and DeepSeek\/Ollama
+-- backends, a type-safe phantom-typed 'APIKey', conversation history management
+-- via 'MonadGPT' \/ 'MonadDeepSeek', and context-selection strategies
+-- ('RelevantContext', 'RelevantContextDS') for stateful multi-turn conversations.
 module LLM.Types where
 
 import LLM.ScrubPrefix
@@ -15,7 +21,7 @@ import Control.Monad.Trans.State
 import Data.Default
 import Data.Aeson
 import Data.Aeson.TH
-import Data.Text as T
+import qualified Data.Text as T
 import Data.ByteString.Lazy as LBS
 import GHC.Generics
 
@@ -24,36 +30,42 @@ data APIProvider = OpenAI | Google | AWS | Anthropic
 -- Define the APIKey type with a phantom type parameter
 newtype APIKey (api :: APIProvider) = APIKey { unAPIKey :: T.Text }
 
+-- | OpenAI chat-completion request body. Serializes directly to the JSON
+-- the @\/v1\/chat\/completions@ endpoint expects.
 data GPTRequestBody = GPTRequestBody
-  { model :: T.Text
-  -- , response_format :: GPTResponseFormat
-  , max_tokens :: Maybe Int 
-  , messages :: [ContentWithRole]
-  -- more exist but we dont need them or use them
+  { _gptRequest_model :: T.Text
+  -- , _gptRequest_response_format :: GPTResponseFormat
+  , _gptRequest_max_tokens :: Maybe Int
+  , _gptRequest_messages :: [ContentWithRole]
   } deriving (Show,Generic)
 
+-- | Response format hint: plain text or JSON object.
 data GPTType = GPT_Text | GPT_JSON deriving Show
 
     
+-- | Wrapper for the @response_format@ field in the OpenAI API.
 data GPTResponseFormat = GPTResponseFormat
   { _gptResponseFormat_type :: GPTType
-  } deriving (Generic, Show) 
+  } deriving (Generic, Show)
 
 
 -- | Shorthand for ContentWithRole 
 cwr :: GPTRole -> T.Text -> ContentWithRole
 cwr = ContentWithRole 
 
+-- | A single message in a conversation, pairing a role with text content.
+-- Serializes to @{\"role\": ..., \"content\": ...}@ for both OpenAI and Ollama.
 data ContentWithRole = ContentWithRole
-  { _cwr_role :: GPTRole 
+  { _cwr_role :: GPTRole
   , _cwr_content :: T.Text
   } deriving (Show, Generic)
 
-data GPTRole = System -- we provide some context: "Pretend you are an Interviewer"
-             | User -- we ask some question
-             | Assistant deriving (Show, Generic)
-             -- We tell GPT something : "The assistant messages help store prior responses.
-             -- They can also be written by a developer to help give examples of desired behavior."
+-- | The role of a message in the conversation.
+data GPTRole
+  = System     -- ^ System prompt — sets behaviour, persona, or constraints
+  | User       -- ^ User turn — the question or instruction
+  | Assistant  -- ^ Assistant turn — prior model responses or few-shot examples
+  deriving (Show, Eq, Generic)
 
 instance ToJSON GPTRole where
   toJSON = \case
@@ -70,6 +82,7 @@ instance FromJSON GPTRole where
 
 
 
+-- | Top-level response from the OpenAI chat-completion endpoint.
 data PromptResponse = PromptResponse { id :: T.Text
                                      , object :: T.Text
                                      , created :: Int
@@ -77,12 +90,14 @@ data PromptResponse = PromptResponse { id :: T.Text
                                      , usage :: Usage
                                      } deriving (Show, Generic)
 
+-- | A single choice inside a 'PromptResponse'.
 data ResMessage = ResMessage { message :: ContentWithRole
                              , finish_reason :: T.Text
-                             , index :: Int 
+                             , index :: Int
                              } deriving (Show,Generic)
 
 
+-- | Token usage statistics returned by OpenAI.
 data Usage = Usage { prompt_tokens :: Int
                    , completion_tokens :: Int
                    , total_tokens :: Int
@@ -90,16 +105,17 @@ data Usage = Usage { prompt_tokens :: Int
 
 
 
--- Wrapper for Raw GPT Response         
+-- | Wrapper for a raw GPT response body (unparsed JSON bytes).
 data Content = Content { unContent :: LBS.ByteString } deriving Show
 
--- default 
+-- | Request body for the OpenAI text-to-speech endpoint.
 data TextToSpeechBody = TextToSpeechBody
   { _textToSpeech_model :: T.Text
   , _textToSpeech_voice :: T.Text
   , _textToSpeech_input :: T.Text
   }
 
+-- | Structured error returned inside an OpenAI error response.
 data ErrorOpenAI = ErrorOpenAI {
   _errorOpenAI_message :: T.Text,
   _errorOpenAI_type :: T.Text, -- 'type' is a reserved keyword in Haskell, so we use type' or another name
@@ -107,7 +123,7 @@ data ErrorOpenAI = ErrorOpenAI {
   _errorOpenAI_code :: Maybe T.Text
 } deriving (Show, Generic)
 
--- Define the data structure for the top-level object
+-- | Top-level OpenAI error envelope (@{\"error\": ...}@).
 data ErrorResponseOpenAI = ErrorResponseOpenAI {
   _errorResponseOpenAI_error :: ErrorOpenAI
 } deriving (Show, Generic)
@@ -122,6 +138,7 @@ data ErrorResponseOpenAI = ErrorResponseOpenAI {
 --   , _ds_stream :: Bool
 --   } deriving Generic
 
+-- | Whether the model should return plain text or a JSON object.
 data ResponseFormat = AsText | AsJSON deriving (Eq, Show)
 instance ToJSON ResponseFormat where
   toJSON = \case
@@ -135,10 +152,12 @@ instance FromJSON ResponseFormat where
       "text"        -> pure AsText
       _             -> fail $ "Unknown ResponseFormat: " ++ T.unpack t
 
+-- | Request body for the Ollama-hosted DeepSeek chat endpoint.
+-- Has a 'Default' instance so you only need to set model and messages.
 data DeepSeekRequestBody = DeepSeekRequestBody
   { _deepSeekRequest_messages           :: [ContentWithRole]
   , _deepSeekRequest_model              :: DeepSeekModel
-  , _deepSeekRequest_images             :: Maybe T.Text 
+  , _deepSeekRequest_images             :: Maybe T.Text
   -- , _deepSeekRequest_frequency_penalty  :: Double
   -- , _deepSeekRequest_max_tokens         :: Int
   -- , _deepSeekRequest_presence_penalty   :: Double
@@ -177,7 +196,9 @@ instance Default DeepSeekRequestBody where
     -- , _deepSeekRequest_top_logprobs      = Nothing
     }
 
-data DeepSeekModel = DS_1_5b | DS_7b | DS_8b | DS_14b | DS_32b | DS_70b | DS_671b deriving (Eq, Show, Generic)
+-- | Available DeepSeek-R1 model sizes for local Ollama inference.
+-- Ordered smallest to largest; serializes to e.g. @\"deepseek-r1:7b\"@.
+data DeepSeekModel = DS_1_5b | DS_7b | DS_8b | DS_14b | DS_32b | DS_70b | DS_671b deriving (Eq, Ord, Enum, Show, Generic)
 instance ToJSON DeepSeekModel where
   toJSON = \case
     DS_1_5b -> "deepseek-r1:1.5b"
@@ -208,6 +229,7 @@ instance FromJSON DeepSeekModel where
 -- 671b
 
 
+-- | Response from the Ollama @\/api\/chat@ endpoint (non-streaming).
 data DeepSeekResponse = DeepSeekResponse
   { _deepSeekResponse_model              :: String
   , _deepSeekResponse_created_at         :: String
@@ -220,40 +242,50 @@ data DeepSeekResponse = DeepSeekResponse
 
 
 
--- todo: use readerT for Manager and ApiKey
--- then create this monad as a newtype with getter funcs
--- and a put for history
-type MonadGPT m a = StateT ConversationHistory m a
-type MonadDeepSeek m a = StateT ConversationHistoryDeepSeek m a 
-type ConversationHistory = [GPTQuery T.Text]
+-- | Monad transformer for DeepSeek\/Ollama conversations.
+-- Uses 'StateT' with a 'ConversationHistoryDeepSeek' to accumulate tagged Q&A turns.
+type MonadDeepSeek m a = StateT ConversationHistoryDeepSeek m a
+
+-- | Accumulated Q&A pairs from a conversation, most-recent first.
+type ConversationHistory = [ConvoQuery T.Text]
 --type ConversationHistoryCWR = [GPTQuery ContentWithRole]
 
+-- | Accumulated tagged message lists from a DeepSeek conversation.
 type ConversationHistoryDeepSeek = [(TagDS, [ContentWithRole])]
 
 -- q == x
 -- a == x ++ "-answer"
 
 
-data GPTQuery a = GPTQuery
-  { _gptQuery_tag :: Tag
-  , _gptQuery_question :: GPTQuestion
-  , _gptQuery_answer ::  GPTAnswer a
+-- | A single tagged question\/answer pair stored in conversation history.
+data ConvoQuery a = ConvoQuery
+  { _convoQuery_tag :: Tag
+  , _convoQuery_question :: ConvoQuestion
+  , _convoQuery_answer ::  ConvoAnswer a
   }
+
+-- | User-defined label for a conversation turn, used by 'RelevantContext'
+-- to select which history items to include as context.
 newtype Tag = Tag { unTag :: T.Text } deriving (Eq,Show)
+
+-- | Tag for DeepSeek conversation items; 'isAnswerDS' distinguishes
+-- question entries from answer entries in the flat history list.
 data TagDS = TagDS { unTagDS :: T.Text, isAnswerDS :: Bool } deriving (Eq,Show, Generic)
 
 instance ToJSON TagDS
 instance FromJSON TagDS
 
-newtype GPTQuestion = GPTQuestion [ContentWithRole]
-newtype GPTAnswer a = GPTAnswer { unGPTAnswer :: a } deriving (Generic, Show)
+-- | The prompt messages for a single conversation question.
+newtype ConvoQuestion = ConvoQuestion [ContentWithRole]
 
-instance ToJSON a => ToJSON (GPTAnswer a)
-instance FromJSON a => FromJSON (GPTAnswer a)
+-- | Wrapper for a parsed answer from a model.
+newtype ConvoAnswer a = ConvoAnswer { unConvoAnswer :: a } deriving (Generic, Show)
 
-type DeepSeekAnswer = GPTAnswer ContentWithRole
+instance ToJSON a => ToJSON (ConvoAnswer a)
+instance FromJSON a => FromJSON (ConvoAnswer a)
 
-newtype GPTError = GPTError T.Text deriving Show
+-- | Convenience alias — DeepSeek answers carry the full 'ContentWithRole'.
+type DeepSeekAnswer = ConvoAnswer ContentWithRole
 
 -- | A tool definition advertised to the model (provider-neutral). The schema is
 -- a JSON-Schema 'Value'; each provider serialises it into its own @tools@ shape.
@@ -295,25 +327,29 @@ data ToolTurn = ToolTurn
   } deriving (Show, Generic)
 
 data RelevantContext
-  = LastN Int
-  | Relevants [Tag]
-  | LastNRelevant Int (Tag -> Bool) -- LastN matching pattern; most general
+  = LastN Int                       -- ^ Take the @n@ most recent items
+  | Relevants [Tag]                 -- ^ Take items matching specific tags
+  | LastNRelevant Int (Tag -> Bool) -- ^ Take the @n@ most recent items whose tag matches a predicate
 
+-- | Same as 'RelevantContext' but for the DeepSeek conversation history.
 data RelevantContextDS
   = LastN_DS Int
   | Relevants_DS [TagDS]
-  | LastNRelevant_DS Int (TagDS -> Bool) -- LastN matching pattern; most general
+  | LastNRelevant_DS Int (TagDS -> Bool)
 
 -- 3 tags:
 --   html-1
 --   html-2
 --   xml-2342
 
+-- | The prompt messages for a single question to DeepSeek.
 newtype DeepSeekQuestion = DeepSeekQuestion [ContentWithRole]
 
+-- | Parsed DeepSeek-R1 response split into @\<think\>@ reasoning and the
+-- final answer. Produced by 'LLM.LLM.toThoughtResponse'.
 data ThoughtResponse = ThoughtResponse
-  { _thoughtResponse_think :: [T.Text]
-  , _thoughtResponse_answer :: [T.Text]
+  { _thoughtResponse_think :: [T.Text]   -- ^ Lines inside @\<think\>...\<\/think\>@
+  , _thoughtResponse_answer :: [T.Text]  -- ^ Lines after the think block
   } deriving Show
 
 instance ToJSON GPTType where
@@ -327,7 +363,24 @@ instance FromJSON GPTType where
     "json_object" -> pure GPT_JSON
     t -> fail . T.unpack $ "unknown GPT type" <> t
 
+-- | Error response from the Ollama API.
+data OllamaError = OllamaError { _ollama_error :: T.Text }
 
+-- | A single content block in an Anthropic response (type + text).
+data AnthropicContent = AnthropicContent
+  { _anthropicContent_type :: T.Text
+  , _anthropicContent_text :: T.Text
+  } deriving (Show, Generic)
+
+-- | Top-level response from the Anthropic Messages API.
+data AnthropicResponse = AnthropicResponse
+  { _anthropicResponse_id      :: T.Text
+  , _anthropicResponse_content :: [AnthropicContent]
+  , _anthropicResponse_model   :: T.Text
+  } deriving (Show, Generic)
+
+deriveJSON (scrubPrefix "_anthropicContent_") ''AnthropicContent
+deriveJSON (scrubPrefix "_anthropicResponse_") ''AnthropicResponse
 deriveJSON (scrubPrefix "_errorOpenAI_") ''ErrorOpenAI
 deriveJSON (scrubPrefix "_errorResponseOpenAI_") ''ErrorResponseOpenAI
 deriveJSON (scrubPrefix "_textToSpeech_") ''TextToSpeechBody
@@ -335,6 +388,7 @@ deriveJSON (scrubPrefix "_gptResponseFormat_") ''GPTResponseFormat
 deriveJSON (scrubPrefix "_cwr_") ''ContentWithRole
 deriveJSON (scrubPrefix "_deepSeekRequest_") ''DeepSeekRequestBody
 deriveJSON (scrubPrefix "_deepSeekResponse_") ''DeepSeekResponse
+deriveJSON (scrubPrefix "_ollama_") ''OllamaError
 
 instance FromJSON Usage
 instance ToJSON Usage
@@ -344,4 +398,4 @@ instance FromJSON ResMessage
 instance ToJSON ResMessage
 
 
-instance ToJSON GPTRequestBody 
+deriveJSON (scrubPrefix "_gptRequest_") ''GPTRequestBody
