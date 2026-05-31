@@ -20,6 +20,7 @@ import LLM.ReadLLM
 
 import Control.Monad.Trans.Reader (runReaderT)
 import Control.Monad.Trans.State (evalStateT, execStateT)
+import Data.Functor.Identity (runIdentity)
 import Data.Aeson (encode, eitherDecode, toJSON, fromJSON, Result(..))
 import Data.Typeable (Typeable, typeRep, Proxy(..))
 import Scrappy.JSON.Record (jString, jInt, jBool)
@@ -40,6 +41,8 @@ tests = testGroup "llm-with-context"
   , testGroup "ContextLabeled" contextLabeledTests
   , testGroup "PrepareContext" prepareContextTests
   , testGroup "Integration" integrationTests
+  , testGroup "TagPattern" tagPatternTests
+  , testGroup "GetsContext" getsContextTests
   ]
 
 -- ============================================================
@@ -872,3 +875,152 @@ prop_prepare_rebinds_state = withTests 1 $ property $ do
     _ -> do
       annotate $ "Expected ConvoSummary at head of state"
       failure
+
+-- ============================================================
+-- TagPattern Tests: matchTag + mkPattern
+-- ============================================================
+
+tagPatternTests :: [TestTree]
+tagPatternTests =
+  [ testProperty "exact match" prop_tag_exact_match
+  , testProperty "wildcard matches any segment" prop_tag_wildcard
+  , testProperty "case insensitive" prop_tag_case_insensitive
+  , testProperty "rejects extra segments" prop_tag_rejects_extra_segments
+  , testProperty "rejects fewer segments" prop_tag_rejects_fewer_segments
+  , testProperty "leading wildcard" prop_tag_leading_wildcard
+  , testProperty "all wildcards match any tag with same segment count" prop_tag_all_wildcards
+  , testProperty "mkPattern splits on --" prop_mkPattern_splits
+  ]
+
+prop_tag_exact_match :: Property
+prop_tag_exact_match = withTests 1 $ property $ do
+  assert $ matchTag (mkPattern "Run0--Decomp") (Tag "Run0--Decomp")
+
+prop_tag_wildcard :: Property
+prop_tag_wildcard = withTests 1 $ property $ do
+  let pat = mkPattern "Run0--PartDetail--*"
+  assert $ matchTag pat (Tag "Run0--PartDetail--cat-legs")
+  assert $ matchTag pat (Tag "Run0--PartDetail--bear-torso")
+  assert $ not $ matchTag pat (Tag "Run0--Fill--cat-legs")
+
+prop_tag_case_insensitive :: Property
+prop_tag_case_insensitive = withTests 1 $ property $ do
+  assert $ matchTag (mkPattern "run0--decomp") (Tag "Run0--Decomp")
+  assert $ matchTag (mkPattern "RUN0--DECOMP") (Tag "run0--decomp")
+
+prop_tag_rejects_extra_segments :: Property
+prop_tag_rejects_extra_segments = withTests 1 $ property $ do
+  assert $ not $ matchTag (mkPattern "Run0--Decomp") (Tag "Run0--Decomp--Extra")
+
+prop_tag_rejects_fewer_segments :: Property
+prop_tag_rejects_fewer_segments = withTests 1 $ property $ do
+  assert $ not $ matchTag (mkPattern "*--*--*") (Tag "A--B")
+
+prop_tag_leading_wildcard :: Property
+prop_tag_leading_wildcard = withTests 1 $ property $ do
+  let pat = mkPattern "*--Fill--ball-body"
+  assert $ matchTag pat (Tag "Run0--Fill--ball-body")
+  assert $ matchTag pat (Tag "Run5--Fill--ball-body")
+  assert $ not $ matchTag pat (Tag "Run0--PartDetail--ball-body")
+
+prop_tag_all_wildcards :: Property
+prop_tag_all_wildcards = withTests 1 $ property $ do
+  let pat = mkPattern "*--*"
+  assert $ matchTag pat (Tag "Run0--Decomp")
+  assert $ matchTag pat (Tag "anything--here")
+  assert $ not $ matchTag pat (Tag "Run0--A--B")
+
+prop_mkPattern_splits :: Property
+prop_mkPattern_splits = withTests 1 $ property $ do
+  unTagPattern (mkPattern "Run0--PartDetail--*") === ["Run0", "PartDetail", "*"]
+  unTagPattern (mkPattern "Decomp") === ["Decomp"]
+  unTagPattern (mkPattern "*--*--*") === ["*", "*", "*"]
+
+-- ============================================================
+-- GetsContext Tests: Gets + NoHistory in getRelevantCtx
+-- ============================================================
+
+-- | Simulated visual pipeline history: 3 structural + 15 PartDetail + 10 Fill = 28 entries
+visualHistory :: ConversationHistory
+visualHistory =
+  [ mkExchange "Run0--Decomp" "decompose the scene" "{\"parts\":[\"body\",\"head\"]}"
+  , mkExchange "Run0--Layout" "position the parts" "{\"parts\":[{\"name\":\"body\",\"x\":0.5}]}"
+  , mkExchange "Run0--PartGuide" "reference guide" "{\"ready\":true}"
+  ]
+  ++ [ mkExchange ("Run0--PartDetail--part" <> T.pack (show i))
+                  ("detail for part " <> T.pack (show i))
+                  ("{\"name\":\"part" <> T.pack (show i) <> "\"}")
+     | i <- [1..15 :: Int]
+     ]
+  ++ [ mkExchange ("Run0--Fill--part" <> T.pack (show i))
+                  ("fill for part " <> T.pack (show i))
+                  ("{\"color\":\"aa0000\"}")
+     | i <- [1..10 :: Int]
+     ]
+
+runGets :: RelevantContext -> ConversationHistory -> ConversationHistory
+runGets ctx hist = runIdentity $ evalStateT (getRelevantCtx ctx) hist
+
+getsContextTests :: [TestTree]
+getsContextTests =
+  [ testProperty "pin returns all matches for exact tag" prop_gets_pin
+  , testProperty "lastNMatching budgets correctly" prop_gets_lastN_budget
+  , testProperty "multiple rules compose" prop_gets_compose
+  , testProperty "chronological order preserved" prop_gets_order
+  , testProperty "no matches returns empty" prop_gets_no_matches
+  , testProperty "NoHistory returns empty" prop_gets_nohistory
+  ]
+
+prop_gets_pin :: Property
+prop_gets_pin = withTests 1 $ property $ do
+  let result = runGets (Gets [pin "Run0--Decomp"]) visualHistory
+  length result === 1
+  entryTag (Prelude.head result) === Tag "Run0--Decomp"
+
+prop_gets_lastN_budget :: Property
+prop_gets_lastN_budget = withTests 1 $ property $ do
+  -- 15 PartDetail entries, budget of 5 → should get 5 most recent
+  let result = runGets (Gets [lastNMatching 5 "Run0--PartDetail--*"]) visualHistory
+  length result === 5
+  -- Most recent means lowest indices in the list (history is newest-first)
+  -- so the first 5 PartDetail matches
+  let tags = map (unTag . entryTag) result
+  assert $ all (T.isInfixOf "PartDetail") tags
+
+prop_gets_compose :: Property
+prop_gets_compose = withTests 1 $ property $ do
+  let ctx = Gets
+        [ pin "Run0--Decomp"
+        , pin "Run0--Layout"
+        , lastNMatching 3 "Run0--PartDetail--*"
+        ]
+      result = runGets ctx visualHistory
+  -- 1 Decomp + 1 Layout + 3 PartDetail = 5
+  length result === 5
+
+prop_gets_order :: Property
+prop_gets_order = withTests 1 $ property $ do
+  let ctx = Gets
+        [ pin "Run0--Decomp"
+        , pin "Run0--Layout"
+        , lastNMatching 2 "Run0--PartDetail--*"
+        ]
+      result = runGets ctx visualHistory
+      tags = map (unTag . entryTag) result
+  -- Decomp comes before Layout comes before PartDetails in the original history
+  -- so the result should preserve that order
+  let decompIdx = Prelude.head [i | (i, t) <- Prelude.zip [0..] tags, T.isInfixOf "Decomp" t]
+      layoutIdx = Prelude.head [i | (i, t) <- Prelude.zip [0..] tags, T.isInfixOf "Layout" t]
+      detailIdxs = [i | (i, t) <- Prelude.zip [0..] tags, T.isInfixOf "PartDetail" t]
+  assert $ decompIdx < layoutIdx
+  assert $ all (> layoutIdx) detailIdxs
+
+prop_gets_no_matches :: Property
+prop_gets_no_matches = withTests 1 $ property $ do
+  let result = runGets (Gets [pin "Run99--Decomp"]) visualHistory
+  length result === 0
+
+prop_gets_nohistory :: Property
+prop_gets_nohistory = withTests 1 $ property $ do
+  let result = runGets NoHistory visualHistory
+  length result === 0

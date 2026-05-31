@@ -232,6 +232,43 @@ entryTag :: ConvoEntry a -> Tag
 entryTag (ConvoExchange q) = _convoQuery_tag q
 entryTag (ConvoSummary t _) = t
 
+-- TODO: Evolve ConversationHistory from a flat list into a tree structure
+-- with summary branches to circumvent deep traversals:
+--
+--   data LLMTree a
+--     = Leaf (ConvoEntry a)
+--     | Branch [LLMTree a]
+--     | Summary T.Text (LLMTree a)   -- N-token summary that stands in for
+--                                     -- its subtree during context selection,
+--                                     -- avoiding full traversal of deep histories.
+--
+-- Open questions:
+--   - How does RelevantContext (Gets, LastN, etc.) interact with Summary nodes?
+--     Does matching a Summary's tag expand it, or does the summary text suffice?
+--   - Who produces the summary? Automatic compaction when a subtree exceeds
+--     a token budget, or explicit user/pipeline control?
+--   - Should Summary nodes be transparent (expand on demand) or opaque
+--     (always use the summary, never recurse)?
+--
+-- TODO: External memory — read/write persistent memory that lives outside
+-- ConversationHistory (e.g. on-disk key-value store, vector DB, or structured
+-- files). The LLM context loop should be able to:
+--   1. Write facts/conclusions to external memory during a conversation
+--   2. Read them back in future conversations (or later in the same one)
+--   3. Use RelevantContext / Gets rules to selectively pull external memory
+--      entries into the prompt, just like history entries
+-- This decouples "what the LLM has learned" from "what fits in the context
+-- window" and enables cross-session knowledge accumulation.
+--
+-- TODO: Haskell package sitemaps as contextual input — generate structured
+-- sitemaps (module hierarchy, exported API surface, key type signatures) for
+-- Haskell packages and inject them into ConversationHistory as pre-seeded
+-- context entries. This gives the LLM a map of available types/functions
+-- without dumping entire source files into the prompt. Possible approach:
+--   1. Parse .cabal exposed-modules + haddock/hie output for each dep
+--   2. Produce a compact sitemap (module → [exported names + signatures])
+--   3. Store as ConvoEntry with a well-known tag (e.g. "Sitemap--<package>")
+--   4. CtxRule patterns can pin/budget sitemaps like any other context
 type ConversationHistory = [ConvoEntry T.Text]
 --type ConversationHistoryCWR = [GPTQuery ContentWithRole]
 
@@ -246,7 +283,7 @@ data ConvoQuery a = ConvoQuery
   , _convoQuery_question :: ConvoQuestion
   , _convoQuery_answer ::  ConvoAnswer a
   }
-newtype Tag = Tag { unTag :: T.Text } deriving (Eq,Show)
+newtype Tag = Tag { unTag :: T.Text } deriving (Eq,Show,Ord)
 data TagDS = TagDS { unTagDS :: T.Text, isAnswerDS :: Bool } deriving (Eq,Show, Generic)
 
 instance ToJSON TagDS
@@ -266,6 +303,45 @@ data RelevantContext
   = LastN Int
   | Relevants [Tag]
   | LastNRelevant Int (Tag -> Bool) -- LastN matching pattern; most general
+  | Gets [CtxRule]     -- ^ Pattern-based composite: union of budgeted tag-glob filters
+  | NoHistory          -- ^ Skip history entirely; caller provides all context in the prompt
+
+-- | A glob pattern over "--"-delimited tag segments.
+-- "*" matches any single segment. Literal text matches case-insensitively.
+newtype TagPattern = TagPattern { unTagPattern :: [T.Text] }
+  deriving (Eq, Show)
+
+-- | Smart constructor: "Run0--PartDetail--*" → TagPattern ["Run0", "PartDetail", "*"]
+mkPattern :: T.Text -> TagPattern
+mkPattern = TagPattern . T.splitOn "--"
+
+-- | Does a tag match a pattern? Segment count must be equal,
+-- "*" matches any segment, literal matches case-insensitively.
+matchTag :: TagPattern -> Tag -> Bool
+matchTag (TagPattern pats) (Tag t) =
+  let segs = T.splitOn "--" t
+  in sameLength pats segs
+     && and (Prelude.zipWith matchSeg pats segs)
+  where
+    matchSeg "*" _ = True
+    matchSeg p  s  = T.toCaseFold p == T.toCaseFold s
+    sameLength [] []         = True
+    sameLength (_:xs) (_:ys) = sameLength xs ys
+    sameLength _ _           = False
+
+-- | A context selection rule: budget + pattern.
+data CtxRule = CtxRule
+  { crBudget  :: Maybe Int      -- ^ Nothing = pinned (include ALL matches)
+  , crPattern :: TagPattern     -- ^ Which history entries this rule matches
+  }
+
+-- | Pin all matches of a pattern (no budget limit).
+pin :: T.Text -> CtxRule
+pin pat = CtxRule Nothing (mkPattern pat)
+
+-- | Take at most N most-recent matches of a pattern.
+lastNMatching :: Int -> T.Text -> CtxRule
+lastNMatching n pat = CtxRule (Just n) (mkPattern pat)
 
 data RelevantContextDS
   = LastN_DS Int

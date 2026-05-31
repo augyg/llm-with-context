@@ -31,6 +31,7 @@ import Data.Default
 import Text.Read (readEither)
 import Data.Maybe (catMaybes)
 import qualified Data.List as L
+import qualified Data.Set as S
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
 import qualified Data.ByteString.Lazy as LBS
@@ -82,6 +83,13 @@ getRelevantCtx = \case
                                take n
                                . filter (anonF . entryTag) $ x
                             )
+  NoHistory -> pure []
+  Gets rules -> gets $ \hist ->
+    let perRule (CtxRule budget pat) =
+          let matches = filter (matchTag pat . entryTag) hist
+          in maybe matches (`take` matches) budget
+        selectedTags = S.fromList $ map entryTag (concatMap perRule rules)
+    in filter (\e -> entryTag e `S.member` selectedTags) hist
   where
     finds hist tags =
       catMaybes $ fmap (\t -> L.find (\h -> t == entryTag h) hist) tags
