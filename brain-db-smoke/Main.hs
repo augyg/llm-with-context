@@ -20,6 +20,7 @@ module Main (main) where
 
 import Control.Monad (forM_, unless)
 import qualified Data.ByteString.Char8 as BS
+import Data.Maybe (listToMaybe)
 import System.Environment (getArgs)
 import System.Exit (exitFailure)
 
@@ -36,14 +37,14 @@ import LLM.Brain.Store
   , recallByKey
   , rememberKeyed
   )
-import LLM.Brain.DB (migrateBrainDb, runBrainBeam, runLexiconBeam, upsertLexeme)
+import LLM.Brain.DB (loadMobyPOS, migrateBrainDb, runBrainBeam, runLexiconBeam, upsertLexeme)
 
 main :: IO ()
 main = do
   args <- getArgs
-  let conninfo = case args of
-        (c : _) -> BS.pack c
-        []      -> "host=/tmp dbname=brain_smoke"
+  let (conninfo, mMoby) = case args of
+        (c : rest) -> (BS.pack c, listToMaybe rest)
+        []         -> ("host=/tmp dbname=brain_smoke", Nothing)
   conn <- connectPostgreSQL conninfo
   migrateBrainDb conn
 
@@ -66,13 +67,34 @@ main = do
     u <- classify "xqzwv"
     pure (t, u)
 
-  let checks =
+  let baseChecks =
         [ ( "brain-db: recall ranks A (perfect), C (partial), spreads to linked D"
           , recalled == ["A", "C", "D"]
           )
         , ("brain-db: lexicon DB hit returns stored POS (Noun, not rule's Both)", posTelemetry == Noun)
         , ("brain-db: lexicon OOV word falls back to the rule classifier", posUnknown == Both)
         ]
+
+  -- If a Moby-POS TSV path is given, load it and verify real-dictionary
+  -- lookups. computer/quickly differ from what the rule classifier answers
+  -- (Both), so a correct result proves the DB POS is in force.
+  mobyChecks <- case mMoby of
+    Nothing -> pure []
+    Just mobyPath -> do
+      loaded <- loadMobyPOS conn mobyPath
+      (pComputer, pQuickly, pBeautiful) <- runEff . runLexiconBeam conn $ do
+        c <- classify "computer"
+        q <- classify "quickly"
+        b <- classify "beautiful"
+        pure (c, q, b)
+      pure
+        [ ("brain-db: Moby load populated the lexicon (>150k rows)", loaded > 150000)
+        , ("brain-db: Moby 'computer' -> Noun (DB, not rule's Both)", pComputer == Noun)
+        , ("brain-db: Moby 'quickly' -> OtherNoise (adverb, not rule's Both)", pQuickly == OtherNoise)
+        , ("brain-db: Moby 'beautiful' -> Adjective", pBeautiful == Adjective)
+        ]
+
+  let checks = baseChecks ++ mobyChecks
   forM_ checks $ \(name, ok) ->
     putStrLn $ (if ok then "PASS  " else "FAIL  ") <> name
   unless (all snd checks) exitFailure

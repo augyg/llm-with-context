@@ -39,12 +39,15 @@ module LLM.Brain.DB
     -- * Interpreters
   , runBrainBeam
   , runLexiconBeam
-    -- * Lexicon seeding (used by the Moby loader + tests)
+    -- * Lexicon seeding (Moby loader + tests)
+  , loadMobyPOS
+  , posFromMobyCodes
   , upsertLexeme
   , renderPOS
   , parsePOS
   ) where
 
+import Control.Monad (forM_)
 import Data.Int (Int64)
 import Data.List (sortBy)
 import qualified Data.Map.Strict as Map
@@ -52,6 +55,8 @@ import Data.Maybe (mapMaybe)
 import Data.Ord (Down (..), comparing)
 import qualified Data.Set as Set
 import Data.Text (Text)
+import qualified Data.Text as T
+import qualified Data.Text.IO as TIO
 
 import Database.Beam
 import Database.Beam.Backend.SQL.BeamExtensions (SqlSerial (..), runInsertReturningList)
@@ -195,6 +200,51 @@ upsertLexeme conn word pos = runBeamPostgres conn $ do
   runDelete $ delete (_bdb_lexicon brainDb) (\l -> _lex_word l ==. val_ word)
   runInsert $ insert (_bdb_lexicon brainDb) $ insertExpressions
     [ LexiconT (val_ word) (val_ (renderPOS pos)) ]
+
+-- | Map a Moby part-of-speech code string to our 'PartOfSpeech'. Moby codes:
+-- @N@ noun, @p@ noun-plural, @h@ noun-phrase, @o@ nominative; @V@ verb
+-- (participle), @t@ transitive, @i@ intransitive; @A@ adjective; @v@ adverb;
+-- plus @C@\/@P@\/@!@\/@r@\/@D@\/@I@ function words. Noun + verb senses combine to
+-- 'Both'; a noun sense wins over a bare adjective sense; an adverb-\/function-only
+-- word is 'OtherNoise' (correctly dropped from keys).
+posFromMobyCodes :: String -> PartOfSpeech
+posFromMobyCodes codes
+  | hasNoun && hasVerb = Both
+  | hasNoun            = Noun
+  | hasVerb            = Verb
+  | hasAdj             = Adjective
+  | otherwise          = OtherNoise
+  where
+    hasNoun = any (`elem` codes) ("Npho" :: String)
+    hasVerb = any (`elem` codes) ("Vti" :: String)
+    hasAdj  = 'A' `elem` codes
+
+-- | Bulk-load a Moby Part-of-Speech TSV (@word<TAB>codes@ per line) into the
+-- lexicon table, replacing its contents. Returns the number of rows loaded.
+-- The data is the public-domain Moby POS list (Grady Ward), pre-filtered to
+-- single lowercase-alphabetic words; the raw Moby codes are interpreted by
+-- 'posFromMobyCodes' here.
+loadMobyPOS :: Connection -> FilePath -> IO Int
+loadMobyPOS conn path = do
+  contents <- TIO.readFile path
+  let rows =
+        [ (w, renderPOS (posFromMobyCodes (T.unpack (T.drop 1 rest))))
+        | line <- T.lines contents
+        , let (w, rest) = T.breakOn "\t" line
+        , not (T.null w)
+        , not (T.null rest)
+        ]
+  runBeamPostgres conn $ do
+    runDelete $ delete (_bdb_lexicon brainDb) (\_ -> val_ True)
+    forM_ (chunksOf 2000 rows) $ \chunk ->
+      runInsert $ insert (_bdb_lexicon brainDb) $
+        insertExpressions [ LexiconT (val_ w) (val_ p) | (w, p) <- chunk ]
+  pure (length rows)
+
+-- | Split a list into chunks of at most @n@ (for batched inserts).
+chunksOf :: Int -> [a] -> [[a]]
+chunksOf _ [] = []
+chunksOf n xs = let (a, b) = splitAt n xs in a : chunksOf n b
 
 -- Brain interpreter ----------------------------------------------------------
 
