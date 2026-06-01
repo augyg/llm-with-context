@@ -21,18 +21,22 @@
 --     deterministically and recall by overlap.
 module LLM.Brain.Catalogue
   ( CatalogueResult (..)
+  , PromptKeys (..)
   , catalogue
   , catalogueWith
   , compactSummarize
   , recallForPrompt
+  , recallFocused
+  , keyForPrompt
   , cataloguePrompt
+  , keyExtractPrompt
   ) where
 
 import qualified Data.Text as T
 
 import Effectful (Eff, (:>))
 
-import LLM.Brain.Key (canonicalizeTerms, keyOf)
+import LLM.Brain.Key (BrainKey, canonicalizeTerms, keyOf)
 import LLM.Brain.Lexicon (Lexicon)
 import LLM.Brain.Store
   ( Brain
@@ -129,6 +133,66 @@ recallForPrompt
 recallForPrompt effort prompt = do
   key <- keyOf prompt
   recallByKey key effort
+
+-- | The cataloguer's reply when keying a READ prompt: just the salient terms,
+-- no value to store.
+data PromptKeys = PromptKeys
+  { pkNouns :: [T.Text]
+  , pkVerbs :: [T.Text]
+  , pkAdjs  :: [T.Text]
+  } deriving (Show)
+
+instance FromJValue PromptKeys where
+  fromJValue (JObject obj) = do
+    ns <- jField obj "nouns"
+    vs <- jField obj "verbs"
+    as <- jField obj "adjectives"
+    Just (PromptKeys (map T.pack ns) (map T.pack vs) (map T.pack as))
+  fromJValue _ = Nothing
+
+-- | The FOCUSED read key: a pre-call asking provider @p@ to pick only the
+-- salient keywords from a prompt and their part of speech, canonicalised through
+-- the same 'Lexicon' the rest of the system uses. Where 'LLM.Brain.Key.keyOf'
+-- keys every content word deterministically (cheap, but @"tell me about
+-- butterflies"@ also keys @tell@), this lets the model focus the lookup on just
+-- @Noun "butterfly"@. It is a plain combinator over the existing @LLM p@ 'ask'
+-- (a normal API call with a key-extraction prompt) + the 'Lexicon' — no new
+-- effect, mirroring 'LLM.Effect.Compaction.compact's @LLM p@+'Memory' shape.
+keyForPrompt
+  :: forall p es. (LLM p :> es, Lexicon :> es)
+  => T.Text -> Eff es (Either ConvoError BrainKey)
+keyForPrompt prompt = do
+  res <- ask @p [cwr System keyExtractPrompt, cwr User prompt]
+  case res of
+    Left e -> pure (Left (ConvoError e))
+    Right out -> case parseLLMJSON out :: Maybe PromptKeys of
+      Nothing -> pure (Left (ConvoError "keyForPrompt: could not parse extracted keys"))
+      Just pk -> Right <$> canonicalizeTerms (pkNouns pk) (pkVerbs pk) (pkAdjs pk)
+
+-- | The focused read path: 'keyForPrompt' (LLM pre-call) then recall by that
+-- key. The more "focused" alternative to 'recallForPrompt' — at the cost of one
+-- LLM call per lookup. Pin the provider: @recallFocused \@'Anthropic effort prompt@.
+recallFocused
+  :: forall p es. (LLM p :> es, Brain :> es, Lexicon :> es)
+  => RecallEffort -> T.Text -> Eff es (Either ConvoError [BrainEntry])
+recallFocused effort prompt = do
+  eKey <- keyForPrompt @p prompt
+  case eKey of
+    Left e    -> pure (Left e)
+    Right key -> Right <$> recallByKey key effort
+
+-- | Instructions for the focused key pre-call.
+keyExtractPrompt :: T.Text
+keyExtractPrompt = T.unlines
+  [ "For the user prompt below, determine the few KEY search keywords a memory"
+  , "lookup should focus on, and whether each is a noun, verb, or adjective."
+  , "Return ONLY a JSON object of EXACTLY this shape:"
+  , "{\"nouns\": [...], \"verbs\": [...], \"adjectives\": [...]}"
+  , ""
+  , "Include only salient content words (the actual topic); drop filler verbs like"
+  , "tell / show / explain / give and all function words. Prefer 1-4 keywords total."
+  , "Example: \"tell me about butterflies\" -> {\"nouns\": [\"butterflies\"], \"verbs\": [], \"adjectives\": []}"
+  ]
 
 -- | The default cataloguer instructions. The model must emit canonical key
 -- terms (so write-vocabulary lines up with the read path) and a durable,

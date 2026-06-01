@@ -71,7 +71,7 @@ import LLM.Brain.Store
   , rememberKeyed
   , runBrainState
   )
-import LLM.Brain.Catalogue (catalogue)
+import LLM.Brain.Catalogue (catalogue, keyForPrompt, recallFocused)
 
 main :: IO ()
 main = do
@@ -91,6 +91,8 @@ main = do
         , ("brain/recall: spreading activation reaches a linked entry", spreadRecallOk)
         , ("brain/compact: identical-key entries merge (Concat)", collisionMergeOk)
         , ("brain/catalogue: mock write path keys via the Lexicon", catalogueKeyOk)
+        , ("brain/focused: keyForPrompt extracts a focused key via the LLM", keyForPromptOk)
+        , ("brain/focused: recallFocused recalls the keyed entry", recallFocusedOk)
         ]
   forM_ checks $ \(name, ok) ->
     putStrLn $ (if ok then "PASS  " else "FAIL  ") <> name
@@ -257,3 +259,41 @@ catalogueKey =
 
 catalogueKeyOk :: Bool
 catalogueKeyOk = catalogueKey == Just (canonicalKey ["scraper", "bot"] ["detect"] [])
+
+-- Focused read path: an LLM pre-call (mocked) extracts just the salient
+-- keyword + POS for "tell me about butterflies", canonicalised through the same
+-- Lexicon as everything else.
+focusedKeyJson :: Text
+focusedKeyJson = "{\"nouns\":[\"butterflies\"],\"verbs\":[],\"adjectives\":[]}"
+
+keyForPromptKey :: Maybe BrainKey
+keyForPromptKey =
+  runPureEff
+    . evalState emptyMemoryStore
+    . runMemoryState
+    . runLexiconRules
+    . runLLMMock @'Anthropic (const (Right focusedKeyJson))
+    $ do
+        e <- keyForPrompt @'Anthropic "tell me about butterflies"
+        pure (either (const Nothing) Just e)
+
+keyForPromptOk :: Bool
+keyForPromptOk = keyForPromptKey == Just (canonicalKey [lemmatize "butterflies"] [] [])
+
+-- recallFocused: the focused key then recalls the entry stored under it.
+recallFocusedVals :: [Text]
+recallFocusedVals =
+  runPureEff
+    . evalState emptyMemoryStore
+    . runMemoryState
+    . evalState emptyBrain
+    . runBrainState defaultWeights
+    . runLexiconRules
+    . runLLMMock @'Anthropic (const (Right focusedKeyJson))
+    $ do
+        _ <- rememberKeyed (canonicalKey [lemmatize "butterflies"] [] []) "BUTTERFLY-NOTE"
+        e <- recallFocused @'Anthropic defaultEffort "tell me about butterflies"
+        pure (either (const []) (map beValue) e)
+
+recallFocusedOk :: Bool
+recallFocusedOk = recallFocusedVals == ["BUTTERFLY-NOTE"]
