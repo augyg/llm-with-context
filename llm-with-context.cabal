@@ -36,6 +36,7 @@ library
     import:           warnings
     exposed-modules:  LLM.JsonExample
                       LLM.LLM
+                      LLM.Retry
                       LLM.Provider
                       LLM.Provider.Backends
                       LLM.ReadLLM
@@ -49,6 +50,7 @@ library
                       LLM.Effect
                       LLM.Effect.Memory
                       LLM.Effect.Anthropic
+                      LLM.Effect.Backend
                       LLM.Effect.OpenAI
                       LLM.Effect.Mock
                       LLM.Effect.Compaction
