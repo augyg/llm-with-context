@@ -65,6 +65,7 @@ library
                       LLM.Brain.Key
                       LLM.Brain.Store
                       LLM.Brain.Catalogue
+                      LLM.Brain.DB
     -- other-modules:
     -- other-extensions:
     build-depends:    base
@@ -102,6 +103,14 @@ library
                     -- tested-with still lists GHC 8.10.7 (the 2.2 / 2.3 line);
                     -- newer releases may have raised the GHC floor.
                     , effectful-core
+                    -- beam-postgres persistence for the keyed Brain + Lexicon
+                    -- (LLM.Brain.DB). Same stack as ace-ws: beam-core for the
+                    -- schema/queries, beam-postgres for the backend, and
+                    -- beam-migrate to create the tables (beam-automigrate is
+                    -- unmaintained for GHC 9.10 / mtl 2.3).
+                    , beam-core
+                    , beam-postgres
+                    , beam-migrate
 
                     
 
@@ -136,5 +145,19 @@ test-suite llm-with-context-test
     build-depends:    base
                     , text
                     , effectful-core
+                    , llm-with-context
+    default-language: Haskell2010
+
+-- Runtime smoke test for the beam-postgres brain interpreters. Compile-checked
+-- by nix; run by hand against an ephemeral Postgres (the nix sandbox + doCheck
+-- have no database). See db-smoke/Main.hs for the invocation.
+executable brain-db-smoke
+    import:           warnings
+    main-is:          Main.hs
+    hs-source-dirs:   brain-db-smoke
+    build-depends:    base
+                    , bytestring
+                    , effectful-core
+                    , postgresql-simple
                     , llm-with-context
     default-language: Haskell2010
