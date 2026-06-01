@@ -51,6 +51,7 @@ library
                       LLM.Effect.Memory
                       LLM.Effect.Anthropic
                       LLM.Effect.Backend
+                      LLM.Effect.Validate
                       LLM.Effect.OpenAI
                       LLM.Effect.Mock
                       LLM.Effect.Compaction

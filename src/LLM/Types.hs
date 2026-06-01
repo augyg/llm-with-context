@@ -331,10 +331,25 @@ data ToolTurn = ToolTurn
   , _toolTurn_assistantBlocks :: [Block]
   } deriving (Show, Generic)
 
+-- | A glob pattern over tag text: @*@ matches any run of characters, @?@ any
+-- single character (e.g. @"Run0--PartDetail--*"@).
+newtype TagPattern = TagPattern { unTagPattern :: T.Text }
+  deriving (Show, Eq)
+
+-- | One context-selection rule: a tag pattern plus an optional recency budget.
+-- @crBudget == Nothing@ pins all entries matching the pattern; @Just n@ keeps
+-- only the most recent @n@.
+data CtxRule = CtxRule
+  { crPattern :: TagPattern
+  , crBudget :: Maybe Int
+  } deriving (Show, Eq)
+
 data RelevantContext
   = LastN Int                       -- ^ Take the @n@ most recent items
   | Relevants [Tag]                 -- ^ Take items matching specific tags
   | LastNRelevant Int (Tag -> Bool) -- ^ Take the @n@ most recent items whose tag matches a predicate
+  | Gets [CtxRule]                  -- ^ Compose several tag-pattern rules (pin-all / last-n-matching)
+  | NoHistory                       -- ^ Include no prior context
 
 -- | Same as 'RelevantContext' but for the DeepSeek conversation history.
 data RelevantContextDS

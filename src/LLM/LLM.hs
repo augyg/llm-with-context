@@ -60,6 +60,11 @@ module LLM.LLM
   , renderHistoryWithRole
   , readTypedAnswer
   , selectRelevant
+    -- * Context-selection DSL (glob tag patterns)
+  , matchTag
+  , mkPattern
+  , pin
+  , lastNMatching
   ) where
 
 import LLM.Types
@@ -133,16 +138,7 @@ renderHistoryWithRole role =
 
 -- | Select conversation history items matching a 'RelevantContext' strategy.
 getRelevantCtx :: Monad m => RelevantContext -> StateT ConversationHistory m ConversationHistory
-getRelevantCtx = \case
-  LastN n -> gets (take n)
-  Relevants tags -> gets (flip finds tags)
-  LastNRelevant n anonF -> gets (\x ->
-                               take n
-                               . filter (anonF . _convoQuery_tag) $ x
-                            )
-  where
-    finds hist tags =
-      catMaybes $ fmap (\t -> L.find (\h -> t == _convoQuery_tag h) hist) tags
+getRelevantCtx rc = gets (selectRelevant rc)
 
 -- | Select DeepSeek conversation history items matching a 'RelevantContextDS' strategy.
 getRelevantCtxDeepSeek :: MonadIO m => RelevantContextDS -> MonadDeepSeek m ConversationHistoryDeepSeek
@@ -423,10 +419,38 @@ gptReturnType typeProxy =
 -- 'StateT' wrapper, so the effect interpreters (which carry history in an
 -- effectful 'State') can reuse the exact same selection rules.
 selectRelevant :: RelevantContext -> ConversationHistory -> ConversationHistory
-selectRelevant = \case
-  LastN n -> take n
-  Relevants tags -> \hist -> catMaybes $ fmap (\t -> L.find (\h -> t == _convoQuery_tag h) hist) tags
-  LastNRelevant n anonF -> take n . filter (anonF . _convoQuery_tag)
+selectRelevant rc hist = case rc of
+  LastN n -> take n hist
+  Relevants tags -> catMaybes $ fmap (\t -> L.find (\h -> t == _convoQuery_tag h) hist) tags
+  LastNRelevant n anonF -> take n (filter (anonF . _convoQuery_tag) hist)
+  Gets rules -> concatMap applyRule rules
+  NoHistory -> []
+  where
+    applyRule (CtxRule pat mb) =
+      let matched = filter (matchTag pat . _convoQuery_tag) hist
+       in maybe matched (`take` matched) mb
+
+-- | Build a tag pattern from glob text (@*@ = any run, @?@ = any single char).
+mkPattern :: T.Text -> TagPattern
+mkPattern = TagPattern
+
+-- | Match a tag against a glob 'TagPattern'.
+matchTag :: TagPattern -> Tag -> Bool
+matchTag (TagPattern pat) (Tag t) = glob (T.unpack pat) (T.unpack t)
+  where
+    glob [] [] = True
+    glob ('*' : ps) cs = glob ps cs || (not (null cs) && glob ('*' : ps) (drop 1 cs))
+    glob ('?' : ps) (_ : cs) = glob ps cs
+    glob (p : ps) (c : cs) = p == c && glob ps cs
+    glob _ _ = False
+
+-- | Pin all entries whose tag matches (an exact tag is a wildcard-free pattern).
+pin :: T.Text -> CtxRule
+pin t = CtxRule (mkPattern t) Nothing
+
+-- | Most recent @n@ entries whose tag matches the glob pattern.
+lastNMatching :: Int -> T.Text -> CtxRule
+lastNMatching n p = CtxRule (mkPattern p) (Just n)
 
 -- | The three-tier read used by the typed variants, factored out of
 -- 'askGPTWithContextTyped' so the plain typed prim ('askTypedBy') and the
