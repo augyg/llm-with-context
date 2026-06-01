@@ -61,6 +61,10 @@ library
                       LLM.Effect.Tool
                       LLM.Effect.Tool.Sandbox
                       LLM.Tooling
+                      LLM.Brain.Lexicon
+                      LLM.Brain.Key
+                      LLM.Brain.Store
+                      LLM.Brain.Catalogue
     -- other-modules:
     -- other-extensions:
     build-depends:    base

@@ -55,6 +55,24 @@ import LLM.Types
   , cwr
   )
 
+import LLM.Brain.Lexicon (PartOfSpeech (..), classifyRules, lemmatize, runLexiconRules)
+import LLM.Brain.Key (BrainKey (..), canonicalKey, keyOf)
+import LLM.Brain.Store
+  ( BrainEntry (..)
+  , allEntries
+  , collisions
+  , compactConcat
+  , defaultEffort
+  , defaultWeights
+  , emptyBrain
+  , getEntry
+  , linkEntries
+  , recallByKey
+  , rememberKeyed
+  , runBrainState
+  )
+import LLM.Brain.Catalogue (catalogue)
+
 main :: IO ()
 main = do
   let checks =
@@ -66,6 +84,13 @@ main = do
         , ("sandbox: shellCommandPaths extracts the path", shellCommandPaths (Grep "x" "sub/dir" False False) == ["sub/dir"])
         , ("sandbox: bwrap argv binds root + ro-binds store + runs exe", bwrapArgvOk)
         , ("sandbox: sandbox-exec profile confines writes to root", sbProfileOk)
+        , ("brain/lexicon: inflections collapse to one lemma", lemmaConsistency)
+        , ("brain/lexicon: POS buckets (noise / noun / adjective)", posBuckets)
+        , ("brain/key: keyOf buckets nouns vs verbs, drops noise", keyBucketsOk)
+        , ("brain/recall: ranks by weighted overlap, excludes non-matches", recallRankingOk)
+        , ("brain/recall: spreading activation reaches a linked entry", spreadRecallOk)
+        , ("brain/compact: identical-key entries merge (Concat)", collisionMergeOk)
+        , ("brain/catalogue: mock write path keys via the Lexicon", catalogueKeyOk)
         ]
   forM_ checks $ \(name, ok) ->
     putStrLn $ (if ok then "PASS  " else "FAIL  ") <> name
@@ -140,3 +165,95 @@ sbProfileOk =
     && not ("(allow network*)" `isInfixOf` profile)
   where
     profile = sandboxExecProfile defaultSbExecConfig "/srv/root"
+
+-- Brain: keyed-memory system -------------------------------------------------
+
+-- Inflections must collapse to the same lemma (this is what lets a written
+-- "scrape" match a read "scraping"), while doubling vs e-restoration is kept
+-- distinct (hopping/hoping).
+lemmaConsistency :: Bool
+lemmaConsistency =
+  lemmatize "scraping" == lemmatize "scrape"
+    && lemmatize "running" == "run"
+    && lemmatize "studies" == lemmatize "study"
+    && lemmatize "queries" == "query"
+    && lemmatize "hopping" /= lemmatize "hoping"
+
+-- Closed-class words are noise; suffix morphology recovers noun/adjective.
+posBuckets :: Bool
+posBuckets =
+  classifyRules "the" == OtherNoise
+    && classifyRules "happiness" == Noun
+    && classifyRules "beautiful" == Adjective
+
+-- keyOf splits a sentence into noun/verb buckets and drops function words.
+keyBuckets :: BrainKey
+keyBuckets = runPureEff . runLexiconRules $ keyOf "barking dogs chase the cat"
+
+keyBucketsOk :: Bool
+keyBucketsOk =
+  "bark" `elem` bkVerbs keyBuckets
+    && "dog" `elem` bkNouns keyBuckets
+    && "cat" `elem` bkNouns keyBuckets
+    && "the" `notElem` (bkNouns keyBuckets ++ bkVerbs keyBuckets)
+
+-- Recall ranks by weighted overlap: a perfect noun match (A) beats a partial
+-- one (C); a non-overlapping entry (B) is not a candidate at all.
+recallRanking :: [Text]
+recallRanking = runPureEff . evalState emptyBrain . runBrainState defaultWeights $ do
+  _ <- rememberKeyed (canonicalKey ["scrape", "bot"] [] []) "A"
+  _ <- rememberKeyed (canonicalKey ["effect", "memory"] [] []) "B"
+  _ <- rememberKeyed (canonicalKey ["scrape", "proxy"] [] []) "C"
+  map beValue <$> recallByKey (canonicalKey ["scrape", "bot"] [] []) defaultEffort
+
+recallRankingOk :: Bool
+recallRankingOk = recallRanking == ["A", "C"]
+
+-- Spreading activation: a linked entry is recalled even with a disjoint key.
+spreadRecall :: [Text]
+spreadRecall = runPureEff . evalState emptyBrain . runBrainState defaultWeights $ do
+  a <- rememberKeyed (canonicalKey ["alpha"] [] []) "A"
+  b <- rememberKeyed (canonicalKey ["zzz"] [] []) "B"
+  linkEntries a "see" b
+  map beValue <$> recallByKey (canonicalKey ["alpha"] [] []) defaultEffort
+
+spreadRecallOk :: Bool
+spreadRecallOk = spreadRecall == ["A", "B"]
+
+-- Two entries with an identical canonical key are one collision group, and
+-- compactConcat fuses their values into a single entry.
+collisionMerge :: (Int, Int, [Text])
+collisionMerge = runPureEff . evalState emptyBrain . runBrainState defaultWeights $ do
+  _ <- rememberKeyed (canonicalKey ["dog"] [] []) "v1"
+  _ <- rememberKeyed (canonicalKey ["dog"] [] []) "v2"
+  before <- length <$> collisions
+  merged <- compactConcat
+  vals <- map beValue <$> allEntries
+  pure (before, merged, vals)
+
+collisionMergeOk :: Bool
+collisionMergeOk = collisionMerge == (1, 1, ["v1\n\nv2"])
+
+-- Catalogue (write path) via the mock LLM: the model's raw terms are lemmatised
+-- through the same Lexicon the read path uses and stored as a canonical key
+-- (scrapers -> scraper, bots -> bot).
+catalogueKey :: Maybe BrainKey
+catalogueKey =
+  runPureEff
+    . evalState emptyMemoryStore
+    . runMemoryState
+    . evalState emptyBrain
+    . runBrainState defaultWeights
+    . runLexiconRules
+    . runLLMMock @'Anthropic (const (Right cannedJson))
+    $ do
+        res <- catalogue @'Anthropic "the scrapers detect bots"
+        case res of
+          Left _  -> pure Nothing
+          Right i -> fmap (fmap beKey) (getEntry i)
+  where
+    cannedJson =
+      "{\"nouns\":[\"scrapers\",\"bots\"],\"verbs\":[\"detect\"],\"adjectives\":[],\"value\":\"## note\"}"
+
+catalogueKeyOk :: Bool
+catalogueKeyOk = catalogueKey == Just (canonicalKey ["scraper", "bot"] ["detect"] [])
