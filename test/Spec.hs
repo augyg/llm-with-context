@@ -71,7 +71,15 @@ import LLM.Brain.Store
   , rememberKeyed
   , runBrainState
   )
-import LLM.Brain.Catalogue (catalogue, keyForPrompt, recallFocused)
+import qualified Data.Text as T
+import LLM.Brain.Catalogue
+  ( BrainAnswer (..)
+  , askWithBrain
+  , catalogue
+  , keyForPrompt
+  , recallFocused
+  , renderRecalled
+  )
 
 main :: IO ()
 main = do
@@ -93,6 +101,8 @@ main = do
         , ("brain/catalogue: mock write path keys via the Lexicon", catalogueKeyOk)
         , ("brain/focused: keyForPrompt extracts a focused key via the LLM", keyForPromptOk)
         , ("brain/focused: recallFocused recalls the keyed entry", recallFocusedOk)
+        , ("brain/render: renderRecalled joins values, empty for none", renderRecalledOk)
+        , ("brain/inject: askWithBrain injects recalled context + reports it", askWithBrainOk)
         ]
   forM_ checks $ \(name, ok) ->
     putStrLn $ (if ok then "PASS  " else "FAIL  ") <> name
@@ -297,3 +307,34 @@ recallFocusedVals =
 
 recallFocusedOk :: Bool
 recallFocusedOk = recallFocusedVals == ["BUTTERFLY-NOTE"]
+
+-- renderRecalled: empty for no entries; joins the values otherwise.
+renderRecalledOk :: Bool
+renderRecalledOk =
+  renderRecalled [] == ""
+    && T.isInfixOf "alpha" rendered
+    && T.isInfixOf "beta" rendered
+  where
+    rendered = renderRecalled [mkEntry "alpha", mkEntry "beta"]
+    mkEntry v = BrainEntry 0 (canonicalKey [] [] []) v 0
+
+-- askWithBrain (memory injection): store an entry, ask with a mock model, and
+-- check the answer comes back AND the injected entry is reported in baInjected.
+askWithBrainResult :: Maybe (Text, [Text])
+askWithBrainResult =
+  runPureEff
+    . evalState emptyMemoryStore
+    . runMemoryState
+    . evalState emptyBrain
+    . runBrainState defaultWeights
+    . runLexiconRules
+    . runLLMMock @'Anthropic (const (Right "MOCK-ANSWER"))
+    $ do
+        _ <- rememberKeyed (canonicalKey ["cat"] [] []) "## Cats"
+        e <- askWithBrain @'Anthropic defaultEffort "cats"
+        pure $ case e of
+          Left _   -> Nothing
+          Right ba -> Just (baAnswer ba, map beValue (baInjected ba))
+
+askWithBrainOk :: Bool
+askWithBrainOk = askWithBrainResult == Just ("MOCK-ANSWER", ["## Cats"])

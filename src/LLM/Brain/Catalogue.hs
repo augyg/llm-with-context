@@ -28,6 +28,14 @@ module LLM.Brain.Catalogue
   , recallForPrompt
   , recallFocused
   , keyForPrompt
+    -- * Memory injection (recall -> prepend -> ask) + what was injected
+  , BrainAnswer (..)
+  , askWithBrain
+  , askWithBrainFocused
+  , brainContextFor
+  , brainContextFocused
+  , entriesAsTurn
+  , renderRecalled
   , cataloguePrompt
   , keyExtractPrompt
   ) where
@@ -51,7 +59,7 @@ import LLM.Brain.Store
   )
 import LLM.Effect (LLM, ask)
 import LLM.Provider (parseLLMJSON)
-import LLM.Types (ConvoError (..), GPTRole (System, User), cwr)
+import LLM.Types (ContentWithRole, ConvoError (..), GPTRole (System, User), cwr)
 
 import Scrappy.JSON.Value (FromJValue (..), JValue (..))
 
@@ -180,6 +188,84 @@ recallFocused effort prompt = do
   case eKey of
     Left e    -> pure (Left e)
     Right key -> Right <$> recallByKey key effort
+
+-- Rendering recalled entries into a prependable turn ------------------------
+
+-- | Render recalled entries into one Markdown block: a short preamble plus each
+-- entry's value (already a @##@-style chunk), in the order recall returned them
+-- (most relevant first). Empty string for no entries.
+renderRecalled :: [BrainEntry] -> T.Text
+renderRecalled [] = ""
+renderRecalled entries = T.intercalate "\n\n" (preamble : map beValue entries)
+  where
+    preamble = "Relevant context recalled from memory (use if helpful, otherwise ignore):"
+
+-- | Recalled entries as a 'System' turn, ready to prepend to a prompt —
+-- BrainMd-style ('LLM.Effect.BrainMd.brainAsTurn'), but assembled from a live
+-- recall instead of a fixed document.
+entriesAsTurn :: [BrainEntry] -> ContentWithRole
+entriesAsTurn = cwr System . renderRecalled
+
+-- | A recall's context turn, or 'Nothing' if it recalled nothing (so a caller
+-- prepends context only when there is some).
+turnOf :: [BrainEntry] -> Maybe ContentWithRole
+turnOf []      = Nothing
+turnOf entries = Just (entriesAsTurn entries)
+
+-- | Deterministic recall ('keyOf') + render as a prependable 'System' turn.
+brainContextFor
+  :: (Brain :> es, Lexicon :> es)
+  => RecallEffort -> T.Text -> Eff es (Maybe ContentWithRole)
+brainContextFor effort prompt = turnOf <$> recallForPrompt effort prompt
+
+-- | Focused (LLM-keyed) recall + render. 'Left' on a failed key pre-call.
+brainContextFocused
+  :: forall p es. (LLM p :> es, Brain :> es, Lexicon :> es)
+  => RecallEffort -> T.Text -> Eff es (Either ConvoError (Maybe ContentWithRole))
+brainContextFocused effort prompt = fmap turnOf <$> recallFocused @p effort prompt
+
+-- Memory injection: recall -> prepend -> ask --------------------------------
+
+-- | A brain-injected ask's result: the model's answer plus the exact entries we
+-- recalled and prepended, so a caller can show the user "what we chose to
+-- include" for this prompt (log 'baInjected' to audit past prompts).
+data BrainAnswer = BrainAnswer
+  { baAnswer   :: T.Text
+  , baInjected :: [BrainEntry]
+  } deriving (Show)
+
+-- | Memory injection (deterministic): key the prompt via 'keyOf', recall the
+-- relevant entries, prepend them as a 'System' turn, ask provider @p@, and
+-- return the answer together with the injected entries. Pin the provider:
+-- @askWithBrain \@'Anthropic effort "user question"@.
+askWithBrain
+  :: forall p es. (LLM p :> es, Brain :> es, Lexicon :> es)
+  => RecallEffort -> T.Text -> Eff es (Either ConvoError BrainAnswer)
+askWithBrain effort userText = do
+  entries <- recallForPrompt effort userText
+  injectedAsk @p entries userText
+
+-- | 'askWithBrain' but keys the prompt with the LLM pre-call ('recallFocused').
+askWithBrainFocused
+  :: forall p es. (LLM p :> es, Brain :> es, Lexicon :> es)
+  => RecallEffort -> T.Text -> Eff es (Either ConvoError BrainAnswer)
+askWithBrainFocused effort userText = do
+  eEntries <- recallFocused @p effort userText
+  case eEntries of
+    Left e        -> pure (Left e)
+    Right entries -> injectedAsk @p entries userText
+
+-- | Prepend the entries as a 'System' turn (when any), ask, and tag the answer
+-- with what was injected.
+injectedAsk
+  :: forall p es. (LLM p :> es)
+  => [BrainEntry] -> T.Text -> Eff es (Either ConvoError BrainAnswer)
+injectedAsk entries userText = do
+  let ctx = maybe [] pure (turnOf entries)
+  res <- ask @p (ctx <> [cwr User userText])
+  pure $ case res of
+    Left e    -> Left (ConvoError e)
+    Right ans -> Right (BrainAnswer ans entries)
 
 -- | Instructions for the focused key pre-call.
 keyExtractPrompt :: T.Text
