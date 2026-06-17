@@ -60,6 +60,10 @@ library
                       LLM.Effect.MemoryGraph
                       LLM.Effect.Tool
                       LLM.Effect.Tool.Sandbox
+                      LLM.Effect.Budget
+                      LLM.Effect.Clock
+                      LLM.Effect.Concurrent
+                      LLM.Effect.FileSystem
                       LLM.Tooling
     -- other-modules:
     -- other-extensions:
@@ -71,6 +75,7 @@ library
                     , directory
                     , fgl
                     , filepath
+                    , time
                     , http-client
                     , http-types
                     , http-client-tls
