@@ -35,19 +35,25 @@ module LLM.Effect.Budget
   , estimateInputTokens
     -- * Interpreter
   , runBudget
+  , runBudgetIO
   , loadOrInit
+    -- * Config loading
+  , loadBudgetConfigOrDefault
   ) where
 
+import qualified Data.Aeson as Aeson
 import Data.Aeson (FromJSON, ToJSON)
+import qualified Data.ByteString.Lazy as BL
 import Data.Time.Clock (UTCTime, addUTCTime, diffUTCTime)
 import GHC.Generics (Generic)
+import qualified System.Directory as Dir
 
-import Effectful (Dispatch (Dynamic), DispatchOf, Eff, Effect, (:>))
+import Effectful (Dispatch (Dynamic), DispatchOf, Eff, Effect, IOE, inject, (:>))
 import Effectful.Dispatch.Dynamic (interpret, send)
 
-import LLM.Effect.Clock (Clock, getCurrentTime)
-import LLM.Effect.Concurrent (Atomic, withAtomic)
-import LLM.Effect.FileSystem (FileSystem, atomicWriteJSONFile, readJSONFile)
+import LLM.Effect.Clock (Clock, getCurrentTime, runClockIO)
+import LLM.Effect.Concurrent (Atomic, runAtomicIO, withAtomic)
+import LLM.Effect.FileSystem (FileSystem, atomicWriteJSONFile, readJSONFile, runFileSystemIO)
 import LLM.Effect.Memory (estimateTokens)
 import LLM.Types (ContentWithRole, _cwr_content)
 
@@ -196,3 +202,47 @@ loadOrInit path = do
     Left _  -> do
       now <- getCurrentTime
       pure (BudgetState now 0)
+
+-- | All-in-one IO-grounded interpreter that composes the three narrow
+-- interpreters ('runClockIO' + 'runFileSystemIO' + 'runAtomicIO') under
+-- the public 'Budget' effect, leaving only @Budget@ visible to the inner
+-- action. Use this when the consumer doesn't want to hand-compose the
+-- assembly recipe shown in 'runBudget'\'s haddock — i.e. most apps.
+--
+-- > runBudgetIO cfg $ do
+-- >    requireTokens 64 msgs
+-- >    ask msgs
+--
+-- The state file (@_budgetConfig_stateFile cfg@) is read at start and
+-- rewritten atomically on every debit / reset.
+runBudgetIO
+  :: (IOE :> es)
+  => BudgetConfig
+  -> Eff (Budget : es) a
+  -> Eff es a
+runBudgetIO cfg act =
+  runClockIO . runFileSystemIO $ do
+    initial <- loadOrInit (_budgetConfig_stateFile cfg)
+    runAtomicIO initial (runBudget cfg (inject act))
+
+-- | Load a 'BudgetConfig' from a JSON file, falling back to @fallback@
+-- when the file is missing or unparseable. The fallback lets each app
+-- bake in its own defaults (cap / window / state-file path) without the
+-- library taking an opinion.
+--
+-- Pure 'IO' rather than effectful so it can run before the effect row
+-- is set up — typical pattern is @loadBudgetConfigOrDefault path
+-- myDefaults@ inside @main@ before 'runBudgetIO'.
+loadBudgetConfigOrDefault
+  :: FilePath        -- ^ JSON config path (e.g. @configs/budget.json@)
+  -> BudgetConfig    -- ^ fallback if the file is missing or unparseable
+  -> IO BudgetConfig
+loadBudgetConfigOrDefault path fallback = do
+  exists <- Dir.doesFileExist path
+  if not exists
+    then pure fallback
+    else do
+      bs <- BL.readFile path
+      case Aeson.eitherDecode' bs of
+        Right c -> pure c
+        Left _  -> pure fallback

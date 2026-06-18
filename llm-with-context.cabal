@@ -61,6 +61,7 @@ library
                       LLM.Effect.Tool
                       LLM.Effect.Tool.Sandbox
                       LLM.Effect.Budget
+                      LLM.Effect.Budget.Policy
                       LLM.Effect.Clock
                       LLM.Effect.Concurrent
                       LLM.Effect.FileSystem
