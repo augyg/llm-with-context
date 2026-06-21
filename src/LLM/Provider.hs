@@ -68,11 +68,14 @@ data LLMError
 -- | Transport + provider data for an LLM backend.
 --
 -- APIWeb: Manager, base URL, API key, model name, max tokens, provider
--- APICLI: executable path, model name
+-- APICLI: executable path, model name, extra args inserted between the
+--         fixed @-p --model M --dangerously-skip-permissions@ flags and
+--         the prompt body (e.g. @["--debug"]@). Pass @[]@ for the
+--         default invocation.
 -- APIMock: pure function (for tests)
 data LLMAPI
   = APIWeb Manager URI T.Text T.Text (Maybe Int) WebProvider
-  | APICLI FilePath T.Text
+  | APICLI FilePath T.Text [String]
   | APIMock ([ContentWithRole] -> IO (Either LLMError T.Text))
 
 -- | A named LLM backend (display name + transport details).
@@ -104,7 +107,7 @@ askBackend backend msgs = case _llmBackend_api backend of
     ProviderOpenAI    -> askOpenAI mgr (show url) key model maxToks msgs
     ProviderAnthropic -> askAnthropic mgr (show url) key model msgs
     ProviderOllama    -> askOllama mgr (show url) model msgs
-  APICLI exec model   -> askCLI exec model msgs
+  APICLI exec model extraArgs -> askCLI exec model extraArgs msgs
   APIMock f            -> f msgs
 
 -- | Send messages to the configured backend and return the raw text response.
@@ -239,18 +242,23 @@ askOllama mgr url model msgs = do
       Left e -> pure . Left . LLMParseError . T.pack $ e
       Right a -> pure . Right . _cwr_content . _deepSeekResponse_message $ a
 
-askCLI :: FilePath -> T.Text -> [ContentWithRole] -> IO (Either LLMError T.Text)
-askCLI exec model msgs = do
+-- | Shell out to a Claude-style CLI. @extraArgs@ are inserted between
+-- the fixed @-p --model M --dangerously-skip-permissions@ flags and
+-- the prompt body — use them to pin an alternate model, add a debug
+-- flag, etc., without touching this function.
+askCLI :: FilePath -> T.Text -> [String] -> [ContentWithRole] -> IO (Either LLMError T.Text)
+askCLI exec model extraArgs msgs = do
   let combinedPrompt = T.unpack $ T.intercalate "\n\n"
         [ _cwr_content m | m <- msgs ]
   curEnv <- getEnvironment
   let cleanEnv = filter ((/= "CLAUDECODE") . fst) curEnv
-      cp = (proc exec
-              [ "-p"
-              , "--model", T.unpack model
-              , "--dangerously-skip-permissions"
-              , combinedPrompt
-              ]) { env = Just cleanEnv }
+      args = [ "-p"
+             , "--model", T.unpack model
+             , "--dangerously-skip-permissions"
+             ]
+          <> extraArgs
+          <> [ combinedPrompt ]
+      cp = (proc exec args) { env = Just cleanEnv }
   (CE.try $ readCreateProcessWithExitCode cp "" :: IO (Either SomeException (ExitCode, String, String))) >>= \case
     Left e ->
       pure $ Left $ LLMProcessError 1 (T.pack $ show e)
