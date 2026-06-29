@@ -4,6 +4,7 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE TypeOperators #-}
@@ -60,6 +61,7 @@ import System.Process
   , proc
   , readCreateProcessWithExitCode
   )
+import System.Which (staticWhich)
 
 import Effectful (Eff, IOE, liftIO, (:>))
 import Effectful.Dispatch.Dynamic (interpret, send)
@@ -138,19 +140,17 @@ readPreamble = \case
     <> T.unlines [ "  - " <> T.pack p | p <- ps ]
     <> "\n"
 
--- | Shell out to the @claude@ binary with the typed args. The binary
--- name is looked up on @PATH@ at runtime. (CLAUDE.md prefers
--- compile-time resolution via 'staticWhich', but the current
--- llm-with-context nixpkgs pin predates @claude-code@; a follow-up
--- bump to a nixpkgs containing it can swap this to @$(staticWhich
--- \"claude\")@.)
+-- | Shell out to the @claude@ binary with the typed args. The path is
+-- resolved at COMPILE time via 'staticWhich' so we get a determinate
+-- /nix/store path baked in — the build pulls 'claude-code' from a
+-- pinned newer-than-24.11 nixpkgs (see default.nix's 'newerPkgs').
 runClaudeAsk :: AskArgs -> IO (Either T.Text T.Text)
 runClaudeAsk a = do
   let argv = askArgs a
       scrub = aScrubEnv a
   curEnv <- getEnvironment
   let cleanEnv = filter (\(k, _) -> k `notElem` scrub) curEnv
-      cp = (proc "claude" argv)
+      cp = (proc $(staticWhich "claude") argv)
              { env = Just cleanEnv }
   result <- CE.try (readCreateProcessWithExitCode cp "")
               :: IO (Either CE.SomeException (ExitCode, String, String))

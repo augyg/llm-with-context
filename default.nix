@@ -2,6 +2,15 @@ let
   pkgs = import (builtins.fetchTarball {
     url = "https://github.com/NixOS/nixpkgs/archive/refs/heads/nixos-24.11.tar.gz";
   }) { };
+  # claude-code isn't in nixpkgs 24.11 yet, but it lives in nixpkgs-unstable.
+  # Pin a specific unstable rev (per the CLAUDE.md lazamar pattern) so
+  # 'newerPkgs.claude-code' resolves without bumping the rest of the channel.
+  # rev: e6f23dc08d3624daab7094b701aa3954923c6bbb (2025-06-16, claude-code 1.0.21)
+  # sha256 verified locally via `nix-prefetch-url --unpack <url>`.
+  newerPkgs = import (builtins.fetchTarball {
+    url = "https://github.com/NixOS/nixpkgs/archive/e6f23dc08d3624daab7094b701aa3954923c6bbb.tar.gz";
+    sha256 = "0m0xmk8sjb5gv2pq7s8w7qxf7qggqsd3rxzv3xrqkhfimy2x7bnx";
+  }) { };
   hlib = pkgs.haskell.lib;
   # GHC 9.10: the merged-in upstream modules depend on scrappy-json (base >= 4.19)
   # and upstream targets base 4.20, so the unified tree builds on 9.10, not the
@@ -50,13 +59,13 @@ let
   # it there; because the resolved path is baked into the object code, nix then
   # tracks bubblewrap as a runtime dependency automatically.
   #
-  # NOTE: LLM.Provider.AnthropicCli looks up the @claude@ binary at runtime
-  # via PATH (the binary lives in a more recent nixpkgs than the GHC 9.10.1
-  # set above; pinning it here would require a second nixpkgs import).
-  # Consumers wire the binary in via their own shell.nix.
+  # Same story for claude-code: LLM.Provider.AnthropicCli uses
+  # $(staticWhich "claude") so the binary path is baked in at compile time.
+  # It comes from the pinned 'newerPkgs' above (claude-code isn't yet in
+  # nixpkgs 24.11).
   llm-with-context =
-    hlib.addBuildTool
+    hlib.addBuildTools
       (hp.callCabal2nix "llm-with-context" (cleanSrc ./.) { inherit scrappy-core scrappy-json; })
-      pkgs.bubblewrap;
+      [ pkgs.bubblewrap newerPkgs.claude-code ];
 in
 hlib.doCheck llm-with-context
