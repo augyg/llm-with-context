@@ -25,6 +25,7 @@ module LLM.Capability
     CanText (..)
     -- * Multimodal
   , CanMultimodal (..)
+  , ImageInput
     -- * Structured output
   , CanJsonOutput (..)
     -- * Tool use
@@ -36,6 +37,7 @@ import qualified Data.Text as T
 import Effectful (Eff, (:>))
 
 import LLM.Effect (LLM)
+import LLM.Effect.ImageInput (ImageInput)
 import LLM.Types (APIProvider)
 
 -- | Text-only ask. Every provider implements this — it's the universal
@@ -52,7 +54,6 @@ class CanText (p :: APIProvider) where
 -- without vision capability simply don't have the instance — calling
 -- 'askWithImages' against them is a compile error.
 class CanMultimodal (p :: APIProvider) where
-  type ImageInput p :: Type
   askWithImages :: (LLM p :> es) => ImageInput p -> T.Text -> Eff es T.Text
 
 -- | Structured-output ask. The 'Schema' family is per-provider because

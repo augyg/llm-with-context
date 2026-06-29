@@ -28,6 +28,7 @@ module LLM.Effect
   , askTyped
   , askWithContext
   , askWithContextTyped
+  , askMultimodal
     -- * Provider aliases
   , askAnthropic
   , askOpenAI
@@ -38,6 +39,7 @@ module LLM.Effect
   , runCtxTyped
   ) where
 
+import LLM.Effect.ImageInput (ImageInput)
 import LLM.Effect.Memory (Memory, recall, remember)
 import LLM.LLM (gptReturnType, readTypedAnswer)
 import LLM.Types
@@ -70,6 +72,16 @@ data LLM (p :: APIProvider) :: Effect where
   AskWithContext :: RelevantContext -> (Tag, ConvoQuestion) -> LLM p m (Either ConvoError (ConvoAnswer T.Text))
   AskWithContextTyped :: (Typeable a, Read a) => RelevantContext -> (Tag, ConvoQuestion) -> LLM p m (Either ConvoError (ConvoAnswer a))
   AskTools :: [ToolDef] -> [RichMessage] -> LLM p m (Either T.Text ToolTurn)
+  -- | Provider-specific multimodal ask. The 'ImageInput' family is
+  -- defined in "LLM.Effect.ImageInput" (broken out into its own module
+  -- to avoid an import cycle with "LLM.Capability"). Each provider's
+  -- interpreter pattern-matches on this and routes the image carrier
+  -- to its native multimodal-request mechanic. Carrying it through
+  -- the GADT (rather than letting the 'CanMultimodal' instance escape
+  -- to IO via 'unsafeEff_') means cross-cutting middleware — Budget,
+  -- Retry, Memory, Log — observes multimodal calls the same way it
+  -- observes text-only 'Ask' calls.
+  AskMultimodal :: ImageInput p -> [ContentWithRole] -> LLM p m (Either T.Text T.Text)
 
 type instance DispatchOf (LLM p) = Dynamic
 
@@ -96,6 +108,15 @@ askWithContextTyped
   => RelevantContext -> (Tag, ConvoQuestion) -> Eff es (Either ConvoError (ConvoAnswer a))
 askWithContextTyped relCtx q =
   send (AskWithContextTyped relCtx q :: LLM p (Eff es) (Either ConvoError (ConvoAnswer a)))
+
+-- | Multimodal ask against provider @p@: ship the provider-specific
+-- image carrier alongside the text turns. Pin the provider with a
+-- type application: @askMultimodal \@'AnthropicCli paths contents@.
+askMultimodal
+  :: forall p es. (LLM p :> es)
+  => ImageInput p -> [ContentWithRole] -> Eff es (Either T.Text T.Text)
+askMultimodal img contents =
+  send (AskMultimodal img contents :: LLM p (Eff es) (Either T.Text T.Text))
 
 -- | @ask@ pinned to Anthropic.
 askAnthropic :: (LLM 'AnthropicHttp :> es) => [ContentWithRole] -> Eff es (Either T.Text T.Text)

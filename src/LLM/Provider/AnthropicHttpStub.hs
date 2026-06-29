@@ -27,7 +27,7 @@ module LLM.Provider.AnthropicHttpStub
 
 import qualified Data.ByteString as BS
 
-import LLM.Capability (CanMultimodal (..), CanText (..))
+import LLM.Capability (CanMultimodal (..), CanText (..), ImageInput)
 import LLM.Types (APIProvider (..))
 
 -- | Single-marker handle for everything this module owes the HTTP
@@ -45,6 +45,7 @@ instance CanText 'AnthropicHttp where
 -- the request body's @content@ blocks. Pinned in the type family so
 -- consumers can name the carrier (e.g. via @Encoding@) without forcing
 -- a lowest-common-denominator on the CLI's path-based input.
+type instance ImageInput 'AnthropicHttp = [BS.ByteString]
+
 instance CanMultimodal 'AnthropicHttp where
-  type ImageInput 'AnthropicHttp = [BS.ByteString]
   askWithImages _ _ = claudeDeferredLogicImplementation

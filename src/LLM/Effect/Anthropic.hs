@@ -2,6 +2,7 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TypeOperators #-}
 
 -- | Anthropic interpreter for the @LLM 'AnthropicHttp@ effect. Closes over a
@@ -34,5 +35,12 @@ runLLMAnthropic cfg = interpret $ \_ -> \case
   AskWithContext rc q      -> runCtx injectHistory (askClaude cfg) rc q
   AskWithContextTyped rc q -> runCtxTyped injectHistory (askClaude cfg) rc q
   AskTools defs msgs       -> askClaudeTools cfg defs msgs
+  -- Multimodal via the HTTP transport is not wired here yet — the
+  -- HTTP-side carrier is base64 image bytes, which 'askClaude' does
+  -- not currently embed in its request body. Surface a loud, specific
+  -- error rather than silently routing text-only.
+  AskMultimodal _img _contents ->
+    pure (Left "LLM.Effect.Anthropic: AskMultimodal is not supported by the HTTP interpreter \
+                \(use runLLMAnthropicCli for multimodal asks).")
   where
     injectHistory histItems = [renderHistoryWithRole System histItems]

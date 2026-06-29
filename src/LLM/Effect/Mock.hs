@@ -39,6 +39,10 @@ runLLMMock respond = interpret $ \_ -> \case
   AskTyped contents        -> askTypedBy (pure . respond) contents
   AskWithContext rc q      -> runCtx injectHistory (pure . respond) rc q
   AskWithContextTyped rc q -> runCtxTyped injectHistory (pure . respond) rc q
+  -- Multimodal: the mock backend has no notion of the per-provider
+  -- 'ImageInput' carrier, so drop it and route the text turns through
+  -- the same responder. Mock tests assert against the text payload.
+  AskMultimodal _img contents -> pure (respond contents)
   -- Mock never requests tools, so an agent loop over it terminates at once.
   AskTools _defs msgs ->
     let contents = [cwr role t | RichMessage role bs <- msgs, BlockText t <- bs]

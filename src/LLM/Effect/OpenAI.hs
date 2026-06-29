@@ -2,6 +2,7 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TypeOperators #-}
 
 -- | OpenAI interpreter for the @LLM 'OpenAIHttp@ effect. Closes over a 'GPTConfig'
@@ -31,5 +32,12 @@ runLLMOpenAI cfg = interpret $ \_ -> \case
   AskWithContext rc q      -> runCtx injectHistory (askGPTServant cfg) rc q
   AskWithContextTyped rc q -> runCtxTyped injectHistory (askGPTServant cfg) rc q
   AskTools defs msgs       -> askGPTServantTools cfg defs msgs
+  -- Multimodal: OpenAI's chat-completions vision endpoint takes URLs
+  -- (or base64 data-URIs) embedded in 'content' parts. 'askGPTServant'
+  -- does not currently model that shape, so report it loudly rather
+  -- than silently routing text-only.
+  AskMultimodal _img _contents ->
+    pure (Left "LLM.Effect.OpenAI: AskMultimodal is not supported by the HTTP interpreter \
+                \(no image-carrier wiring through askGPTServant yet).")
   where
     injectHistory histItems = [renderHistory histItems]

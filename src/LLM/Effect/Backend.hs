@@ -48,6 +48,14 @@ runLLMBackend env = interpret $ \_ -> \case
   AskWithContextTyped rc q -> runCtxTyped injectHistory prim rc q
   AskTools _ _             ->
     pure (Left "LLM.Effect.Backend: tool use is not supported over this transport")
+  -- The generic 'LLMBackend' dispatcher is provider-agnostic and has
+  -- no slot for the per-provider 'ImageInput' carrier. Surface a
+  -- specific error rather than silently dropping the image carrier
+  -- and routing text-only — multimodal callers should pick a
+  -- provider-specific interpreter (e.g. 'runLLMAnthropicCli').
+  AskMultimodal _img _contents ->
+    pure (Left "LLM.Effect.Backend: AskMultimodal is not supported by the generic backend \
+                \interpreter — use a provider-specific interpreter (e.g. runLLMAnthropicCli).")
   where
     prim :: [ContentWithRole] -> Eff es (Either T.Text T.Text)
     prim contents = liftIO (first renderLLMError <$> askBackend (_llmEnv_backend env) contents)

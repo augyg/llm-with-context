@@ -19,11 +19,12 @@ import Effectful.State.Static.Local (evalState)
 
 import qualified Control.Exception as CE
 import LLM.Capability (askText)
-import LLM.Effect (askWithContext)
+import LLM.Effect (askMultimodal, askWithContext)
 import LLM.Provider.AnthropicCli
   ( AskArgs (..)
   , askArgs
   , defaultAskArgs
+  , multimodalAskArgs
   , readPreamble
   )
 -- Importing these stub modules brings the deferred capability instances
@@ -61,6 +62,7 @@ import LLM.Effect.Tool.Sandbox
 import Data.List (isInfixOf)
 import LLM.Types
   ( APIProvider (..)
+  , ContentWithRole (..)
   , ConvoAnswer (..)
   , ConvoQuery (..)
   , ConvoQuestion (..)
@@ -111,6 +113,9 @@ main = do
         , ("anthropic-cli: askArgs prepends -p and skip-perms", argvFrontMatter)
         , ("anthropic-http: askText stub throws on touch", anthropicHttpStubThrows)
         , ("openai-http: askText stub throws on touch", openAIHttpStubThrows)
+        , ("anthropic-cli: multimodalAskArgs binds --add-dir per unique parent dir", multimodalArgsDirsOk)
+        , ("anthropic-cli: multimodalAskArgs prepends Read-tool preamble to prompt", multimodalArgsPreambleOk)
+        , ("effect: AskMultimodal routes through Mock backend's responder", askMultimodalRoutesOk)
         ]
   forM_ checks $ \(name, ok) ->
     putStrLn $ (if ok then "PASS  " else "FAIL  ") <> name
@@ -218,6 +223,40 @@ argvFrontMatter =
   let av = askArgs (defaultAskArgs "hello")
   in take 2 av == ["-p", "--dangerously-skip-permissions"]
        && last av == "hello"
+
+-- Two-image multimodal: --add-dir must appear once per unique parent dir
+-- (equals-bound), in the same order as nub-deduped takeDirectory.
+multimodalArgsDirsOk :: Bool
+multimodalArgsDirsOk =
+  let a   = multimodalAskArgs ["/srv/a/1.png", "/srv/a/2.png", "/srv/b/3.png"] [cwr User "go"]
+      av  = askArgs a
+  in    "--add-dir=/srv/a" `elem` av
+     && "--add-dir=/srv/b" `elem` av
+     && length (filter (== "--add-dir=/srv/a") av) == 1
+     && aAddDirs a == ["/srv/a", "/srv/b"]
+
+-- The constructed prompt body must lead with the Read-tool preamble and
+-- carry the flattened user contents after it.
+multimodalArgsPreambleOk :: Bool
+multimodalArgsPreambleOk =
+  let a = multimodalAskArgs ["/img/x.png"] [cwr User "describe please"]
+  in    "Read the image file at /img/x.png using your Read tool." `T.isInfixOf` aPrompt a
+     && "describe please" `T.isInfixOf` aPrompt a
+
+-- Routing 'askMultimodal' through the Mock interpreter must reach the
+-- responder with the text contents intact (the image carrier is dropped
+-- by the mock, by design — the assertion is on the text path).
+askMultimodalRoutesOk :: Bool
+askMultimodalRoutesOk =
+  let result = runPureEff
+        . evalState emptyMemoryStore
+        . runMemoryState
+        . runLLMMock @'AnthropicCli (\contents ->
+            if any (\c -> "frame.png" `T.isInfixOf` _cwr_content c) contents
+              then Right "saw-frame"
+              else Right "no-frame")
+        $ askMultimodal @'AnthropicCli ["/img/frame.png"] [cwr User "frame.png is the image"]
+  in result == Right "saw-frame"
 
 -- 'CE.evaluate'-driven check: was an exception raised when forcing the action?
 -- The stub modules' 'claudeDeferredLogicImplementation' throws a pure 'error',

@@ -22,7 +22,7 @@ module LLM.Provider.OpenAIHttpStub
 
 import qualified Data.Text as T
 
-import LLM.Capability (CanMultimodal (..), CanText (..))
+import LLM.Capability (CanMultimodal (..), CanText (..), ImageInput)
 import LLM.Types (APIProvider (..))
 
 -- | Single-marker handle for everything this module owes the HTTP
@@ -38,6 +38,7 @@ instance CanText 'OpenAIHttp where
 -- | OpenAI's vision API accepts image URLs (and base64 data URIs); we
 -- model the carrier as URL-shaped 'T.Text' for now. Pinned in the
 -- type family.
+type instance ImageInput 'OpenAIHttp = [T.Text]
+
 instance CanMultimodal 'OpenAIHttp where
-  type ImageInput 'OpenAIHttp = [T.Text]
   askWithImages _ _ = claudeDeferredLogicImplementation

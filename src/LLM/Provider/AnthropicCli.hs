@@ -46,6 +46,7 @@ module LLM.Provider.AnthropicCli
   , askArgs
     -- * Multimodal helper
   , readPreamble
+  , multimodalAskArgs
     -- * Effect runner
   , runLLMAnthropicCli
   ) where
@@ -65,9 +66,8 @@ import System.Which (staticWhich)
 
 import Effectful (Eff, IOE, liftIO, (:>))
 import Effectful.Dispatch.Dynamic (interpret, send)
-import Effectful.Internal.Monad (unsafeEff_)
 
-import LLM.Capability (CanMultimodal (..), CanText (..))
+import LLM.Capability (CanMultimodal (..), CanText (..), ImageInput)
 import LLM.Effect (LLM (..))
 import LLM.Effect.Memory (Memory)
 import LLM.Types
@@ -169,6 +169,19 @@ runClaudeAsk a = do
 flattenContents :: [ContentWithRole] -> T.Text
 flattenContents = T.intercalate "\n\n" . map _cwr_content
 
+-- | Build the typed 'AskArgs' for a multimodal CLI ask. Pure helper so
+-- the argv shape is testable without invoking the @claude@ binary:
+--   * @--add-dir=<DIR>@ per unique parent directory ('nub'-deduped);
+--   * 'readPreamble' prepended in front of the flattened user prompt;
+--   * default print-mode + skip-permissions front matter (via
+--     'defaultAskArgs').
+multimodalAskArgs :: [FilePath] -> [ContentWithRole] -> AskArgs
+multimodalAskArgs paths contents =
+  let dirs     = nub (map takeDirectory paths)
+      preamble = readPreamble paths
+      body     = preamble <> flattenContents contents
+  in (defaultAskArgs body) { aAddDirs = dirs }
+
 -- | Interpret @LLM 'AnthropicCli@ against the real @claude@ binary.
 -- The interpreter handles the generic 'Ask' op; the capability classes
 -- ('CanText', 'CanMultimodal') sit on top of 'Ask' as more typed entry
@@ -179,6 +192,12 @@ runLLMAnthropicCli
   -> Eff es a
 runLLMAnthropicCli = interpret $ \_ -> \case
   Ask contents -> liftIO $ runClaudeAsk (defaultAskArgs (flattenContents contents))
+  -- Multimodal: derive each path's parent dir, prepend the Read-tool
+  -- preamble in front of the flattened user prompt, and bind --add-dir
+  -- per unique dir (EQUALS-BOUND, see module header). The result
+  -- routes through the same 'runClaudeAsk' shellout as 'Ask', so
+  -- cross-cutting middleware observes both uniformly.
+  AskMultimodal paths contents -> liftIO $ runClaudeAsk (multimodalAskArgs paths contents)
   -- Typed / context / tools paths are not modelled at the CLI yet;
   -- the capability classes give the supported intents typed entry
   -- points. These three deliberately throw at runtime so a consumer
@@ -207,32 +226,27 @@ instance CanText 'AnthropicCli where
       Left e  -> error ("LLM.Provider.AnthropicCli.askText: " <> T.unpack e)
       Right t -> pure t
 
--- | Multimodal ask: 'ImageInput' is the list of image paths the CLI
--- will Read via its tool.  Mechanics, per the module header:
+-- | 'ImageInput' carrier for the CLI: the raw list of image file paths
+-- to grant Read-tool access to. Pinned as a top-level @type instance@
+-- (the family lives in "LLM.Effect.ImageInput") so the 'AskMultimodal'
+-- GADT constructor can carry it as a typed field at the effect layer.
+type instance ImageInput 'AnthropicCli = [FilePath]
+
+-- | Multimodal ask: route through the 'AskMultimodal' GADT
+-- constructor via 'send', so the framework's middleware (Budget,
+-- Retry, Memory, Log) observes the call the same way it observes
+-- text-only 'Ask' calls. The CLI-specific @--add-dir=<DIR>@ + Read-
+-- tool preamble mechanics live in the interpreter
+-- ('runLLMAnthropicCli'), not here.
 --
---   1. Derive each path's parent directory ('nub' for dedup).
---   2. Emit @--add-dir=<DIR>@ per unique directory.
---   3. Auto-prepend the \"Read the image…\" preamble in front of the
---      domain prompt.
---
--- The caller supplies only the DOMAIN portion of the prompt — the
--- instance handles the read-the-files mechanics.
---
--- Note: this instance carries an additional 'IOE' constraint via
--- 'unsafeEff_' inside the body, because the @--add-dir=<DIR>@ argv
--- machinery is not modelled at the @LLM@ GADT layer (which always
--- wraps prompts via 'defaultAskArgs'). Lifting directly to IO keeps
--- the equals-bound add-dir grants intact. A future refactor could
--- widen the GADT with a dedicated @AskCli@ constructor and drop the
--- escape; for now this is the pragmatic shape.
+-- The class method's signature returns 'T.Text' (no Either), so the
+-- Left case becomes a runtime error — same shape as 'CanText.askText'.
+-- The honest-API path is 'askMultimodal' from "LLM.Effect", which
+-- returns the @Either@ directly.
 instance CanMultimodal 'AnthropicCli where
-  type ImageInput 'AnthropicCli = [FilePath]
   askWithImages paths userPrompt = do
-    let dirs     = nub (map takeDirectory paths)
-        preamble = readPreamble paths
-        args     = (defaultAskArgs (preamble <> userPrompt))
-                     { aAddDirs = dirs }
-    res <- unsafeEff_ (runClaudeAsk args)
+    res <- send (AskMultimodal paths [ContentWithRole User userPrompt]
+                  :: LLM 'AnthropicCli (Eff es) (Either T.Text T.Text))
     case res of
       Left e  -> error ("LLM.Provider.AnthropicCli.askWithImages: " <> T.unpack e)
       Right t -> pure t

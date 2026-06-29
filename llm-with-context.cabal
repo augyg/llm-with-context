@@ -52,6 +52,7 @@ library
                       LLM.Provider.OpenAIHttpStub
                       LLM.Capability
                       LLM.Effect
+                      LLM.Effect.ImageInput
                       LLM.Effect.Memory
                       LLM.Effect.Anthropic
                       LLM.Effect.Backend
