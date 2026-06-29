@@ -12,7 +12,7 @@
 -- Two backends are supported:
 --
 -- * __OpenAI__ — 'askGPT', 'askGPTTyped', 'askGPTJSON', 'askGPTWithContext',
---   'askGPTWithContextTyped'.  Requires an @'APIKey' \'OpenAI@ and an
+--   'askGPTWithContextTyped'.  Requires an @'APIKey' \'OpenAIHttp@ and an
 --   @http-client@ 'Manager'.
 --
 -- * __DeepSeek \/ Ollama__ — 'askDeepSeek', 'askDeepSeekWithContext'.
@@ -184,7 +184,7 @@ askGPTWithContextTyped
   , Read a
   , MonadIO m
   )
-  => APIKey 'OpenAI
+  => APIKey 'OpenAIHttp
   -> Manager
   -> TokenLimit
   -> RelevantContext
@@ -222,7 +222,7 @@ askGPTWithContextTyped key mgr tokenLimit relCtx (thisTag, ConvoQuestion content
 -- in state on success.
 askGPTWithContext
   :: MonadIO m
-  => APIKey 'OpenAI
+  => APIKey 'OpenAIHttp
   -> Manager
   -> TokenLimit
   -> RelevantContext
@@ -368,7 +368,7 @@ askGPTTyped
   , Typeable a
   , Read a
   )
-  => APIKey 'OpenAI
+  => APIKey 'OpenAIHttp
   -> Manager
   -> TokenLimit
   -> ConvoQuestion
@@ -485,7 +485,7 @@ type TokenLimit = Maybe Int
 
 -- | Low-level OpenAI chat-completion call. Sends messages to
 -- @\/v1\/chat\/completions@ and returns the first choice's content or an error.
-askGPT :: MonadIO m => APIKey 'OpenAI -> Manager -> T.Text -> TokenLimit -> [ContentWithRole] -> m (Either T.Text T.Text)
+askGPT :: MonadIO m => APIKey 'OpenAIHttp -> Manager -> T.Text -> TokenLimit -> [ContentWithRole] -> m (Either T.Text T.Text)
 askGPT apiKey mgr modelName maxTokens contents = liftIO $ do
   putStrLn "askGPT"
   let url = "https://api.openai.com/v1/chat/completions"
@@ -593,7 +593,7 @@ askDeepSeek mgr modelDS contents = liftIO $ do
 -- Returns @Right Nothing@ if the response is valid text but not valid JSON for @b@.
 askGPTJSON
   :: FromJSON b
-  => APIKey 'OpenAI
+  => APIKey 'OpenAIHttp
   -> Manager
   -> TokenLimit
   -> [ContentWithRole]

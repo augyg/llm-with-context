@@ -38,7 +38,7 @@ dsModelToText m = case toJSON m of
   _        -> T.pack (show m)
 
 -- | OpenAI backend.
-mkOpenAI :: APIKey 'OpenAI -> Manager -> T.Text -> TokenLimit -> LLMBackend
+mkOpenAI :: APIKey 'OpenAIHttp -> Manager -> T.Text -> TokenLimit -> LLMBackend
 mkOpenAI apiKey mgr modelName tokenLimit = LLMBackend
   { _llmBackend_name = "openai/" <> modelName
   , _llmBackend_api  = APIWeb mgr
@@ -56,7 +56,7 @@ mkDeepSeek mgr modelDS = LLMBackend
   }
 
 -- | Anthropic Claude API backend.
-mkClaudeAPI :: APIKey 'Anthropic -> Manager -> T.Text -> LLMBackend
+mkClaudeAPI :: APIKey 'AnthropicHttp -> Manager -> T.Text -> LLMBackend
 mkClaudeAPI apiKey mgr modelName = LLMBackend
   { _llmBackend_name = "claude-api/" <> modelName
   , _llmBackend_api  = APIWeb mgr

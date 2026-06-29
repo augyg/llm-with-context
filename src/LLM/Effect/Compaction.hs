@@ -10,7 +10,7 @@
 -- | Compaction: cross-effect combinators over @LLM p@ AND 'Memory'. Deliberately
 -- NOT a 'Memory' operation — summarisation needs the LLM, so the dependency
 -- lives here, visible in the constraints. Pin the provider that does the
--- summarising (@compact \@'Anthropic@, or the 'compactAnthropic' alias).
+-- summarising (@compact \@'AnthropicHttp@, or the 'compactAnthropic' alias).
 module LLM.Effect.Compaction
   ( summarizeHistory
   , compact
@@ -49,9 +49,9 @@ compact = summarizeHistory @p >>= \case
     forM_ (reverse pinned) remember
 
 -- | 'compact' pinned to Anthropic.
-compactAnthropic :: (LLM 'Anthropic :> es, Memory :> es) => Eff es ()
-compactAnthropic = compact @'Anthropic
+compactAnthropic :: (LLM 'AnthropicHttp :> es, Memory :> es) => Eff es ()
+compactAnthropic = compact @'AnthropicHttp
 
 -- | 'compact' pinned to OpenAI.
-compactOpenAI :: (LLM 'OpenAI :> es, Memory :> es) => Eff es ()
-compactOpenAI = compact @'OpenAI
+compactOpenAI :: (LLM 'OpenAIHttp :> es, Memory :> es) => Eff es ()
+compactOpenAI = compact @'OpenAIHttp

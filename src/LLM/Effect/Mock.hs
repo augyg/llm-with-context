@@ -9,7 +9,7 @@
 -- a deterministic responder; run the whole stack with 'Effectful.runPureEff'
 -- for fast tests. Typed and context operations reuse the real decoders/loops
 -- ('askTypedBy', 'runCtx', 'runCtxTyped'), so only the transport is faked.
--- Pin the provider if it's ambiguous: @runLLMMock \@'Anthropic respond@.
+-- Pin the provider if it's ambiguous: @runLLMMock \@'AnthropicHttp respond@.
 module LLM.Effect.Mock
   ( runLLMMock
   ) where

@@ -1,5 +1,6 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications #-}
 
 -- | Pure tests for the effect layer. Everything here runs via 'runPureEff' —
@@ -10,12 +11,26 @@ module Main (main) where
 
 import Control.Monad (forM_, unless)
 import Data.Text (Text)
+import qualified Data.Text as T
 import System.Exit (exitFailure)
 
 import Effectful (runPureEff)
 import Effectful.State.Static.Local (evalState)
 
+import qualified Control.Exception as CE
+import LLM.Capability (askText)
 import LLM.Effect (askWithContext)
+import LLM.Provider.AnthropicCli
+  ( AskArgs (..)
+  , askArgs
+  , defaultAskArgs
+  , readPreamble
+  )
+-- Importing these stub modules brings the deferred capability instances
+-- into scope so the throw-on-touch tests can typecheck. The modules
+-- themselves export nothing other than their instances.
+import LLM.Provider.AnthropicHttpStub ()
+import LLM.Provider.OpenAIHttpStub ()
 import LLM.Effect.Memory
   ( emptyMemoryStore
   , pin
@@ -57,6 +72,28 @@ import LLM.Types
 
 main :: IO ()
 main = do
+  -- The stub instances' method bodies reduce immediately to a pure
+  -- 'error' (via 'claudeDeferredLogicImplementation'). Forcing the
+  -- returned 'Eff' value to WHNF therefore raises the exception even
+  -- without an interpreter — what matters is that the binding is
+  -- bottom, not that the Eff action ever runs. We run it through
+  -- 'runPureEff' against an empty effect row only to fix the
+  -- otherwise-ambiguous @es@; because the body never inspects the
+  -- effect row, this still triggers the underlying 'error'.
+  let anthropicProbe :: Text
+      anthropicProbe = runPureEff
+        . evalState emptyMemoryStore
+        . runMemoryState
+        . runLLMMock @'AnthropicHttp (\_ -> Right "n/a")
+        $ askText @'AnthropicHttp "x"
+      openAIProbe    :: Text
+      openAIProbe    = runPureEff
+        . evalState emptyMemoryStore
+        . runMemoryState
+        . runLLMMock @'OpenAIHttp (\_ -> Right "n/a")
+        $ askText @'OpenAIHttp "x"
+  anthropicHttpStubThrows <- throws (CE.evaluate anthropicProbe)
+  openAIHttpStubThrows    <- throws (CE.evaluate openAIProbe)
   let checks =
         [ ("memory: remember/recallAll round-trip", memCount == 2)
         , ("memory: pinned turn survives prune", pinnedTags == ["keep"])
@@ -66,6 +103,14 @@ main = do
         , ("sandbox: shellCommandPaths extracts the path", shellCommandPaths (Grep "x" "sub/dir" False False) == ["sub/dir"])
         , ("sandbox: bwrap argv binds root + ro-binds store + runs exe", bwrapArgvOk)
         , ("sandbox: sandbox-exec profile confines writes to root", sbProfileOk)
+        , ("anthropic-cli: readPreamble [] is empty", readPreamble [] == "")
+        , ("anthropic-cli: readPreamble [p] uses Read tool wording"
+          , readPreamble ["/img/a.png"] == "Read the image file at /img/a.png using your Read tool.\n\n")
+        , ("anthropic-cli: readPreamble [p1,p2] enumerates as bullets", multiPreambleOk)
+        , ("anthropic-cli: askArgs emits --add-dir=DIR (equals-bound)", addDirEqualsBound)
+        , ("anthropic-cli: askArgs prepends -p and skip-perms", argvFrontMatter)
+        , ("anthropic-http: askText stub throws on touch", anthropicHttpStubThrows)
+        , ("openai-http: askText stub throws on touch", openAIHttpStubThrows)
         ]
   forM_ checks $ \(name, ok) ->
     putStrLn $ (if ok then "PASS  " else "FAIL  ") <> name
@@ -95,10 +140,10 @@ ctxTurns =
   runPureEff
     . evalState emptyMemoryStore
     . runMemoryState
-    . runLLMMock @'Anthropic (\_ -> Right "ok")
+    . runLLMMock @'AnthropicHttp (\_ -> Right "ok")
     $ do
-        _ <- askWithContext @'Anthropic (LastN 10) (Tag "q1", ConvoQuestion [cwr User "hi"])
-        _ <- askWithContext @'Anthropic (LastN 10) (Tag "q2", ConvoQuestion [cwr User "again"])
+        _ <- askWithContext @'AnthropicHttp (LastN 10) (Tag "q1", ConvoQuestion [cwr User "hi"])
+        _ <- askWithContext @'AnthropicHttp (LastN 10) (Tag "q2", ConvoQuestion [cwr User "again"])
         length <$> recallAll
 
 -- A custom (pure) Tool backend: stdout is just the rendered command name.
@@ -140,3 +185,44 @@ sbProfileOk =
     && not ("(allow network*)" `isInfixOf` profile)
   where
     profile = sandboxExecProfile defaultSbExecConfig "/srv/root"
+
+-- A two-path preamble must enumerate the paths as a bullet list inside the
+-- "Read the following image files" header.
+multiPreambleOk :: Bool
+multiPreambleOk =
+  let p = readPreamble ["/a/x.png", "/a/y.png"]
+  in "Read the following image files" `T.isInfixOf` p
+       && "  - /a/x.png" `T.isInfixOf` p
+       && "  - /a/y.png" `T.isInfixOf` p
+  where
+    -- shadowed import to keep this self-contained without changing the
+    -- top of the file
+    _shadow = ()
+
+-- Two-path askArgs must emit BOTH --add-dir flags in the equals-bound form
+-- ("--add-dir=DIR"), never as separate "--add-dir" "DIR" tokens, because the
+-- CLI's argparse otherwise greedily consumes the following positional prompt.
+addDirEqualsBound :: Bool
+addDirEqualsBound =
+  let a   = (defaultAskArgs "hello") { aAddDirs = ["/srv/a", "/srv/b"] }
+      av  = askArgs a
+  in    "--add-dir=/srv/a" `elem` av
+     && "--add-dir=/srv/b" `elem` av
+     && "--add-dir" `notElem` av  -- bare form must not appear
+     && last av == "hello"        -- prompt is last positional
+
+-- The default args must put -p and --dangerously-skip-permissions in front of
+-- the prompt body.
+argvFrontMatter :: Bool
+argvFrontMatter =
+  let av = askArgs (defaultAskArgs "hello")
+  in take 2 av == ["-p", "--dangerously-skip-permissions"]
+       && last av == "hello"
+
+-- 'CE.evaluate'-driven check: was an exception raised when forcing the action?
+-- The stub modules' 'claudeDeferredLogicImplementation' throws a pure 'error',
+-- so the underlying SomeException catches it.
+throws :: forall a. IO a -> IO Bool
+throws m = do
+  r <- CE.try m :: IO (Either CE.SomeException a)
+  pure (either (const True) (const False) r)

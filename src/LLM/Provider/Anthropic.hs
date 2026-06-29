@@ -77,7 +77,7 @@ import Servant.Client (BaseUrl (..), ClientError, ClientM, Scheme (Https), clien
 -- rather than passed as a fistful of arguments most callers don't care about.
 data ClaudeConfig = ClaudeConfig
   { _claudeConfig_manager :: Manager
-  , _claudeConfig_apiKey :: APIKey 'Anthropic
+  , _claudeConfig_apiKey :: APIKey 'AnthropicHttp
   , _claudeConfig_model :: T.Text
   , _claudeConfig_version :: T.Text
   , _claudeConfig_baseUrl :: BaseUrl
@@ -92,7 +92,7 @@ data ClaudeConfig = ClaudeConfig
 -- 'Manager' (the two values with no universal default). Override any other
 -- field with record-update syntax
 -- (e.g. @(defaultClaudeConfig key mgr) { _claudeConfig_model = "..." }@).
-defaultClaudeConfig :: APIKey 'Anthropic -> Manager -> ClaudeConfig
+defaultClaudeConfig :: APIKey 'AnthropicHttp -> Manager -> ClaudeConfig
 defaultClaudeConfig key mgr = ClaudeConfig
   { _claudeConfig_manager = mgr
   , _claudeConfig_apiKey = key

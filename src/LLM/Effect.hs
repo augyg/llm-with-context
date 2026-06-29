@@ -10,9 +10,9 @@
 
 -- | The provider-parameterised @LLM@ effect (dynamic dispatch, via @effectful@).
 --
--- @LLM 'Anthropic@ and @LLM 'OpenAI@ are DISTINCT effects, so a program can use
--- both in one stack (@(LLM 'Anthropic :> es, LLM 'OpenAI :> es)@). Each call
--- names its provider — via a type application (@ask \@'Anthropic@) or the
+-- @LLM 'AnthropicHttp@ and @LLM 'OpenAIHttp@ are DISTINCT effects, so a program can use
+-- both in one stack (@(LLM 'AnthropicHttp :> es, LLM 'OpenAIHttp :> es)@). Each call
+-- names its provider — via a type application (@ask \@'AnthropicHttp@) or the
 -- 'askAnthropic' / 'askOpenAI' aliases. Each provider's interpreter pins @p@
 -- (see "LLM.Effect.Anthropic" / "LLM.Effect.OpenAI").
 --
@@ -73,11 +73,11 @@ data LLM (p :: APIProvider) :: Effect where
 
 type instance DispatchOf (LLM p) = Dynamic
 
--- | Ask provider @p@ (pin it: @ask \@'Anthropic ...@).
+-- | Ask provider @p@ (pin it: @ask \@'AnthropicHttp ...@).
 ask :: forall p es. (LLM p :> es) => [ContentWithRole] -> Eff es (Either T.Text T.Text)
 ask contents = send (Ask contents :: LLM p (Eff es) (Either T.Text T.Text))
 
--- | Typed ask against provider @p@ (e.g. @askTyped \@'Anthropic \@Int ...@).
+-- | Typed ask against provider @p@ (e.g. @askTyped \@'AnthropicHttp \@Int ...@).
 askTyped
   :: forall p a es. (LLM p :> es, Typeable a, Read a)
   => [ContentWithRole] -> Eff es (Either ConvoError (ConvoAnswer a))
@@ -98,12 +98,12 @@ askWithContextTyped relCtx q =
   send (AskWithContextTyped relCtx q :: LLM p (Eff es) (Either ConvoError (ConvoAnswer a)))
 
 -- | @ask@ pinned to Anthropic.
-askAnthropic :: (LLM 'Anthropic :> es) => [ContentWithRole] -> Eff es (Either T.Text T.Text)
-askAnthropic = ask @'Anthropic
+askAnthropic :: (LLM 'AnthropicHttp :> es) => [ContentWithRole] -> Eff es (Either T.Text T.Text)
+askAnthropic = ask @'AnthropicHttp
 
 -- | @ask@ pinned to OpenAI.
-askOpenAI :: (LLM 'OpenAI :> es) => [ContentWithRole] -> Eff es (Either T.Text T.Text)
-askOpenAI = ask @'OpenAI
+askOpenAI :: (LLM 'OpenAIHttp :> es) => [ContentWithRole] -> Eff es (Either T.Text T.Text)
+askOpenAI = ask @'OpenAIHttp
 
 -- | Tool-enabled ask against provider @p@: advertise the tool definitions, send
 -- the conversation so far, and get back the assistant's turn (text + any tool

@@ -53,13 +53,13 @@ import LLM.Types
 main :: IO ()
 main = do
   mgr <- newTlsManager
-  let key = APIKey "sk-ant-placeholder" :: APIKey 'Anthropic
+  let key = APIKey "sk-ant-placeholder" :: APIKey 'AnthropicHttp
       cfg = defaultClaudeConfig key mgr -- override fields with record-update if desired
   backend <- detectBackend
   let sandboxCfg = mkSandboxConfig "/tmp/llm-with-context-sandbox" backend
 
   -- 1. Full tool loop against a sandboxed Tool, then compact the history.
-  --    Stack (innermost first): LLM 'Anthropic, Tool, Reader ToolSet, Memory,
+  --    Stack (innermost first): LLM 'AnthropicHttp, Tool, Reader ToolSet, Memory,
   --    State MemoryStore, IOE.
   answer <- runEff
     . evalState emptyMemoryStore
@@ -81,7 +81,7 @@ main = do
     . runMemoryState
     . runToolSandboxed sandboxCfg
     . runLLMAnthropic cfg
-    $ stepTooled @'Anthropic toolDefs firstMsgs
+    $ stepTooled @'AnthropicHttp toolDefs firstMsgs
   case step of
     Left err -> putStrLn ("step error: " <> show err)
     Right (turn, resultBlocks) ->

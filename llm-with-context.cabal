@@ -46,7 +46,11 @@ library
                       LLM.ProviderMeta
                       LLM.Provider.Servant
                       LLM.Provider.Anthropic
+                      LLM.Provider.AnthropicCli
+                      LLM.Provider.AnthropicHttpStub
                       LLM.Provider.OpenAI
+                      LLM.Provider.OpenAIHttpStub
+                      LLM.Capability
                       LLM.Effect
                       LLM.Effect.Memory
                       LLM.Effect.Anthropic

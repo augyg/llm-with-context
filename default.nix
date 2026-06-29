@@ -49,6 +49,11 @@ let
   # LLM.Effect.Tool.Sandbox resolves to its /nix/store path. addBuildTool puts
   # it there; because the resolved path is baked into the object code, nix then
   # tracks bubblewrap as a runtime dependency automatically.
+  #
+  # NOTE: LLM.Provider.AnthropicCli looks up the @claude@ binary at runtime
+  # via PATH (the binary lives in a more recent nixpkgs than the GHC 9.10.1
+  # set above; pinning it here would require a second nixpkgs import).
+  # Consumers wire the binary in via their own shell.nix.
   llm-with-context =
     hlib.addBuildTool
       (hp.callCabal2nix "llm-with-context" (cleanSrc ./.) { inherit scrappy-core scrappy-json; })

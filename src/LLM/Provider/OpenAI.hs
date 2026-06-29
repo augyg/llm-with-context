@@ -66,7 +66,7 @@ import Servant.Client (BaseUrl (..), ClientError, ClientM, Scheme (Https), clien
 -- lives here too (globally decided for the request scope, not a per-call arg).
 data GPTConfig = GPTConfig
   { _gptConfig_manager :: Manager
-  , _gptConfig_apiKey :: APIKey 'OpenAI
+  , _gptConfig_apiKey :: APIKey 'OpenAIHttp
   , _gptConfig_model :: T.Text
   , _gptConfig_baseUrl :: BaseUrl
   , _gptConfig_maxTokens :: Int
@@ -78,7 +78,7 @@ data GPTConfig = GPTConfig
 
 -- | Sensible, overridable defaults given the per-request key and a shared
 -- 'Manager' (the two values with no universal default).
-defaultGPTConfig :: APIKey 'OpenAI -> Manager -> GPTConfig
+defaultGPTConfig :: APIKey 'OpenAIHttp -> Manager -> GPTConfig
 defaultGPTConfig key mgr = GPTConfig
   { _gptConfig_manager = mgr
   , _gptConfig_apiKey = key

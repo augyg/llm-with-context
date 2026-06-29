@@ -4,7 +4,7 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE TypeOperators #-}
 
--- | Anthropic interpreter for the @LLM 'Anthropic@ effect. Closes over a
+-- | Anthropic interpreter for the @LLM 'AnthropicHttp@ effect. Closes over a
 -- 'ClaudeConfig' (which carries the per-request API key) and dispatches to the
 -- prims in "LLM.Provider.Anthropic". History is injected as a 'System' turn
 -- (Anthropic requires the first message to be a @user@ turn);
@@ -18,7 +18,7 @@ import LLM.Effect (LLM (..), runCtx, runCtxTyped)
 import LLM.Effect.Memory (Memory)
 import LLM.LLM (renderHistoryWithRole)
 import LLM.Provider.Anthropic (ClaudeConfig, askClaude, askClaudeTools, askClaudeTyped)
-import LLM.Types (APIProvider (Anthropic), GPTRole (System))
+import LLM.Types (APIProvider (AnthropicHttp), GPTRole (System))
 
 import Effectful (Eff, IOE, (:>))
 import Effectful.Dispatch.Dynamic (interpret)
@@ -26,7 +26,7 @@ import Effectful.Dispatch.Dynamic (interpret)
 runLLMAnthropic
   :: (IOE :> es, Memory :> es)
   => ClaudeConfig
-  -> Eff (LLM 'Anthropic : es) a
+  -> Eff (LLM 'AnthropicHttp : es) a
   -> Eff es a
 runLLMAnthropic cfg = interpret $ \_ -> \case
   Ask contents             -> askClaude cfg contents

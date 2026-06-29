@@ -186,7 +186,7 @@ runToolSet = runReader
 -- each model tool call is dispatched onto the 'Tool' GADT ('dispatchToolUse'),
 -- its result fed back, repeat until the model answers with no further tool
 -- calls. The advertised tools + loop cap come from the read-only 'ToolSet' env
--- (set once via 'runToolSet'). Pin the provider: @askTooled \@'Anthropic [...]@.
+-- (set once via 'runToolSet'). Pin the provider: @askTooled \@'AnthropicHttp [...]@.
 askTooled
   :: forall p es. (LLM p :> es, Tool :> es, Reader ToolSet :> es)
   => [ContentWithRole] -> Eff es (Either T.Text T.Text)
@@ -218,7 +218,7 @@ askTooledWith defs maxIters initial = loop initialMessages 0
 -- model made ('dispatchToolUse'), and hands back BOTH the raw 'ToolTurn' (what
 -- the model said / wanted) and the 'BlockToolResult's from running those calls.
 -- The caller assembles the next message list (see 'appendToolRound') and decides
--- whether to loop. Pin the provider: @stepTooled \@'Anthropic defs msgs@.
+-- whether to loop. Pin the provider: @stepTooled \@'AnthropicHttp defs msgs@.
 stepTooled
   :: forall p es. (LLM p :> es, Tool :> es)
   => [ToolDef] -> [RichMessage] -> Eff es (Either T.Text (ToolTurn, [Block]))
@@ -241,12 +241,12 @@ appendToolRound msgs t resultBlocks =
 
 -- | 'askTooled' pinned to Anthropic.
 askTooledAnthropic
-  :: (LLM 'Anthropic :> es, Tool :> es, Reader ToolSet :> es)
+  :: (LLM 'AnthropicHttp :> es, Tool :> es, Reader ToolSet :> es)
   => [ContentWithRole] -> Eff es (Either T.Text T.Text)
-askTooledAnthropic = askTooled @'Anthropic
+askTooledAnthropic = askTooled @'AnthropicHttp
 
 -- | 'askTooled' pinned to OpenAI.
 askTooledOpenAI
-  :: (LLM 'OpenAI :> es, Tool :> es, Reader ToolSet :> es)
+  :: (LLM 'OpenAIHttp :> es, Tool :> es, Reader ToolSet :> es)
   => [ContentWithRole] -> Eff es (Either T.Text T.Text)
-askTooledOpenAI = askTooled @'OpenAI
+askTooledOpenAI = askTooled @'OpenAIHttp

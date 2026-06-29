@@ -26,8 +26,26 @@ import Data.ByteString.Lazy as LBS
 import GHC.Generics
 
 
-data APIProvider = OpenAI | Google | AWS | Anthropic
--- Define the APIKey type with a phantom type parameter
+-- | The set of deployment surfaces we can target. Each constructor is ONE
+-- concrete transport (binary + wire shape), not a vendor. Same vendor with
+-- different transports = different constructors (e.g. @'AnthropicHttp@ for
+-- the HTTPS Messages API vs @'AnthropicCli@ for the local @claude@ binary).
+--
+-- Closed sum kind on purpose — the @LLM (p :: APIProvider)@ effect, the
+-- 'APIKey' phantom, and the per-provider 'LLM.Capability' instances all
+-- pivot on this. Adding a new deployment surface = adding one constructor
+-- + the matching capability instances.
+data APIProvider
+  = AnthropicCli   -- ^ The local @claude@ binary (no API key; capability via subscription).
+  | AnthropicHttp  -- ^ @POST https://api.anthropic.com/v1/messages@.
+  | OpenAIHttp     -- ^ OpenAI chat-completions HTTP API.
+  | GoogleHttp     -- ^ Google's HTTP API (Gemini etc.).
+  | AwsBedrock     -- ^ AWS Bedrock.
+  | DeepSeekHttp   -- ^ DeepSeek HTTP API (and Ollama-hosted DeepSeek).
+-- Define the APIKey type with a phantom type parameter. CLI providers
+-- like 'AnthropicCli' do not consume an 'APIKey' (their auth is the
+-- subscription baked into the binary) — those provider tags simply
+-- aren't used here.
 newtype APIKey (api :: APIProvider) = APIKey { unAPIKey :: T.Text }
 
 -- | OpenAI chat-completion request body. Serializes directly to the JSON
