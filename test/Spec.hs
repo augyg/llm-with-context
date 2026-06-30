@@ -40,7 +40,9 @@ import LLM.Effect.Memory
   , remember
   , runMemoryState
   )
-import LLM.Effect.Mock (runLLMMock)
+import Data.IORef (newIORef, readIORef)
+import LLM.Effect.Mock (runLLMMock, runLLMMockRecording)
+import Effectful (runEff)
 import LLM.Effect.Tool
   ( ShellCommand (..)
   , ToolHandlers (..)
@@ -96,6 +98,8 @@ main = do
         $ askText @'OpenAIHttp "x"
   anthropicHttpStubThrows <- throws (CE.evaluate anthropicProbe)
   openAIHttpStubThrows    <- throws (CE.evaluate openAIProbe)
+  recordingAskCapturesPrompt   <- recordingAskTest
+  recordingMultimodalCapturesText <- recordingMultimodalTest
   let checks =
         [ ("memory: remember/recallAll round-trip", memCount == 2)
         , ("memory: pinned turn survives prune", pinnedTags == ["keep"])
@@ -116,6 +120,8 @@ main = do
         , ("anthropic-cli: multimodalAskArgs binds --add-dir per unique parent dir", multimodalArgsDirsOk)
         , ("anthropic-cli: multimodalAskArgs prepends Read-tool preamble to prompt", multimodalArgsPreambleOk)
         , ("effect: AskMultimodal routes through Mock backend's responder", askMultimodalRoutesOk)
+        , ("mock-recording: Ask is recorded with original contents", recordingAskCapturesPrompt)
+        , ("mock-recording: AskMultimodal records text turns (no image carrier)", recordingMultimodalCapturesText)
         ]
   forM_ checks $ \(name, ok) ->
     putStrLn $ (if ok then "PASS  " else "FAIL  ") <> name
@@ -257,6 +263,45 @@ askMultimodalRoutesOk =
               else Right "no-frame")
         $ askMultimodal @'AnthropicCli ["/img/frame.png"] [cwr User "frame.png is the image"]
   in result == Right "saw-frame"
+
+-- Recording variant: an 'Ask' against the recording mock must append
+-- the exact prompt contents to the sink, and the canned responder's
+-- text must still come back to the caller.
+recordingAskTest :: IO Bool
+recordingAskTest = do
+  sink <- newIORef []
+  let promptText = "what is the capital of France?"
+  answer <-
+    runEff
+      . evalState emptyMemoryStore
+      . runMemoryState
+      . runLLMMockRecording @'AnthropicCli sink (\_ -> Right "Paris")
+      $ askText @'AnthropicCli promptText
+  recorded <- reverse <$> readIORef sink
+  pure $ answer == "Paris"
+       && length recorded == 1
+       && case recorded of
+            (cs:_) -> any (\c -> _cwr_content c == promptText) cs
+            []     -> False
+
+-- Recording + multimodal: image carrier is dropped (matches
+-- 'runLLMMock' behaviour), text turns ARE recorded.
+recordingMultimodalTest :: IO Bool
+recordingMultimodalTest = do
+  sink <- newIORef []
+  let userText = "describe this frame"
+  result <-
+    runEff
+      . evalState emptyMemoryStore
+      . runMemoryState
+      . runLLMMockRecording @'AnthropicCli sink (\_ -> Right "a cat")
+      $ askMultimodal @'AnthropicCli ["/img/frame.png"] [cwr User userText]
+  recorded <- reverse <$> readIORef sink
+  pure $ result == Right "a cat"
+       && length recorded == 1
+       && case recorded of
+            (cs:_) -> any (\c -> _cwr_content c == userText) cs
+            []     -> False
 
 -- 'CE.evaluate'-driven check: was an exception raised when forcing the action?
 -- The stub modules' 'claudeDeferredLogicImplementation' throws a pure 'error',
