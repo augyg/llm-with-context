@@ -18,8 +18,16 @@ module LLM.Effect.Anthropic
 import LLM.Effect (LLM (..), runCtx, runCtxTyped)
 import LLM.Effect.Memory (Memory)
 import LLM.LLM (renderHistoryWithRole)
-import LLM.Provider.Anthropic (ClaudeConfig, askClaude, askClaudeTools, askClaudeTyped)
-import LLM.Types (APIProvider (AnthropicHttp), GPTRole (System))
+import LLM.Provider.Anthropic
+  ( ClaudeConfig
+  , askClaude
+  , askClaudeMultimodal
+  , askClaudeTools
+  , askClaudeTyped
+  )
+import LLM.Types (APIProvider (AnthropicHttp), ContentWithRole (..), GPTRole (System))
+
+import qualified Data.Text as T
 
 import Effectful (Eff, IOE, (:>))
 import Effectful.Dispatch.Dynamic (interpret)
@@ -35,12 +43,13 @@ runLLMAnthropic cfg = interpret $ \_ -> \case
   AskWithContext rc q      -> runCtx injectHistory (askClaude cfg) rc q
   AskWithContextTyped rc q -> runCtxTyped injectHistory (askClaude cfg) rc q
   AskTools defs msgs       -> askClaudeTools cfg defs msgs
-  -- Multimodal via the HTTP transport is not wired here yet — the
-  -- HTTP-side carrier is base64 image bytes, which 'askClaude' does
-  -- not currently embed in its request body. Surface a loud, specific
-  -- error rather than silently routing text-only.
-  AskMultimodal _img _contents ->
-    pure (Left "LLM.Effect.Anthropic: AskMultimodal is not supported by the HTTP interpreter \
-                \(use runLLMAnthropicCli for multimodal asks).")
+  -- Multimodal HTTP path: base64-encode the image bytes inline as
+  -- 'image' content blocks alongside a flattened text prompt. The
+  -- carrier type for 'AnthropicHttp' is @[ByteString]@; the request-
+  -- body shape is built by 'multimodalRequestBody' (see
+  -- 'LLM.Provider.Anthropic').
+  AskMultimodal imgBytes contents ->
+    askClaudeMultimodal cfg imgBytes (flattenContents contents)
   where
     injectHistory histItems = [renderHistoryWithRole System histItems]
+    flattenContents = T.intercalate "\n\n" . map _cwr_content

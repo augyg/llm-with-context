@@ -1,10 +1,14 @@
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+-- The ImageInput type-family instance is provider-specific but the family
+-- itself lives in LLM.Effect.ImageInput, so this is an orphan by design.
+{-# OPTIONS_GHC -Wno-orphans #-}
 
 -- | Anthropic (Claude) stateless prims over the Messages API
 -- (@POST https://api.anthropic.com/v1/messages@) via servant-client.
@@ -35,13 +39,17 @@ module LLM.Provider.Anthropic
   , askClaude
   , askClaudeTyped
   , askClaudeTools
+  , askClaudeMultimodal
     -- * Provider metadata
   , fetchClaudeModels
     -- * Helpers (exported for reuse / testing)
   , splitSystem
   , firstText
+  , multimodalRequestBody
+  , detectImageMediaType
   ) where
 
+import LLM.Effect.ImageInput (ImageInput)
 import LLM.LLM (askTypedBy, tshow)
 import LLM.Provider.Servant (describeClientError, rawBodyText, runJSON)
 import LLM.ProviderMeta (ModelInfo (..), ProviderMeta (..))
@@ -61,6 +69,9 @@ import LLM.Types
   )
 
 import Control.Monad.IO.Class (MonadIO)
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Base64 as B64
+import qualified Data.Text.Encoding as TE
 import Data.Aeson (Options (..), Value, decode, object, (.=))
 import Data.Aeson.TH (deriveJSON)
 import Data.List (partition)
@@ -236,6 +247,101 @@ askClaudeTyped
   -> [ContentWithRole]
   -> m (Either ConvoError (ConvoAnswer a))
 askClaudeTyped cfg = askTypedBy (askClaude cfg)
+
+-- Multimodal ---------------------------------------------------------------
+
+-- | The HTTP carrier for vision: raw image bytes. The interpreter
+-- base64-encodes each ByteString into an Anthropic @image@ content
+-- block. Defined here (rather than in 'LLM.Provider.AnthropicHttp')
+-- because the interpreter 'LLM.Effect.Anthropic.runLLMAnthropic' needs
+-- this instance in scope to pattern-match 'AskMultimodal' against
+-- @'AnthropicHttp@.
+type instance ImageInput 'AnthropicHttp = [BS.ByteString]
+
+-- | Sniff the leading magic bytes of an image and return the matching
+-- IANA media-type Anthropic expects in @source.media_type@. Falls back
+-- to @image/png@ for unrecognised data (the pipeline's primary
+-- use-case is PNGs).
+detectImageMediaType :: BS.ByteString -> T.Text
+detectImageMediaType bs
+  | BS.take 8 bs == BS.pack [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A] = "image/png"
+  | BS.take 3 bs == BS.pack [0xFF, 0xD8, 0xFF]                                = "image/jpeg"
+  | BS.take 4 bs == BS.pack [0x47, 0x49, 0x46, 0x38]                          = "image/gif"
+  | BS.take 4 bs == BS.pack [0x52, 0x49, 0x46, 0x46]                          = "image/webp"
+  | otherwise                                                                 = "image/png"
+
+-- | One @image@ content block: @{type: image, source: {type: base64, media_type, data}}@.
+imageBlockJSON :: BS.ByteString -> Value
+imageBlockJSON bs =
+  object
+    [ "type" .= ("image" :: T.Text)
+    , "source" .= object
+        [ "type" .= ("base64" :: T.Text)
+        , "media_type" .= detectImageMediaType bs
+        , "data" .= TE.decodeUtf8 (B64.encode bs)
+        ]
+    ]
+
+-- | Build the multimodal @messages@ request body for @POST /v1/messages@:
+-- one @user@ message whose @content@ is the image blocks followed by a
+-- text block. Pure for snapshot testability.
+multimodalRequestBody
+  :: T.Text          -- ^ model id
+  -> Int             -- ^ max_tokens
+  -> [BS.ByteString] -- ^ raw image bytes (base64-encoded inline)
+  -> T.Text          -- ^ user text prompt
+  -> Value
+multimodalRequestBody model maxToks imageBytes prompt =
+  object
+    [ "model"      .= model
+    , "max_tokens" .= maxToks
+    , "messages"   .=
+        [ object
+            [ "role"    .= ("user" :: T.Text)
+            , "content" .=
+                ( map imageBlockJSON imageBytes
+                  ++ [object ["type" .= ("text" :: T.Text), "text" .= prompt]]
+                )
+            ]
+        ]
+    ]
+
+-- | Same endpoint as 'MessagesAPI', but the body is a 'Value' so we can
+-- include image content blocks.
+type MessagesMultimodalAPI =
+  "v1" :> "messages"
+    :> Header' '[Required, Strict] "x-api-key" T.Text
+    :> Header' '[Required, Strict] "anthropic-version" T.Text
+    :> ReqBody '[JSON] Value
+    :> Post '[JSON] AnthropicResponse
+
+messagesMultimodalClient :: T.Text -> T.Text -> Value -> ClientM AnthropicResponse
+messagesMultimodalClient = client (Proxy :: Proxy MessagesMultimodalAPI)
+
+-- | Stateless multimodal Claude request: ship images (base64-encoded
+-- inline) plus a text prompt; return the first text block, or a rendered
+-- error. The token cap is the globally-decided '_claudeConfig_maxTokens'.
+askClaudeMultimodal
+  :: MonadIO m
+  => ClaudeConfig
+  -> [BS.ByteString]  -- ^ image bytes
+  -> T.Text           -- ^ user text prompt
+  -> m (Either T.Text T.Text)
+askClaudeMultimodal cfg imageBytes prompt = do
+  let body = multimodalRequestBody
+               (_claudeConfig_model cfg)
+               (_claudeConfig_maxTokens cfg)
+               imageBytes
+               prompt
+  result <- runJSON (_claudeConfig_manager cfg) (_claudeConfig_baseUrl cfg)
+    (messagesMultimodalClient
+       (T.strip (unAPIKey (_claudeConfig_apiKey cfg)))
+       (_claudeConfig_version cfg)
+       body)
+  pure $ case result of
+    Left err -> Left (renderAnthropicError err)
+    Right resp ->
+      maybe (Left "Anthropic: multimodal response contained no text content block") Right (firstText resp)
 
 -- Tool-use translation layer ------------------------------------------------
 

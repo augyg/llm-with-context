@@ -27,11 +27,25 @@ import LLM.Provider.AnthropicCli
   , multimodalAskArgs
   , readPreamble
   )
--- Importing these stub modules brings the deferred capability instances
--- into scope so the throw-on-touch tests can typecheck. The modules
--- themselves export nothing other than their instances.
-import LLM.Provider.AnthropicHttpStub ()
-import LLM.Provider.OpenAIHttpStub ()
+-- Importing these brings the real HTTP capability instances into scope
+-- so the shape / smoke tests can typecheck. The modules themselves
+-- export nothing other than their instances.
+import LLM.Provider.AnthropicHttp ()
+import LLM.Provider.OpenAIHttp ()
+import qualified LLM.Provider.Anthropic as A
+import qualified LLM.Provider.OpenAI as O
+import LLM.Effect.Anthropic (runLLMAnthropic)
+import LLM.Effect.OpenAI (runLLMOpenAI)
+import LLM.Types (APIKey (..))
+import qualified Data.Aeson as Aeson
+import qualified Data.Aeson.Types as Aeson (Parser, parseEither, parseMaybe)
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Base64 as B64
+import qualified Data.ByteString.Lazy as LBS
+import qualified Data.Text.Encoding as TE
+import Network.HTTP.Client (newManager)
+import Network.HTTP.Client.TLS (tlsManagerSettings)
+import System.Environment (lookupEnv)
 import LLM.Effect.Memory
   ( emptyMemoryStore
   , pin
@@ -76,28 +90,23 @@ import LLM.Types
 
 main :: IO ()
 main = do
-  -- The stub instances' method bodies reduce immediately to a pure
-  -- 'error' (via 'claudeDeferredLogicImplementation'). Forcing the
-  -- returned 'Eff' value to WHNF therefore raises the exception even
-  -- without an interpreter — what matters is that the binding is
-  -- bottom, not that the Eff action ever runs. We run it through
-  -- 'runPureEff' against an empty effect row only to fix the
-  -- otherwise-ambiguous @es@; because the body never inspects the
-  -- effect row, this still triggers the underlying 'error'.
+  -- The HTTP capability instances now delegate via 'send (Ask ...)' to
+  -- the active LLM interpreter. Pointing them at the mock backend
+  -- routes the prompt through and returns the canned response — no
+  -- network, no throw.
   let anthropicProbe :: Text
       anthropicProbe = runPureEff
         . evalState emptyMemoryStore
         . runMemoryState
-        . runLLMMock @'AnthropicHttp (\_ -> Right "n/a")
+        . runLLMMock @'AnthropicHttp (\_ -> Right "ok-anthropic")
         $ askText @'AnthropicHttp "x"
       openAIProbe    :: Text
       openAIProbe    = runPureEff
         . evalState emptyMemoryStore
         . runMemoryState
-        . runLLMMock @'OpenAIHttp (\_ -> Right "n/a")
+        . runLLMMock @'OpenAIHttp (\_ -> Right "ok-openai")
         $ askText @'OpenAIHttp "x"
-  anthropicHttpStubThrows <- throws (CE.evaluate anthropicProbe)
-  openAIHttpStubThrows    <- throws (CE.evaluate openAIProbe)
+  liveSmokeChecks <- runLiveSmokeChecks
   recordingAskCapturesPrompt   <- recordingAskTest
   recordingMultimodalCapturesText <- recordingMultimodalTest
   let checks =
@@ -115,14 +124,25 @@ main = do
         , ("anthropic-cli: readPreamble [p1,p2] enumerates as bullets", multiPreambleOk)
         , ("anthropic-cli: askArgs emits --add-dir=DIR (equals-bound)", addDirEqualsBound)
         , ("anthropic-cli: askArgs prepends -p and skip-perms", argvFrontMatter)
-        , ("anthropic-http: askText stub throws on touch", anthropicHttpStubThrows)
-        , ("openai-http: askText stub throws on touch", openAIHttpStubThrows)
+        , ("anthropic-http: askText routes through interpreter (mock)", anthropicProbe == "ok-anthropic")
+        , ("openai-http: askText routes through interpreter (mock)", openAIProbe == "ok-openai")
+        , ("anthropic-http: detectImageMediaType identifies PNG magic", A.detectImageMediaType pngMagic == "image/png")
+        , ("anthropic-http: detectImageMediaType identifies JPEG magic", A.detectImageMediaType jpegMagic == "image/jpeg")
+        , ("anthropic-http: detectImageMediaType defaults to PNG on unknown bytes", A.detectImageMediaType "????" == "image/png")
+        , ("anthropic-http: multimodal body has model/max_tokens/messages", anthropicBodyShapeOk)
+        , ("anthropic-http: multimodal body base64-encodes image bytes", anthropicBodyBase64Ok)
+        , ("anthropic-http: multimodal body places text block AFTER image blocks", anthropicBodyOrderOk)
+        , ("openai-http: multimodal body has model/max_tokens/messages", openaiBodyShapeOk)
+        , ("openai-http: multimodal body carries image_url parts", openaiBodyImageUrlOk)
+        , ("openai-http: multimodal body places text part AFTER image parts", openaiBodyOrderOk)
+        , ("anthropic-http: 1x1 PNG fixture decodes to bytes starting with PNG magic", onePixelPngIsPng)
         , ("anthropic-cli: multimodalAskArgs binds --add-dir per unique parent dir", multimodalArgsDirsOk)
         , ("anthropic-cli: multimodalAskArgs prepends Read-tool preamble to prompt", multimodalArgsPreambleOk)
         , ("effect: AskMultimodal routes through Mock backend's responder", askMultimodalRoutesOk)
         , ("mock-recording: Ask is recorded with original contents", recordingAskCapturesPrompt)
         , ("mock-recording: AskMultimodal records text turns (no image carrier)", recordingMultimodalCapturesText)
         ]
+        <> liveSmokeChecks
   forM_ checks $ \(name, ok) ->
     putStrLn $ (if ok then "PASS  " else "FAIL  ") <> name
   unless (all snd checks) exitFailure
@@ -303,10 +323,167 @@ recordingMultimodalTest = do
             (cs:_) -> any (\c -> _cwr_content c == userText) cs
             []     -> False
 
--- 'CE.evaluate'-driven check: was an exception raised when forcing the action?
--- The stub modules' 'claudeDeferredLogicImplementation' throws a pure 'error',
--- so the underlying SomeException catches it.
-throws :: forall a. IO a -> IO Bool
-throws m = do
-  r <- CE.try m :: IO (Either CE.SomeException a)
-  pure (either (const True) (const False) r)
+-- =========================================================================
+-- HTTP multimodal request-body shape tests (pure, no network).
+-- =========================================================================
+
+-- Standard PNG file signature (8-byte magic).
+pngMagic :: BS.ByteString
+pngMagic = BS.pack [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
+
+-- Standard JPEG SOI + APP0/APP1 marker prefix.
+jpegMagic :: BS.ByteString
+jpegMagic = BS.pack [0xFF, 0xD8, 0xFF, 0xE0]
+
+-- Minimal valid 1x1 PNG — round-trip test: base64-decoding then encoding
+-- the bytes should equal the original base64.
+onePixelPng :: BS.ByteString
+onePixelPng =
+  let b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNgAAIAAAUAAarVyFEAAAAASUVORK5CYII="
+  in case B64.decode (TE.encodeUtf8 b64) of
+       Right bs -> bs
+       Left e   -> error ("test: cannot decode onePixelPng base64: " <> e)
+
+-- The decoded bytes must start with the PNG magic.
+onePixelPngIsPng :: Bool
+onePixelPngIsPng = BS.take 8 onePixelPng == pngMagic
+
+-- Anthropic body has the three required top-level keys.
+anthropicBodyShapeOk :: Bool
+anthropicBodyShapeOk =
+  let v = A.multimodalRequestBody "claude-test" 1024 [pngMagic] "hi"
+  in case Aeson.parseEither (Aeson.withObject "body" $ \o -> do
+                                _ <- o Aeson..: "model"      :: Aeson.Parser Text
+                                _ <- o Aeson..: "max_tokens" :: Aeson.Parser Int
+                                _ <- o Aeson..: "messages"   :: Aeson.Parser Aeson.Value
+                                pure ()) v of
+       Right () -> True
+       Left _   -> False
+
+-- Anthropic body base64-encodes the bytes inside source.data.
+anthropicBodyBase64Ok :: Bool
+anthropicBodyBase64Ok =
+  let v = A.multimodalRequestBody "claude-test" 1024 [pngMagic] "hi"
+      expectedB64 = TE.decodeUtf8 (B64.encode pngMagic)
+      -- Drill: body.messages[0].content[0].source.data
+      dataField = Aeson.parseMaybe (Aeson.withObject "body" $ \o -> do
+        msgs    <- o Aeson..: "messages"
+        case (msgs :: [Aeson.Value]) of
+          (m:_) -> flip (Aeson.withObject "msg") m $ \mo -> do
+            cs <- mo Aeson..: "content"
+            case (cs :: [Aeson.Value]) of
+              (c:_) -> flip (Aeson.withObject "block") c $ \bo -> do
+                src <- bo Aeson..: "source"
+                Aeson.withObject "src" (\so -> so Aeson..: "data") src
+              [] -> fail "no content"
+          [] -> fail "no msgs") v
+  in dataField == Just expectedB64
+
+-- The text block must come AFTER the image blocks (model attention order).
+anthropicBodyOrderOk :: Bool
+anthropicBodyOrderOk =
+  let v = A.multimodalRequestBody "claude-test" 1024 [pngMagic] "the-prompt"
+      typeList = Aeson.parseMaybe (Aeson.withObject "body" $ \o -> do
+        msgs <- o Aeson..: "messages"
+        case (msgs :: [Aeson.Value]) of
+          (m:_) -> flip (Aeson.withObject "msg") m $ \mo -> do
+            cs <- mo Aeson..: "content"
+            traverse (Aeson.withObject "block" (\bo -> bo Aeson..: "type")) (cs :: [Aeson.Value])
+          [] -> fail "no msgs") v
+  in typeList == Just ["image", "text" :: Text]
+
+-- OpenAI body has the three required top-level keys.
+openaiBodyShapeOk :: Bool
+openaiBodyShapeOk =
+  let v = O.multimodalRequestBody "gpt-4o-test" 1024 ["https://x/y.png"] "hi"
+  in case Aeson.parseEither (Aeson.withObject "body" $ \o -> do
+                                _ <- o Aeson..: "model"      :: Aeson.Parser Text
+                                _ <- o Aeson..: "max_tokens" :: Aeson.Parser Int
+                                _ <- o Aeson..: "messages"   :: Aeson.Parser Aeson.Value
+                                pure ()) v of
+       Right () -> True
+       Left _   -> False
+
+-- The image part must be image_url.url == the supplied URL.
+openaiBodyImageUrlOk :: Bool
+openaiBodyImageUrlOk =
+  let url = "https://example.com/x.png"
+      v = O.multimodalRequestBody "gpt-4o-test" 1024 [url] "hi"
+      gotUrl = Aeson.parseMaybe (Aeson.withObject "body" $ \o -> do
+        msgs <- o Aeson..: "messages"
+        case (msgs :: [Aeson.Value]) of
+          (m:_) -> flip (Aeson.withObject "msg") m $ \mo -> do
+            cs <- mo Aeson..: "content"
+            case (cs :: [Aeson.Value]) of
+              (c:_) -> flip (Aeson.withObject "part") c $ \po -> do
+                iu <- po Aeson..: "image_url"
+                Aeson.withObject "iu" (\io -> io Aeson..: "url") iu
+              [] -> fail "no content"
+          [] -> fail "no msgs") v
+  in gotUrl == Just url
+
+-- Text part after image part.
+openaiBodyOrderOk :: Bool
+openaiBodyOrderOk =
+  let v = O.multimodalRequestBody "gpt-4o-test" 1024 ["https://x/y.png"] "hi"
+      typeList = Aeson.parseMaybe (Aeson.withObject "body" $ \o -> do
+        msgs <- o Aeson..: "messages"
+        case (msgs :: [Aeson.Value]) of
+          (m:_) -> flip (Aeson.withObject "msg") m $ \mo -> do
+            cs <- mo Aeson..: "content"
+            traverse (Aeson.withObject "part" (\po -> po Aeson..: "type")) (cs :: [Aeson.Value])
+          [] -> fail "no msgs") v
+  in typeList == Just ["image_url", "text" :: Text]
+
+-- silence "unused" warnings for Aeson.encode / LBS in case we change strategy
+_unusedHandle :: LBS.ByteString
+_unusedHandle = Aeson.encode (Aeson.Null :: Aeson.Value)
+
+-- =========================================================================
+-- Live-API smoke tests, GATED on ANTHROPIC_API_KEY / OPENAI_API_KEY.
+-- If the env var is absent the check is reported as a no-op pass so CI
+-- never breaks on a missing key.
+-- =========================================================================
+
+runLiveSmokeChecks :: IO [(String, Bool)]
+runLiveSmokeChecks = do
+  anthropicCheck <- runAnthropicLive
+  openaiCheck    <- runOpenAILive
+  pure [anthropicCheck, openaiCheck]
+
+runAnthropicLive :: IO (String, Bool)
+runAnthropicLive = do
+  mk <- lookupEnv "ANTHROPIC_API_KEY"
+  case mk of
+    Nothing -> pure ("anthropic-http live smoke: SKIPPED (ANTHROPIC_API_KEY unset)", True)
+    Just k -> do
+      mgr <- newManager tlsManagerSettings
+      let cfg = A.defaultClaudeConfig (APIKey (T.pack k)) mgr
+      ok <- CE.try (runEff
+                      . evalState emptyMemoryStore
+                      . runMemoryState
+                      . runLLMAnthropic cfg
+                      $ askText @'AnthropicHttp "Reply with exactly the word: YES")
+              :: IO (Either CE.SomeException Text)
+      case ok of
+        Right t -> pure ("anthropic-http live smoke: round-trip OK (got " <> T.unpack (T.take 60 t) <> ")", "YES" `T.isInfixOf` t)
+        Left e  -> pure ("anthropic-http live smoke: FAILED (" <> take 200 (show e) <> ")", False)
+
+runOpenAILive :: IO (String, Bool)
+runOpenAILive = do
+  mk <- lookupEnv "OPENAI_API_KEY"
+  case mk of
+    Nothing -> pure ("openai-http live smoke: SKIPPED (OPENAI_API_KEY unset)", True)
+    Just k -> do
+      mgr <- newManager tlsManagerSettings
+      let cfg = O.defaultGPTConfig (APIKey (T.pack k)) mgr
+      ok <- CE.try (runEff
+                      . evalState emptyMemoryStore
+                      . runMemoryState
+                      . runLLMOpenAI cfg
+                      $ askText @'OpenAIHttp "Reply with exactly the word: YES")
+              :: IO (Either CE.SomeException Text)
+      case ok of
+        Right t -> pure ("openai-http live smoke: round-trip OK (got " <> T.unpack (T.take 60 t) <> ")", "YES" `T.isInfixOf` t)
+        Left e  -> pure ("openai-http live smoke: FAILED (" <> take 200 (show e) <> ")", False)
+

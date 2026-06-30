@@ -1,8 +1,12 @@
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+-- ImageInput type-family instance is an orphan by design — see
+-- LLM.Provider.Anthropic.
+{-# OPTIONS_GHC -Wno-orphans #-}
 
 -- | servant-client OpenAI/ChatGPT stateless prims. The original http-client
 -- functions in "LLM.LLM" ('LLM.LLM.askGPT' etc.) are left intact; these mirror
@@ -22,10 +26,14 @@ module LLM.Provider.OpenAI
   , askGPTServant
   , askGPTServantTyped
   , askGPTServantTools
+  , askGPTServantMultimodal
     -- * Provider metadata
   , fetchOpenAIModels
+    -- * Helpers (exported for reuse / testing)
+  , multimodalRequestBody
   ) where
 
+import LLM.Effect.ImageInput (ImageInput)
 import LLM.LLM (askTypedBy, gptModel, tshow)
 import LLM.Provider.Servant (describeClientError, rawBodyText, runJSON)
 import LLM.ProviderMeta (ModelInfo (..), ProviderMeta (..))
@@ -136,6 +144,99 @@ askGPTServantTyped
   -> [ContentWithRole]
   -> m (Either ConvoError (ConvoAnswer a))
 askGPTServantTyped cfg = askTypedBy (askGPTServant cfg)
+
+-- Multimodal ---------------------------------------------------------------
+
+-- | OpenAI vision carrier: image URLs (http(s) or @data:@-URIs).
+-- Defined here (rather than in 'LLM.Provider.OpenAIHttp') because the
+-- interpreter 'LLM.Effect.OpenAI.runLLMOpenAI' needs this instance in
+-- scope to pattern-match 'AskMultimodal' against @'OpenAIHttp@.
+type instance ImageInput 'OpenAIHttp = [T.Text]
+
+-- | Build the multimodal @messages@ request body for
+-- @POST /v1/chat/completions@: one @user@ message whose @content@ is a
+-- list of @image_url@ parts followed by a text part. URLs can be
+-- @http(s):@ links or @data:image/...;base64,...@ data-URIs (callers
+-- with raw bytes must base64-encode into a data-URI themselves). Pure
+-- for snapshot testability.
+multimodalRequestBody
+  :: T.Text   -- ^ model id
+  -> Int      -- ^ max_tokens
+  -> [T.Text] -- ^ image URLs (or data: URIs)
+  -> T.Text   -- ^ user text prompt
+  -> Value
+multimodalRequestBody model maxToks imageUrls prompt =
+  object
+    [ "model"      .= model
+    , "max_tokens" .= maxToks
+    , "messages"   .=
+        [ object
+            [ "role"    .= ("user" :: T.Text)
+            , "content" .=
+                ( map imageUrlPart imageUrls
+                  ++ [object ["type" .= ("text" :: T.Text), "text" .= prompt]]
+                )
+            ]
+        ]
+    ]
+  where
+    imageUrlPart url =
+      object
+        [ "type" .= ("image_url" :: T.Text)
+        , "image_url" .= object ["url" .= url]
+        ]
+
+-- | Same endpoint as 'ChatCompletionsAPI', but the body is a 'Value' so
+-- we can include image content parts.
+type ChatMultimodalAPI =
+  "v1" :> "chat" :> "completions"
+    :> Header' '[Required, Strict] "Authorization" T.Text
+    :> ReqBody '[JSON] Value
+    :> Post '[JSON] Value
+
+chatMultimodalClient :: T.Text -> Value -> ClientM Value
+chatMultimodalClient = client (Proxy :: Proxy ChatMultimodalAPI)
+
+-- | Pull the first choice's message content out of a raw chat-completions
+-- response 'Value'. Mirrors the shape parsed via 'PromptResponse', but
+-- accepts non-string content (the vision endpoint sometimes returns
+-- structured content).
+parseChatChoiceText :: Value -> Either String T.Text
+parseChatChoiceText = parseEither $ withObject "response" $ \o -> do
+  cs <- o .: "choices"
+  case cs of
+    [] -> fail "OpenAI: no choices in multimodal response"
+    (choice : _) -> flip (withObject "choice") choice $ \co ->
+      co .: "message"
+        >>= withObject "message"
+          ( \mo -> do
+              c <- mo .: "content"
+              case c of
+                String t -> pure t
+                _        -> fail "OpenAI: multimodal response content was not a string"
+          )
+
+-- | Stateless multimodal OpenAI request via @POST /v1/chat/completions@.
+askGPTServantMultimodal
+  :: MonadIO m
+  => GPTConfig
+  -> [T.Text]  -- ^ image URLs (or data: URIs)
+  -> T.Text    -- ^ user text prompt
+  -> m (Either T.Text T.Text)
+askGPTServantMultimodal cfg imageUrls prompt = do
+  let body = multimodalRequestBody
+               (_gptConfig_model cfg)
+               (_gptConfig_maxTokens cfg)
+               imageUrls
+               prompt
+      authHeader = "Bearer " <> (T.strip . unAPIKey $ _gptConfig_apiKey cfg)
+  result <- runJSON (_gptConfig_manager cfg) (_gptConfig_baseUrl cfg)
+              (chatMultimodalClient authHeader body)
+  pure $ case result of
+    Left err -> Left (renderOpenAIError err)
+    Right v -> case parseChatChoiceText v of
+      Left e  -> Left ("OpenAI: failed to parse multimodal response: " <> T.pack e)
+      Right t -> Right t
 
 -- Tool-use translation layer ------------------------------------------------
 

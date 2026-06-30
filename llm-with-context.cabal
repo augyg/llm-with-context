@@ -47,9 +47,9 @@ library
                       LLM.Provider.Servant
                       LLM.Provider.Anthropic
                       LLM.Provider.AnthropicCli
-                      LLM.Provider.AnthropicHttpStub
+                      LLM.Provider.AnthropicHttp
                       LLM.Provider.OpenAI
-                      LLM.Provider.OpenAIHttpStub
+                      LLM.Provider.OpenAIHttp
                       LLM.Capability
                       LLM.Effect
                       LLM.Effect.ImageInput
@@ -75,6 +75,7 @@ library
     -- other-extensions:
     build-depends:    base
                     , aeson
+                    , base64-bytestring
                     , bytestring
                     , containers
                     , data-default
@@ -141,6 +142,11 @@ test-suite llm-with-context-test
     main-is:          Spec.hs
     hs-source-dirs:   test
     build-depends:    base
+                    , aeson
+                    , base64-bytestring
+                    , bytestring
+                    , http-client
+                    , http-client-tls
                     , text
                     , effectful-core
                     , llm-with-context

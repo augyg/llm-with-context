@@ -15,8 +15,16 @@ module LLM.Effect.OpenAI
 import LLM.Effect (LLM (..), runCtx, runCtxTyped)
 import LLM.Effect.Memory (Memory)
 import LLM.LLM (renderHistory)
-import LLM.Provider.OpenAI (GPTConfig, askGPTServant, askGPTServantTools, askGPTServantTyped)
-import LLM.Types (APIProvider (OpenAIHttp))
+import LLM.Provider.OpenAI
+  ( GPTConfig
+  , askGPTServant
+  , askGPTServantMultimodal
+  , askGPTServantTools
+  , askGPTServantTyped
+  )
+import LLM.Types (APIProvider (OpenAIHttp), ContentWithRole (..))
+
+import qualified Data.Text as T
 
 import Effectful (Eff, IOE, (:>))
 import Effectful.Dispatch.Dynamic (interpret)
@@ -32,12 +40,12 @@ runLLMOpenAI cfg = interpret $ \_ -> \case
   AskWithContext rc q      -> runCtx injectHistory (askGPTServant cfg) rc q
   AskWithContextTyped rc q -> runCtxTyped injectHistory (askGPTServant cfg) rc q
   AskTools defs msgs       -> askGPTServantTools cfg defs msgs
-  -- Multimodal: OpenAI's chat-completions vision endpoint takes URLs
-  -- (or base64 data-URIs) embedded in 'content' parts. 'askGPTServant'
-  -- does not currently model that shape, so report it loudly rather
-  -- than silently routing text-only.
-  AskMultimodal _img _contents ->
-    pure (Left "LLM.Effect.OpenAI: AskMultimodal is not supported by the HTTP interpreter \
-                \(no image-carrier wiring through askGPTServant yet).")
+  -- Multimodal HTTP path: ship image URLs (http(s) or data: URIs) as
+  -- 'image_url' content parts alongside a flattened text prompt. The
+  -- carrier type for 'OpenAIHttp' is @[Text]@ (URLs); callers with raw
+  -- bytes are expected to base64-encode into a data-URI themselves.
+  AskMultimodal imgUrls contents ->
+    askGPTServantMultimodal cfg imgUrls (flattenContents contents)
   where
     injectHistory histItems = [renderHistory histItems]
+    flattenContents = T.intercalate "\n\n" . map _cwr_content
