@@ -67,7 +67,14 @@ import System.Which (staticWhich)
 import Effectful (Eff, IOE, liftIO, (:>))
 import Effectful.Dispatch.Dynamic (interpret, send)
 
-import LLM.Capability (CanMultimodal (..), CanText (..), ImageInput)
+import LLM.Capability
+  ( CanJsonOutput (..)
+  , CanMultimodal (..)
+  , CanText (..)
+  , ImageInput
+  , TransportError (..)
+  )
+import Data.Bifunctor (first)
 import LLM.Effect (LLM (..))
 import LLM.Effect.Memory (Memory)
 import LLM.Types
@@ -216,15 +223,13 @@ runLLMAnthropicCli = interpret $ \_ -> \case
 
 
 -- | Text-only ask via @claude -p PROMPT@. Wraps a single @User@ turn
--- and dispatches via the underlying 'Ask' op; failures are surfaced as
--- a runtime error (the bubbled 'Eff' return type doesn't carry an
--- Either, per the capability-class signature).
+-- and dispatches via the underlying 'Ask' op; transport-layer failures
+-- bubble back as @'Left' 'TransportError'@ for the consumer to handle
+-- (crash, retry, fall back) per the honest-API rule.
 instance CanText 'AnthropicCli where
   askText prompt = do
     res <- send (Ask [ContentWithRole User prompt] :: LLM 'AnthropicCli (Eff es) (Either T.Text T.Text))
-    case res of
-      Left e  -> error ("LLM.Provider.AnthropicCli.askText: " <> T.unpack e)
-      Right t -> pure t
+    pure (first TransportError res)
 
 -- | 'ImageInput' carrier for the CLI: the raw list of image file paths
 -- to grant Read-tool access to. Pinned as a top-level @type instance@
@@ -239,14 +244,39 @@ type instance ImageInput 'AnthropicCli = [FilePath]
 -- tool preamble mechanics live in the interpreter
 -- ('runLLMAnthropicCli'), not here.
 --
--- The class method's signature returns 'T.Text' (no Either), so the
--- Left case becomes a runtime error — same shape as 'CanText.askText'.
--- The honest-API path is 'askMultimodal' from "LLM.Effect", which
--- returns the @Either@ directly.
+-- Transport-layer failures bubble as @'Left' 'TransportError'@ — same
+-- shape as 'CanText.askText'. The lower-level @Either T.Text T.Text@
+-- path is 'askMultimodal' from "LLM.Effect" if a consumer wants the
+-- raw text error string instead of the typed newtype.
 instance CanMultimodal 'AnthropicCli where
   askWithImages paths userPrompt = do
     res <- send (AskMultimodal paths [ContentWithRole User userPrompt]
                   :: LLM 'AnthropicCli (Eff es) (Either T.Text T.Text))
-    case res of
-      Left e  -> error ("LLM.Provider.AnthropicCli.askWithImages: " <> T.unpack e)
-      Right t -> pure t
+    pure (first TransportError res)
+
+-- | Structured-output ask via the @claude@ CLI. The CLI has no native
+-- @--json-schema@ flag the way the HTTP API has @response_format@, so
+-- the schema is delivered to Claude prompt-side: the schema text (a
+-- 'String' carrying the JSON example shape — see "LLM.JsonExample" /
+-- 'jsonResponsePrompt') is prepended to the user prompt with a clear
+-- "Respond with ONLY a JSON object matching this shape:" header.
+--
+-- The result is the raw response text — parsing is the consumer's
+-- problem (honest-API rule: parse errors bubble up at the call site,
+-- they are never swallowed inside the instance, and there is no
+-- in-instance retry). For end-to-end JSON ergonomics on top of this,
+-- consumers compose 'askJson' with their own parser + retry policy.
+--
+-- The dispatch routes through the same 'Ask' GADT constructor as
+-- 'askText', so middleware (Budget, Retry, Memory, Log) observes JSON
+-- asks the same way it observes plain text asks.
+instance CanJsonOutput 'AnthropicCli where
+  type Schema 'AnthropicCli = String
+  askJson schema userPrompt = do
+    let body = "Respond with ONLY a JSON object matching this shape:\n"
+             <> T.pack schema
+             <> "\n\n"
+             <> userPrompt
+    res <- send (Ask [ContentWithRole User body]
+                  :: LLM 'AnthropicCli (Eff es) (Either T.Text T.Text))
+    pure (first TransportError res)

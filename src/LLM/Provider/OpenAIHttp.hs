@@ -1,6 +1,8 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE TypeOperators #-}
 -- Orphan instances by design — see 'LLM.Provider.AnthropicHttp'.
 {-# OPTIONS_GHC -Wno-orphans #-}
@@ -24,7 +26,13 @@ import qualified Data.Text as T
 import Effectful (Eff)
 import Effectful.Dispatch.Dynamic (send)
 
-import LLM.Capability (CanMultimodal (..), CanText (..))
+import LLM.Capability
+  ( CanJsonOutput (..)
+  , CanMultimodal (..)
+  , CanText (..)
+  , TransportError (..)
+  )
+import Data.Bifunctor (first)
 import LLM.Effect (LLM (..))
 -- Bring the 'ImageInput 'OpenAIHttp = [Text]' instance into scope.
 import LLM.Provider.OpenAI ()
@@ -39,15 +47,32 @@ instance CanText 'OpenAIHttp where
   askText prompt = do
     res <- send (Ask [ContentWithRole User prompt]
                   :: LLM 'OpenAIHttp (Eff es) (Either T.Text T.Text))
-    case res of
-      Left e  -> error ("LLM.Provider.OpenAIHttp.askText: " <> T.unpack e)
-      Right t -> pure t
+    pure (first TransportError res)
 
 -- | Multimodal ask via the active interpreter (typically 'runLLMOpenAI').
 instance CanMultimodal 'OpenAIHttp where
   askWithImages imageUrls prompt = do
     res <- send (AskMultimodal imageUrls [ContentWithRole User prompt]
                   :: LLM 'OpenAIHttp (Eff es) (Either T.Text T.Text))
-    case res of
-      Left e  -> error ("LLM.Provider.OpenAIHttp.askWithImages: " <> T.unpack e)
-      Right t -> pure t
+    pure (first TransportError res)
+
+-- | Structured-output ask via prompt-side schema delivery. The OpenAI
+-- HTTP API does have a native @response_format: { type: "json_object" }@
+-- mode, but the interpreter ('runLLMOpenAI') does not yet thread that
+-- through the generic 'Ask' GADT constructor. Until the interpreter
+-- learns to consult the active capability for per-call request
+-- shaping, the schema is delivered prompt-side: the example shape is
+-- prepended to the user prompt with a clear header. The result is the
+-- raw response text — the consumer parses it (honest-API rule: parse
+-- errors bubble up at the call site, never swallowed inside the
+-- instance, no in-instance retry).
+instance CanJsonOutput 'OpenAIHttp where
+  type Schema 'OpenAIHttp = String
+  askJson schema userPrompt = do
+    let body = "Respond with ONLY a JSON object matching this shape:\n"
+             <> T.pack schema
+             <> "\n\n"
+             <> userPrompt
+    res <- send (Ask [ContentWithRole User body]
+                  :: LLM 'OpenAIHttp (Eff es) (Either T.Text T.Text))
+    pure (first TransportError res)

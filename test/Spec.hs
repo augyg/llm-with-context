@@ -18,7 +18,7 @@ import Effectful (runPureEff)
 import Effectful.State.Static.Local (evalState)
 
 import qualified Control.Exception as CE
-import LLM.Capability (askText)
+import LLM.Capability (TransportError (..), askJson, askText, askWithImages)
 import LLM.Effect (askMultimodal, askWithContext)
 import LLM.Provider.AnthropicCli
   ( AskArgs (..)
@@ -94,18 +94,39 @@ main = do
   -- the active LLM interpreter. Pointing them at the mock backend
   -- routes the prompt through and returns the canned response — no
   -- network, no throw.
-  let anthropicProbe :: Text
+  let anthropicProbe :: Either TransportError Text
       anthropicProbe = runPureEff
         . evalState emptyMemoryStore
         . runMemoryState
         . runLLMMock @'AnthropicHttp (\_ -> Right "ok-anthropic")
         $ askText @'AnthropicHttp "x"
-      openAIProbe    :: Text
+      openAIProbe    :: Either TransportError Text
       openAIProbe    = runPureEff
         . evalState emptyMemoryStore
         . runMemoryState
         . runLLMMock @'OpenAIHttp (\_ -> Right "ok-openai")
         $ askText @'OpenAIHttp "x"
+      -- Left-bubble probes: configure the mock to return Left and
+      -- confirm the capability surfaces the failure as Left without
+      -- throwing. Pinned per-class.
+      anthropicTextLeft :: Either TransportError Text
+      anthropicTextLeft = runPureEff
+        . evalState emptyMemoryStore
+        . runMemoryState
+        . runLLMMock @'AnthropicCli (\_ -> Left "boom-text")
+        $ askText @'AnthropicCli "x"
+      anthropicImgLeft :: Either TransportError Text
+      anthropicImgLeft = runPureEff
+        . evalState emptyMemoryStore
+        . runMemoryState
+        . runLLMMock @'AnthropicCli (\_ -> Left "boom-img")
+        $ askWithImages @'AnthropicCli ["/img/x.png"] "x"
+      anthropicJsonLeft :: Either TransportError Text
+      anthropicJsonLeft = runPureEff
+        . evalState emptyMemoryStore
+        . runMemoryState
+        . runLLMMock @'AnthropicCli (\_ -> Left "boom-json")
+        $ askJson @'AnthropicCli "{}" "x"
   liveSmokeChecks <- runLiveSmokeChecks
   recordingAskCapturesPrompt   <- recordingAskTest
   recordingMultimodalCapturesText <- recordingMultimodalTest
@@ -124,8 +145,14 @@ main = do
         , ("anthropic-cli: readPreamble [p1,p2] enumerates as bullets", multiPreambleOk)
         , ("anthropic-cli: askArgs emits --add-dir=DIR (equals-bound)", addDirEqualsBound)
         , ("anthropic-cli: askArgs prepends -p and skip-perms", argvFrontMatter)
-        , ("anthropic-http: askText routes through interpreter (mock)", anthropicProbe == "ok-anthropic")
-        , ("openai-http: askText routes through interpreter (mock)", openAIProbe == "ok-openai")
+        , ("anthropic-http: askText routes through interpreter (mock)", anthropicProbe == Right "ok-anthropic")
+        , ("openai-http: askText routes through interpreter (mock)", openAIProbe == Right "ok-openai")
+        , ("anthropic-cli: askText returns Left on transport failure (no error/throw)"
+          , anthropicTextLeft == Left (TransportError "boom-text"))
+        , ("anthropic-cli: askWithImages returns Left on transport failure (no error/throw)"
+          , anthropicImgLeft == Left (TransportError "boom-img"))
+        , ("anthropic-cli: askJson returns Left on transport failure (no error/throw)"
+          , anthropicJsonLeft == Left (TransportError "boom-json"))
         , ("anthropic-http: detectImageMediaType identifies PNG magic", A.detectImageMediaType pngMagic == "image/png")
         , ("anthropic-http: detectImageMediaType identifies JPEG magic", A.detectImageMediaType jpegMagic == "image/jpeg")
         , ("anthropic-http: detectImageMediaType defaults to PNG on unknown bytes", A.detectImageMediaType "????" == "image/png")
@@ -141,6 +168,11 @@ main = do
         , ("effect: AskMultimodal routes through Mock backend's responder", askMultimodalRoutesOk)
         , ("mock-recording: Ask is recorded with original contents", recordingAskCapturesPrompt)
         , ("mock-recording: AskMultimodal records text turns (no image carrier)", recordingMultimodalCapturesText)
+        , ("anthropic-cli: askJson prepends schema header to user prompt", askJsonCliPromptShapeOk)
+        , ("anthropic-cli: askJson happy-path returns canned JSON verbatim", askJsonCliHappyPathOk)
+        , ("anthropic-cli: askJson surfaces malformed response unchanged (no in-instance retry)", askJsonCliMalformedBubblesOk)
+        , ("anthropic-http: askJson prepends schema header to user prompt", askJsonAnthropicHttpPromptShapeOk)
+        , ("openai-http: askJson prepends schema header to user prompt", askJsonOpenAIHttpPromptShapeOk)
         ]
         <> liveSmokeChecks
   forM_ checks $ \(name, ok) ->
@@ -298,7 +330,7 @@ recordingAskTest = do
       . runLLMMockRecording @'AnthropicCli sink (\_ -> Right "Paris")
       $ askText @'AnthropicCli promptText
   recorded <- reverse <$> readIORef sink
-  pure $ answer == "Paris"
+  pure $ answer == Right "Paris"
        && length recorded == 1
        && case recorded of
             (cs:_) -> any (\c -> _cwr_content c == promptText) cs
@@ -464,10 +496,11 @@ runAnthropicLive = do
                       . runMemoryState
                       . runLLMAnthropic cfg
                       $ askText @'AnthropicHttp "Reply with exactly the word: YES")
-              :: IO (Either CE.SomeException Text)
+              :: IO (Either CE.SomeException (Either TransportError Text))
       case ok of
-        Right t -> pure ("anthropic-http live smoke: round-trip OK (got " <> T.unpack (T.take 60 t) <> ")", "YES" `T.isInfixOf` t)
-        Left e  -> pure ("anthropic-http live smoke: FAILED (" <> take 200 (show e) <> ")", False)
+        Right (Right t) -> pure ("anthropic-http live smoke: round-trip OK (got " <> T.unpack (T.take 60 t) <> ")", "YES" `T.isInfixOf` t)
+        Right (Left te) -> pure ("anthropic-http live smoke: transport-Left (" <> T.unpack (unTransportError te) <> ")", False)
+        Left e          -> pure ("anthropic-http live smoke: FAILED (" <> take 200 (show e) <> ")", False)
 
 runOpenAILive :: IO (String, Bool)
 runOpenAILive = do
@@ -482,8 +515,116 @@ runOpenAILive = do
                       . runMemoryState
                       . runLLMOpenAI cfg
                       $ askText @'OpenAIHttp "Reply with exactly the word: YES")
-              :: IO (Either CE.SomeException Text)
+              :: IO (Either CE.SomeException (Either TransportError Text))
       case ok of
-        Right t -> pure ("openai-http live smoke: round-trip OK (got " <> T.unpack (T.take 60 t) <> ")", "YES" `T.isInfixOf` t)
-        Left e  -> pure ("openai-http live smoke: FAILED (" <> take 200 (show e) <> ")", False)
+        Right (Right t) -> pure ("openai-http live smoke: round-trip OK (got " <> T.unpack (T.take 60 t) <> ")", "YES" `T.isInfixOf` t)
+        Right (Left te) -> pure ("openai-http live smoke: transport-Left (" <> T.unpack (unTransportError te) <> ")", False)
+        Left e          -> pure ("openai-http live smoke: FAILED (" <> take 200 (show e) <> ")", False)
+
+-- =========================================================================
+-- CanJsonOutput tests.
+--
+-- The class returns RAW response text — parsing is the consumer's
+-- problem (honest-API rule: parse errors bubble up at the call site,
+-- never swallowed inside the instance, no in-instance retry). These
+-- tests pin three properties per provider:
+--   1. The instance compiles + dispatches through the LLM effect.
+--   2. The schema + a "Respond with ONLY a JSON object..." header are
+--      visibly prepended to the user prompt the interpreter receives.
+--   3. A malformed response (e.g. "not json at all") bubbles up
+--      VERBATIM as the instance's return value — there's no retry, no
+--      empty-string substitution, no implicit parsing inside the
+--      instance.
+-- =========================================================================
+
+-- Shared example schema string. Mirrors the shape 'LLM.JsonExample'
+-- would emit for a Generic-deriving record.
+exampleSchema :: String
+exampleSchema = "{\"title\": \"...\", \"score\": N}"
+
+-- The user prompt the consumer sends, distinct from the schema and
+-- from the response text so we can assert on each independently.
+exampleUserPrompt :: Text
+exampleUserPrompt = "rate the title of this clip"
+
+-- Helper: run askJson against the AnthropicCli provider with a
+-- responder that inspects what the interpreter actually saw and lets
+-- us assert on it.
+runCliJson
+  :: ([ContentWithRole] -> Either Text Text) -> Either TransportError Text
+runCliJson respond = runPureEff
+  . evalState emptyMemoryStore
+  . runMemoryState
+  . runLLMMock @'AnthropicCli respond
+  $ askJson @'AnthropicCli exampleSchema exampleUserPrompt
+
+-- The prompt the interpreter receives must carry the schema header,
+-- the schema text itself, and the original user prompt.
+askJsonCliPromptShapeOk :: Bool
+askJsonCliPromptShapeOk =
+  let result = runCliJson $ \contents ->
+        let seen = T.concat (map _cwr_content contents)
+            hasHeader = "Respond with ONLY a JSON object" `T.isInfixOf` seen
+            hasSchema = T.pack exampleSchema `T.isInfixOf` seen
+            hasUser   = exampleUserPrompt `T.isInfixOf` seen
+        in if hasHeader && hasSchema && hasUser
+             then Right "{\"title\": \"ok\", \"score\": 7}"
+             else Left ("did not see all parts; saw=" <> seen)
+  in result == Right "{\"title\": \"ok\", \"score\": 7}"
+
+-- Happy path: a well-formed JSON response comes back unchanged.
+askJsonCliHappyPathOk :: Bool
+askJsonCliHappyPathOk =
+  let canned = "{\"title\": \"hello\", \"score\": 42}"
+      result = runCliJson (\_ -> Right (T.pack canned))
+  in result == Right (T.pack canned)
+
+-- Malformed response bubbles up VERBATIM through the instance. The
+-- honest-API contract is that the instance does NOT parse, does NOT
+-- retry, does NOT substitute a default — whatever the transport
+-- produced reaches the consumer untouched, and the consumer's parser
+-- decides what to do with it.
+askJsonCliMalformedBubblesOk :: Bool
+askJsonCliMalformedBubblesOk =
+  let garbage = "not json at all, just prose"
+      result = runCliJson (\_ -> Right (T.pack garbage))
+      -- Negative checks: nothing in the response was silently
+      -- normalised, replaced with a default, or stripped.
+  in case result of
+       Right t -> t == T.pack garbage
+                && not (T.null t)
+                && not ("null" `T.isInfixOf` t && T.length t <= 4)
+       Left _  -> False
+
+-- Symmetric prompt-shape test for the AnthropicHttp provider.
+askJsonAnthropicHttpPromptShapeOk :: Bool
+askJsonAnthropicHttpPromptShapeOk =
+  let result = runPureEff
+        . evalState emptyMemoryStore
+        . runMemoryState
+        . runLLMMock @'AnthropicHttp (\contents ->
+            let seen = T.concat (map _cwr_content contents)
+            in if "Respond with ONLY a JSON object" `T.isInfixOf` seen
+                  && T.pack exampleSchema `T.isInfixOf` seen
+                  && exampleUserPrompt `T.isInfixOf` seen
+                 then Right "{}"
+                 else Left "missing parts")
+        $ askJson @'AnthropicHttp exampleSchema exampleUserPrompt
+  in result == Right "{}"
+
+-- Symmetric prompt-shape test for the OpenAIHttp provider.
+askJsonOpenAIHttpPromptShapeOk :: Bool
+askJsonOpenAIHttpPromptShapeOk =
+  let result = runPureEff
+        . evalState emptyMemoryStore
+        . runMemoryState
+        . runLLMMock @'OpenAIHttp (\contents ->
+            let seen = T.concat (map _cwr_content contents)
+            in if "Respond with ONLY a JSON object" `T.isInfixOf` seen
+                  && T.pack exampleSchema `T.isInfixOf` seen
+                  && exampleUserPrompt `T.isInfixOf` seen
+                 then Right "{}"
+                 else Left "missing parts")
+        $ askJson @'OpenAIHttp exampleSchema exampleUserPrompt
+  in result == Right "{}"
 
