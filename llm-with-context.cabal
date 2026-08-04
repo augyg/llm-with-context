@@ -1,4 +1,4 @@
-cabal-version:      3.0
+cabal-version:      3.4
 name:               llm-with-context
 version:            0.1.0.0
 -- synopsis:
@@ -14,7 +14,7 @@ extra-doc-files:    CHANGELOG.md
 -- extra-source-files:
 
 common warnings
-    ghc-options: -Wall
+    ghc-options: -Wall -Werror
 
 library
     import:           warnings
@@ -43,4 +43,12 @@ library
                     
                     
     hs-source-dirs:   src
-    default-language: Haskell2010
+    default-language: GHC2024
+    default-extensions:
+      FunctionalDependencies
+      OverloadedStrings
+      QuasiQuotes
+      RecordWildCards
+      RecursiveDo
+      TemplateHaskell
+      TypeFamilies
