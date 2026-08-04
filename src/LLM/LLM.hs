@@ -292,8 +292,8 @@ askGPT apiKey mgr maxTokens contents = liftIO $ do
           liftIO $ print $ "Error with OpenAI: " <> msg
           pure $ Left "Unknown AI Error"
       Right r -> case choices r of
-        [] -> pure $ Left "No choices"
-        chcs -> pure . Right . _cwr_content . message . head $ chcs
+        []     -> pure $ Left "No choices"
+        (c:_)  -> pure . Right . _cwr_content . message $ c
 
 
 -- curl -X POST http://localhost:11434/api/generate      -d '{
