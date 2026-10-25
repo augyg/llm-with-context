@@ -2,7 +2,10 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE TemplateHaskell #-}
 
--- | Pre-built 'LLMBackend' constructors for each supported provider.
+-- | Description: Pre-built 'LLMBackend' constructors for each supported provider.
+-- Copyright: (c) lazyLambda, 2024-2026
+-- License: MIT
+-- Maintainer: galen.sprout@gmail.com
 --
 -- Use these to create a backend and pass it to 'LLM.Provider.runLLM':
 --

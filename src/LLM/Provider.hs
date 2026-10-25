@@ -5,7 +5,10 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE FlexibleContexts #-}
 
--- | Provider-agnostic LLM execution layer.
+-- | Description: Provider-agnostic LLM execution layer.
+-- Copyright: (c) lazyLambda, 2024-2026
+-- License: MIT
+-- Maintainer: galen.sprout@gmail.com
 --
 -- Defines the 'LLMT' (stateless) and 'ConvoT' (stateful conversation) monad
 -- transformers, backend dispatch via 'askBackend', and convenience functions
@@ -47,13 +50,13 @@ import LLM.ReadLLM (ReadLLM(..))
 import Scrappy.JSON.Value (FromJValue, fromJValue, parseJValue)
 import Scrappy.Scrape (scrapeFirst')
 
-import Control.Exception as CE
+import qualified Control.Exception as CE
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.Trans.Class (MonadTrans(..))
 import Control.Monad.Trans.Reader (ReaderT, asks, runReaderT)
 import Control.Monad.Trans.State (StateT, evalStateT)
-import Data.Aeson as Aeson
-import qualified Data.ByteString.Lazy as LBS
+import qualified Data.Aeson as Aeson
+import qualified Data.ByteString.Lazy as BL
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import GHC.Generics (Generic)
@@ -188,6 +191,34 @@ askOpenAI mgr url apiKey model maxTokens mTools msgs = do
     Right (ToolResponseText t) -> Right t
     Right (ToolResponseCalls _) -> Left $ LLMHttpError "Model returned tool_calls but no tool executor was provided. Use askOpenAITools + runToolLoop."
 
+{- MERGE NOTE: newSorted/gs/pre-merge-newSorted-dirty shipped the OLD text-only
+   askOpenAI with its HTTP implementation inlined. HEAD's version above has
+   been refactored to delegate to askOpenAITools (which supports both text and
+   tool_calls responses) — the inlined HTTP implementation now lives in
+   askOpenAITools. Old shape preserved below for the audit trail:
+
+   askOpenAI :: Manager -> String -> T.Text -> T.Text -> Maybe Int -> [ContentWithRole] -> IO (Either LLMError T.Text)
+   askOpenAI mgr url apiKey model maxTokens msgs = do
+     req <- parseRequest url
+     let headers =
+           [ (hAuthorization, TE.encodeUtf8 $ "Bearer " <> T.strip apiKey)
+           , (hContentType, "application/json")
+           ]
+         body = Aeson.object $
+           [ "model"    Aeson..= model
+           , "messages" Aeson..= msgs
+           ] ++ maybe [] (\t -> ["max_tokens" Aeson..= t]) maxTokens
+         req' = req { requestHeaders = headers, method = "POST", requestBody = RequestBodyLBS $ Aeson.encode body }
+     (CE.try $ fmap responseBody $ httpLbs req' mgr) >>= \case
+       Left (e :: HttpException) -> pure $ Left $ LLMHttpError $ T.pack $ show e
+       Right resBody -> case Aeson.eitherDecode resBody :: Either String PromptResponse of
+         Left e -> case Aeson.eitherDecode resBody :: Either String ErrorResponseOpenAI of
+           Left ee -> pure . Left . LLMHttpError . T.pack $ e <> ee
+           Right (ErrorResponseOpenAI (ErrorOpenAI msg _ _ _)) -> pure $ Left $ LLMHttpError msg
+         Right r -> case choices r of
+           [] -> pure $ Left $ LLMParseError "No choices"
+           (c:_) -> pure . Right . _cwr_content . message $ c
+-}
 
 askAnthropic :: Manager -> String -> T.Text -> T.Text -> [ContentWithRole] -> IO (Either LLMError T.Text)
 askAnthropic mgr url apiKey model msgs = do
@@ -220,7 +251,7 @@ askAnthropic mgr url apiKey model msgs = do
         , requestHeaders = headers
         , requestBody = RequestBodyLBS (Aeson.encode body)
         }
-  (CE.try (httpLbs req' mgr) :: IO (Either HttpException (Response LBS.ByteString))) >>= \case
+  (CE.try (httpLbs req' mgr) :: IO (Either HttpException (Response BL.ByteString))) >>= \case
     Left e -> pure $ Left $ LLMHttpError (T.pack $ show e)
     Right resp -> do
       let respBody = responseBody resp
@@ -245,9 +276,9 @@ askOllama mgr url model msgs = do
         , responseTimeout = responseTimeoutNone
         , requestBody = RequestBodyLBS $ Aeson.encode body
         }
-  (CE.try $ fmap responseBody $ httpLbs req' mgr :: IO (Either HttpException LBS.ByteString)) >>= \case
+  (CE.try $ fmap responseBody $ httpLbs req' mgr :: IO (Either HttpException BL.ByteString)) >>= \case
     Left e -> pure $ Left $ LLMHttpError $ T.pack $ show e
-    Right resBody -> case eitherDecode resBody :: Either String DeepSeekResponse of
+    Right resBody -> case Aeson.eitherDecode resBody :: Either String DeepSeekResponse of
       Left e -> pure . Left . LLMParseError . T.pack $ e
       Right a -> pure . Right . _cwr_content . _deepSeekResponse_message $ a
 
@@ -550,3 +581,6 @@ runToolLoop mgr url apiKey model maxTokens maxRounds tools execToolF initialMsgs
 -- into HEAD's askCLI body above (see "MERGE: ArgMax guard from gs/gets-context"),
 -- so this duplicate tail from gets-context is omitted — the guard is live in
 -- the authoritative askCLI definition rather than preserved as dead code.
+-- newSorted/gs/pre-merge-newSorted-dirty also shipped a third duplicate of
+-- this tail (inline flags array, no extraArgs, qualified CE.SomeException);
+-- same reasoning applies — dropped here, the HEAD body above is authoritative.

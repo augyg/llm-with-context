@@ -7,7 +7,10 @@
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
--- | High-level functions for calling OpenAI (GPT) and DeepSeek\/Ollama models.
+-- | Description: High-level functions for calling OpenAI (GPT) and DeepSeek\/Ollama models.
+-- Copyright: (c) lazyLambda, 2024-2026
+-- License: MIT
+-- Maintainer: galen.sprout@gmail.com
 --
 -- Two backends are supported:
 --
@@ -70,13 +73,13 @@ module LLM.LLM
 import LLM.Types
 import LLM.Provider (askLLM, LLMT(..), LLMError(..), LLMEnv(..), ConvoT(..), parseLLMJSON)
 
-import Scrappy.Elem as S hiding (Tag)
+import qualified Scrappy.Elem as S
 import Scrappy.JSON.Value (FromJValue)
 
-import Network.HTTP.Client hiding (Proxy)
-import Network.HTTP.Types.Header
+import Network.HTTP.Client (Manager, Request(..), parseRequest, httpLbs, responseBody, HttpException, RequestBody(..), responseTimeoutNone)
+import Network.HTTP.Types.Header (hAuthorization, hContentType)
 
-import Control.Monad.IO.Class
+import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Reader (ReaderT, asks)
 import Control.Monad.Trans.State
@@ -91,8 +94,8 @@ import Data.Maybe (catMaybes)
 import qualified Data.List as L
 import qualified Data.Set as S
 import qualified Data.Text as T
-import qualified Data.Text.Encoding as T
-import qualified Data.ByteString.Lazy as LBS
+import qualified Data.Text.Encoding as TE
+import qualified Data.ByteString.Lazy as BL
 
 -- | 'show' a value directly to 'T.Text'.
 tshow :: Show a => a -> T.Text
@@ -526,7 +529,7 @@ gptReturnType typeProxy =
   let
     typeInfo = T.pack $ show (typeRep typeProxy)
   in
-    if typeInfo == "Text" || typeInfo == "String"
+    if typeInfo == "Text" || typeInfo == "String" || typeInfo == "[Char]"
     then []
     else [ cwr System $ "In responding to the above question, give me only the Haskell type:" <> typeInfo <> " and nothing else in your response: Format should be parsable as the Haskell type:" <> typeInfo ]
 
@@ -619,15 +622,15 @@ askGPT apiKey mgr modelName maxTokens contents = liftIO $ do
         , _gptRequest_tools = Nothing
         , _gptRequest_tool_choice = Nothing
         }
-  let req' = req { requestHeaders = (fmap . fmap) (T.encodeUtf8 . T.pack) headers
+  let req' = req { requestHeaders = (fmap . fmap) (TE.encodeUtf8 . T.pack) headers
                  , method = "POST"
                  , requestBody = RequestBodyLBS $ Aeson.encode prompt --txt
                  }
   liftIO $ print $ Aeson.encode prompt
   (CE.try $ fmap responseBody $ httpLbs req' mgr) >>= \case
     Left (e :: HttpException) -> pure $ Left $ tshow e
-    Right resBody -> case eitherDecode resBody :: Either String PromptResponse of
-      Left e -> case eitherDecode resBody :: Either String ErrorResponseOpenAI of
+    Right resBody -> case Aeson.eitherDecode resBody :: Either String PromptResponse of
+      Left e -> case Aeson.eitherDecode resBody :: Either String ErrorResponseOpenAI of
         Left ee -> pure . Left . T.pack $ e <> ee
         Right (ErrorResponseOpenAI (ErrorOpenAI msg _ _ _)) -> do
           liftIO $ print $ "Error with OpenAI: " <> msg
@@ -689,17 +692,17 @@ askDeepSeek mgr modelDS contents = liftIO $ do
   let headers = [ (hContentType, "application/json")
                 ]
   let prompt = mkDSPrompt modelDS contents -- [ cwr User contents ]
-  let req' = req { requestHeaders = (fmap . fmap) (T.encodeUtf8 . T.pack) headers
+  let req' = req { requestHeaders = (fmap . fmap) (TE.encodeUtf8 . T.pack) headers
                  , method = "POST"
                  , responseTimeout = responseTimeoutNone
                  , requestBody = RequestBodyLBS $ Aeson.encode prompt --txt
                  }
 
-  response_ :: Either HttpException LBS.ByteString <- (CE.try $ fmap responseBody $ httpLbs req' mgr)
+  response_ :: Either HttpException BL.ByteString <- (CE.try $ fmap responseBody $ httpLbs req' mgr)
   case response_ of 
     Left (e :: HttpException) -> pure $ Left $ T.pack $ (show e)
     Right resBody -> do
-      case eitherDecode resBody :: Either String DeepSeekResponse of
+      case Aeson.eitherDecode resBody :: Either String DeepSeekResponse of
         Left e -> do
           pure . Left . T.pack $ e
         Right a -> pure $ Right  a 
@@ -719,7 +722,7 @@ askGPTJSON
 askGPTJSON apiKey mgr tokenLimit contents = do
   content_ <- askGPT apiKey mgr gptModel tokenLimit contents
   print content_
-  pure $ flip fmap content_ (Aeson.decode . LBS.fromStrict . T.encodeUtf8)
+  pure $ flip fmap content_ (Aeson.decode . BL.fromStrict . TE.encodeUtf8)
 
 
 -- ============================================================

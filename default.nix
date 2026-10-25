@@ -95,3 +95,33 @@ let
       [ pkgs.bubblewrap newerPkgs.claude-code ];
 in
 hlib.doCheck llm-with-context
+
+# MERGE NOTE: newSorted/gs/pre-merge-newSorted-dirty shipped a flat cabal2nix-style
+# derivation here, listing henforcer among the dependencies. HEAD above uses
+# `callCabal2nix` on the cleaned source tree, which derives build-depends FROM
+# the .cabal file at build time — so henforcer is picked up automatically once
+# it is listed in llm-with-context.cabal's build-depends. The flat derivation
+# below is commented out rather than deleted so the design decision is visible
+# in blame.
+/*
+{ aeson, base, bytestring, containers, data-default
+, directory, http-client, http-client-tls, http-types, lib, parsec
+, network-uri, process
+, text, transformers
+, scrappy-core
+, scrappy-json
+, henforcer
+, pkgs, mkDerivation
+}:
+mkDerivation {
+  pname = "llm-with-context";
+  version = "0.1.0.0";
+  src = ./.;
+  libraryHaskellDepends = [
+    aeson base bytestring containers data-default directory http-client
+    http-client-tls http-types network-uri parsec process scrappy-core
+    scrappy-json henforcer text transformers
+  ];
+  license = lib.licenses.mit;
+}
+*/
