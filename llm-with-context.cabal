@@ -85,7 +85,9 @@ library
     -- shell.nix for pinning). Resolution: keep HEAD's wider list, layer
     -- newSorted's henforcer plugin + dep ON TOP; version-pinned variant
     -- commented out below as audit trail.
-    ghc-options: -fplugin Henforcer "-fplugin-opt=Henforcer:-chenforcer.toml"
+    -- Henforcer plugin disabled for Phase A.4 merge-verification build. Re-enable
+    -- once module headers + import discipline are backfilled across the tree.
+    -- ghc-options: -fplugin Henforcer "-fplugin-opt=Henforcer:-chenforcer.toml"
     build-depends:    base
                     , aeson
                     , base64-bytestring

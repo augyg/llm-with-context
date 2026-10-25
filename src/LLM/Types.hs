@@ -315,8 +315,11 @@ entryTag (ConvoSummary t _) = t
 type ConversationHistory = [ConvoEntry T.Text]
 --type ConversationHistoryCWR = [GPTQuery ContentWithRole]
 
--- | Accumulated Q&A pairs from a conversation, most-recent first.
-type ConversationHistory = [ConvoQuery T.Text]
+-- MERGE SYNTHESIS: the step-4 union merge duplicated the old
+-- `[ConvoQuery T.Text]` definition BELOW the new `[ConvoEntry T.Text]`.
+-- The newer sum-type ConvoEntry (ConvoExchange | ConvoSummary) wraps
+-- ConvoQuery so this is a strict upgrade — commenting out the old form.
+-- type ConversationHistory = [ConvoQuery T.Text]
 
 -- | Accumulated tagged message lists from a DeepSeek conversation.
 type ConversationHistoryDeepSeek = [(TagDS, [ContentWithRole])]
@@ -329,8 +332,10 @@ data ConvoQuery a = ConvoQuery
   }
 
 -- | User-defined label for a conversation turn, used by 'RelevantContext'
--- to select which history items to include as context.
-newtype Tag = Tag { unTag :: T.Text } deriving (Eq, Show, Generic)
+-- to select which history items to include as context. 'Ord' instance
+-- is required for Set-based deduplication in 'Gets' (added by step-4
+-- gets-context merge).
+newtype Tag = Tag { unTag :: T.Text } deriving (Eq, Ord, Show, Generic)
 
 instance ToJSON Tag
 instance FromJSON Tag
@@ -338,8 +343,12 @@ instance FromJSON Tag
 -- | Tag for DeepSeek conversation items; 'isAnswerDS' distinguishes
 -- question entries from answer entries in the flat history list.
 data TagDS = TagDS { unTagDS :: T.Text, isAnswerDS :: Bool } deriving (Eq, Show, Generic)
-newtype Tag = Tag { unTag :: T.Text } deriving (Eq,Show,Ord)
-data TagDS = TagDS { unTagDS :: T.Text, isAnswerDS :: Bool } deriving (Eq,Show, Generic)
+-- MERGE SYNTHESIS: step-4 union merge duplicated Tag + TagDS below.
+-- The newer forms above combine HEAD's Generic/ToJSON instances with
+-- gets-context's Ord deriving — these second decls are commented out
+-- to avoid "Multiple declarations" errors.
+-- newtype Tag = Tag { unTag :: T.Text } deriving (Eq,Show,Ord)
+-- data TagDS = TagDS { unTagDS :: T.Text, isAnswerDS :: Bool } deriving (Eq,Show, Generic)
 
 instance ToJSON TagDS
 instance FromJSON TagDS
@@ -425,6 +434,17 @@ data ToolTurn = ToolTurn
 instance ToJSON ToolTurn
 instance FromJSON ToolTurn
 
+{- MERGE SYNTHESIS NOTE: HEAD's `TagPattern` wraps a flat `T.Text` with
+   @*@/@?@ glob semantics. gets-context's `TagPattern` (further down this
+   file) wraps `[T.Text]` with "--"-segment-aware matching. They are
+   incompatible designs — step 4 of the merge ladder explicitly pulled in
+   gets-context's segment-aware version (per the Gets/NoHistory DSL rule
+   with budgeted tag-glob filters). HEAD's flat-glob block is commented
+   out here to prevent "multiple declarations of TagPattern/CtxRule"
+   parse errors. Future work: port the ToJSON/FromJSON instances onto
+   the segment-aware version — this block's instances were the richer
+   serialization story. -}
+{-
 -- | A glob pattern over tag text: @*@ matches any run of characters, @?@ any
 -- single character (e.g. @"Run0--PartDetail--*"@).
 newtype TagPattern = TagPattern { unTagPattern :: T.Text }
@@ -443,6 +463,7 @@ data CtxRule = CtxRule
 
 instance ToJSON CtxRule
 instance FromJSON CtxRule
+-}
 
 data RelevantContext
   = LastN Int                       -- ^ Take the @n@ most recent items
@@ -450,11 +471,11 @@ data RelevantContext
   | LastNRelevant Int (Tag -> Bool) -- ^ Take the @n@ most recent items whose tag matches a predicate
   | Gets [CtxRule]                  -- ^ Compose several tag-pattern rules (pin-all / last-n-matching)
   | NoHistory                       -- ^ Include no prior context
-  = LastN Int
-  | Relevants [Tag]
-  | LastNRelevant Int (Tag -> Bool) -- LastN matching pattern; most general
-  | Gets [CtxRule]     -- ^ Pattern-based composite: union of budgeted tag-glob filters
-  | NoHistory          -- ^ Skip history entirely; caller provides all context in the prompt
+-- MERGE FIX: step-4 union-merge left a stray duplicate constructor block
+-- below the real `data RelevantContext` declaration above. Both sides had
+-- the same 5 constructors with slightly different Haddock; HEAD's richer
+-- Haddock wins. The duplicate `= LastN Int | Relevants [Tag] | ... | NoHistory`
+-- block that used to live here has been removed as a parse-error root cause.
 
 -- | A glob pattern over "--"-delimited tag segments.
 -- "*" matches any single segment. Literal text matches case-insensitively.
