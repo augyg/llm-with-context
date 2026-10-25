@@ -496,10 +496,13 @@ askGPT apiKey mgr modelName maxTokens contents = liftIO $ do
   let promptLen = maybe [] (\_len -> [cwr System $ "Please limit response to " <> (T.pack $ show (50 :: Integer)) <> " tokens"]) maxTokens
   -- We add 50 to limit because as the request gets larger GPT is worse at knowing when to stop
   -- This should not affect shorter responses
+
   let prompt = GPTRequestBody
         { _gptRequest_model = modelName
         , _gptRequest_max_tokens = (+ 50) <$> maxTokens
-        , _gptRequest_messages = promptLen <> contents
+        , _gptRequest_messages = map toOpenAIMessage (promptLen <> contents)
+        , _gptRequest_tools = Nothing
+        , _gptRequest_tool_choice = Nothing
         }
   let req' = req { requestHeaders = (fmap . fmap) (T.encodeUtf8 . T.pack) headers
                  , method = "POST"
