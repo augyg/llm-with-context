@@ -89,9 +89,30 @@ let
   # $(staticWhich "claude") so the binary path is baked in at compile time.
   # It comes from the pinned 'newerPkgs' above (claude-code isn't yet in
   # nixpkgs 24.11).
+  # henforcer: GHC plugin from gs/henforcer-strict-tests (via
+  # newSorted/gs/pre-merge-newSorted-dirty). Same derivation shape as the one
+  # in shell.nix — fetchzip from Hackage, dontCheck because tests want an
+  # interactive env, doJailbreak because its base/text bounds predate 9.10.
+  henforcer = hlib.dontCheck (hlib.doJailbreak (hp.callPackage ({ mkDerivation, base, containers, dlist, fetchzip, filepattern, ghc
+    , lib, optparse-applicative, pollock, text, tomland
+    }:
+    mkDerivation {
+      pname = "henforcer";
+      version = "1.0.0.1";
+      src = fetchzip {
+        url = "https://hackage.haskell.org/package/henforcer-1.0.0.1/henforcer-1.0.0.1.tar.gz";
+        sha256 = "1vnwvhszvqrypcvk8zvb7px2q78mn3lhbhj521vsrz6zj6459f0r";
+      };
+      libraryHaskellDepends = [
+        base containers dlist filepattern ghc optparse-applicative pollock
+        text tomland
+      ];
+      license = lib.licenses.bsd3;
+    }) { }));
+
   llm-with-context =
     hlib.addBuildTools
-      (hp.callCabal2nix "llm-with-context" (cleanSrc ./.) { inherit scrappy-core scrappy-json; })
+      (hp.callCabal2nix "llm-with-context" (cleanSrc ./.) { inherit scrappy-core scrappy-json henforcer; })
       [ pkgs.bubblewrap newerPkgs.claude-code ];
 in
 hlib.doCheck llm-with-context

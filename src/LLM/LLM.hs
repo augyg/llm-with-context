@@ -123,7 +123,7 @@ renderHistory :: ConversationHistory -> ContentWithRole
 renderHistory = cwr Assistant . ((<>) "Our conversation history so far:") . T.intercalate "\n" . fmap renderItem
   where
     renderItem (ConvoExchange (ConvoQuery _ (ConvoQuestion q) (ConvoAnswer a))) =
-      "Me: " <> (T.decodeUtf8 . LBS.toStrict . Aeson.encode) q <> "\n" <> "Assistant: " <> a
+      "Me: " <> (TE.decodeUtf8 . BL.toStrict . Aeson.encode) q <> "\n" <> "Assistant: " <> a
     renderItem (ConvoSummary _tag summaryText) =
       "[Summary of prior context]\n" <> summaryText
 
@@ -134,7 +134,7 @@ renderContextLabeled items = cwr Assistant $
   "<context>\n" <> T.intercalate "\n" (map renderItem items) <> "\n</context>"
   where
     renderItem (ConvoExchange (ConvoQuery _ (ConvoQuestion q) (ConvoAnswer a))) =
-      "Me: " <> (T.decodeUtf8 . LBS.toStrict . Aeson.encode) q
+      "Me: " <> (TE.decodeUtf8 . BL.toStrict . Aeson.encode) q
       <> "\nAssistant: " <> a
     renderItem (ConvoSummary _tag summaryText) =
       "[Summary of prior context]\n" <> summaryText
@@ -150,7 +150,7 @@ renderHistoryWithRole role =
   cwr role . ((<>) "Our conversation history so far:") . T.intercalate "\n" . fmap renderItem
   where
     renderItem (ConvoExchange (ConvoQuery _ (ConvoQuestion q) (ConvoAnswer a))) =
-      "Me: " <> (T.decodeUtf8 . LBS.toStrict . Aeson.encode) q <> "\n" <> "ChatGPT: " <> a
+      "Me: " <> (TE.decodeUtf8 . BL.toStrict . Aeson.encode) q <> "\n" <> "ChatGPT: " <> a
     renderItem (ConvoSummary _tag summaryText) =
       "[Summary of prior context]\n" <> summaryText
 
@@ -332,7 +332,7 @@ askGPTWithContextTyped key mgr tokenLimit relCtx (thisTag, ConvoQuestion content
 
       Right typed -> do
         let new = ConvoExchange $ ConvoQuery thisTag (ConvoQuestion contents) (ConvoAnswer txt)
-        modify ((:) new)
+        modify ((:) (ConvoExchange new))
         pure . Right . ConvoAnswer $ typed
 
 -- | Ask GPT with conversation context injected. Retrieves relevant history
@@ -352,7 +352,7 @@ askGPTWithContext key mgr maxTokens relCtx (thisTag, ConvoQuestion contents) = C
     Left e -> pure $ Left $ ConvoError e
     Right answer -> do
       let new = ConvoExchange $ ConvoQuery thisTag (ConvoQuestion contents) (ConvoAnswer answer)
-      modify ((:) new)
+      modify ((:) (ConvoExchange new))
       pure $ Right $ ConvoAnswer answer
 
 -- | Transport-agnostic version of the "with context" loop, parameterised over
@@ -375,7 +375,7 @@ askWithContextBy injectHistory prim maxTokens relCtx (thisTag, ConvoQuestion con
     Left e -> pure $ Left $ ConvoError e
     Right answer -> do
       let new = ConvoQuery thisTag (ConvoQuestion contents) (ConvoAnswer answer)
-      modify ((:) new)
+      modify ((:) (ConvoExchange new))
       pure $ Right $ ConvoAnswer answer
 
 -- | Transport-agnostic version of 'askGPTWithContextTyped', parameterised over
@@ -418,7 +418,7 @@ askGPTWithContextTypedBy prim tokenLimit relCtx (thisTag, ConvoQuestion contents
 
       Right typed -> do
         let new = ConvoQuery thisTag (ConvoQuestion contents) (ConvoAnswer txt)
-        modify ((:) new)
+        modify ((:) (ConvoExchange new))
         pure . Right . ConvoAnswer $ typed
 
 
@@ -536,18 +536,30 @@ gptReturnType typeProxy =
 -- | Pure core of 'getRelevantCtx': the history-selection logic without the
 -- 'StateT' wrapper, so the effect interpreters (which carry history in an
 -- effectful 'State') can reuse the exact same selection rules.
+-- MERGE SYNTHESIS NOTE (step 4): `_convoQuery_tag` only works on ConvoQuery;
+-- ConversationHistory is now `[ConvoEntry a]` which wraps ConvoQuery in
+-- ConvoExchange and also has ConvoSummary. `entryTag` is the correct accessor
+-- across both variants (defined in Types.hs). CtxRule is now a record
+-- (crBudget / crPattern) rather than positional.
 selectRelevant :: RelevantContext -> ConversationHistory -> ConversationHistory
 selectRelevant rc hist = case rc of
   LastN n -> take n hist
-  Relevants tags -> catMaybes $ fmap (\t -> L.find (\h -> t == _convoQuery_tag h) hist) tags
-  LastNRelevant n anonF -> take n (filter (anonF . _convoQuery_tag) hist)
+  Relevants tags -> catMaybes $ fmap (\t -> L.find (\h -> t == entryTag h) hist) tags
+  LastNRelevant n anonF -> take n (filter (anonF . entryTag) hist)
   Gets rules -> concatMap applyRule rules
   NoHistory -> []
   where
-    applyRule (CtxRule pat mb) =
-      let matched = filter (matchTag pat . _convoQuery_tag) hist
-       in maybe matched (`take` matched) mb
+    applyRule rule =
+      let matched = filter (matchTag (crPattern rule) . entryTag) hist
+       in maybe matched (`take` matched) (crBudget rule)
 
+{- MERGE SYNTHESIS NOTE (step 4): LLM.Types owns matchTag/mkPattern/pin/
+   lastNMatching now (gets-context's segment-aware design). HEAD's older
+   glob-char-level versions below would create ambiguous occurrences and
+   are commented out. Future work: port the glob (@*@, @?@) char-level
+   semantics onto the segment model if we want wildcard-within-segment back.
+-}
+{-
 -- | Build a tag pattern from glob text (@*@ = any run, @?@ = any single char).
 mkPattern :: T.Text -> TagPattern
 mkPattern = TagPattern
@@ -569,6 +581,7 @@ pin t = CtxRule (mkPattern t) Nothing
 -- | Most recent @n@ entries whose tag matches the glob pattern.
 lastNMatching :: Int -> T.Text -> CtxRule
 lastNMatching n p = CtxRule (mkPattern p) (Just n)
+-}
 
 -- | The three-tier read used by the typed variants, factored out of
 -- 'askGPTWithContextTyped' so the plain typed prim ('askTypedBy') and the
@@ -741,7 +754,7 @@ askWithContext relCtx (thisTag, ConvoQuestion contents) = ConvoT $ do
     Left e -> pure $ Left e
     Right answer -> do
       let new = ConvoExchange $ ConvoQuery thisTag (ConvoQuestion contents) (ConvoAnswer answer)
-      modify ((:) new)
+      modify ((:) (ConvoExchange new))
       pure $ Right $ ConvoAnswer answer
 
 -- | Like 'askWithContext' but parses the response as JSON into type @a@.

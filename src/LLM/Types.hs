@@ -153,7 +153,7 @@ instance FromJSON PromptResponse where
 
 
 -- | Wrapper for a raw GPT response body (unparsed JSON bytes).
-data Content = Content { unContent :: BL.ByteString } deriving Show
+data Content = Content { unContent :: LBS.ByteString } deriving Show
 
 -- | Request body for the OpenAI text-to-speech endpoint.
 data TextToSpeechBody = TextToSpeechBody

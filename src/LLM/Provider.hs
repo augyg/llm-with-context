@@ -38,9 +38,7 @@ module LLM.Provider
   , ToolResponse(..)
   , askOpenAITools
   , runToolLoop
-    -- * Runners and env helpers (from gs/gets-context)
-  , runLLM
-  , runConvo
+    -- * Env helpers (from gs/gets-context — runLLM / runConvo already listed above)
   , checkArgMax
   , mkLLMEnv
   ) where
@@ -302,12 +300,10 @@ askCLI :: FilePath -> T.Text -> [String] -> [ContentWithRole] -> IO (Either LLME
 askCLI exec model extraArgs msgs = do
   let combinedPrompt = T.unpack $ T.intercalate "\n\n"
         [ _cwr_content m | m <- msgs ]
-      args = [ "-p"
-             , "--model", T.unpack model
-             , "--dangerously-skip-permissions"
-             , combinedPrompt
-             ]
   curEnv <- getEnvironment
+  -- MERGE NOTE: step-5 brought in a bare `args = [...]` block earlier that
+  -- lacked extraArgs; it was unused and shadowed the real `args` below.
+  -- Removed to resolve the unused-local-binds + name-shadowing -Werror pair.
   let cleanEnv = filter ((/= "CLAUDECODE") . fst) curEnv
       args = [ "-p"
              , "--model", T.unpack model
@@ -323,7 +319,7 @@ askCLI exec model extraArgs msgs = do
     Left (actual, limit) -> pure $ Left $ LLMArgMaxExceeded actual limit
     Right () -> do
       let cp = (proc exec args) { env = Just cleanEnv }
-      (CE.try $ readCreateProcessWithExitCode cp "" :: IO (Either SomeException (ExitCode, String, String))) >>= \case
+      (CE.try $ readCreateProcessWithExitCode cp "" :: IO (Either CE.SomeException (ExitCode, String, String))) >>= \case
         Left e ->
           pure $ Left $ LLMProcessError 1 (T.pack $ show e)
         Right (ExitSuccess, out, _) ->
@@ -343,7 +339,7 @@ data ToolResponse
 
 -- | Convert OpenAI ToolCall to our ToolUse (parse the JSON arguments).
 toolCallToUse :: ToolCall -> Either String ToolUse
-toolCallToUse tc = case eitherDecode (LBS.fromStrict $ TE.encodeUtf8 args) of
+toolCallToUse tc = case Aeson.eitherDecode (BL.fromStrict $ TE.encodeUtf8 args) of
   Left e  -> Left $ "Failed to parse arguments for " <> T.unpack name <> ": " <> e
   Right v -> Right $ ToolUse cid name v
   where
@@ -369,7 +365,7 @@ toolCallToUse tc = case eitherDecode (LBS.fromStrict $ TE.encodeUtf8 args) of
 --                 jsonStart = T.dropWhile (== ' ') afterName
 --             in case extractJson jsonStart of
 --                  Just (jsonRaw, afterJson) ->
---                    case eitherDecode (LBS.fromStrict $ TE.encodeUtf8 jsonRaw) of
+--                    case Aeson.eitherDecode (BL.fromStrict $ TE.encodeUtf8 jsonRaw) of
 --                      Right v ->
 --                        let afterJson' = dropClosingTag afterJson
 --                        in extractAll afterJson' (ToolUse ("text-" <> name) name v : acc)
@@ -421,7 +417,7 @@ toolCallToUse tc = case eitherDecode (LBS.fromStrict $ TE.encodeUtf8 args) of
 --                       _ -> afterName
 --                 in case extractJson jsonStart of
 --                      Just (jsonRaw, afterJson) ->
---                        case eitherDecode (LBS.fromStrict $ TE.encodeUtf8 jsonRaw) of
+--                        case Aeson.eitherDecode (BL.fromStrict $ TE.encodeUtf8 jsonRaw) of
 --                          Right v ->
 --                            let afterJson' = dropClosingTag afterJson
 --                            in extractAll afterJson' (ToolUse ("text-" <> name) name v : acc)
@@ -476,7 +472,7 @@ toolCallParser = do
   -- Optionally consume closing tag variants
   _ <- optional (string "</function>")
   _ <- optional (char '>')
-  case eitherDecode (LBS.fromStrict $ TE.encodeUtf8 $ T.pack jsonStr) of
+  case Aeson.eitherDecode (BL.fromStrict $ TE.encodeUtf8 $ T.pack jsonStr) of
     Right v -> pure $ ToolUse ("text-" <> T.pack name) (T.pack name) v
     Left e  -> parserFail $ "Invalid JSON in tool call: " <> e
 
@@ -522,9 +518,9 @@ askOpenAITools mgr url apiKey model maxTokens mTools msgs = do
   (CE.try $ fmap responseBody $ httpLbs req' mgr) >>= \case
     Left (e :: HttpException) -> pure $ Left $ LLMHttpError $ T.pack $ show e
     Right resBody -> do
-      LBS.writeFile "/tmp/openrouter-last.json" resBody
-      case eitherDecode resBody :: Either String OpenAIChatResponse of
-        Left e -> case eitherDecode resBody :: Either String ErrorResponseOpenAI of
+      BL.writeFile "/tmp/openrouter-last.json" resBody
+      case Aeson.eitherDecode resBody :: Either String OpenAIChatResponse of
+        Left e -> case Aeson.eitherDecode resBody :: Either String ErrorResponseOpenAI of
           Left ee -> pure . Left . LLMHttpError . T.pack $ e <> ee
           Right (ErrorResponseOpenAI (ErrorOpenAI msg _ _ _)) ->
             pure $ Left $ LLMHttpError msg
@@ -573,7 +569,7 @@ runToolLoop mgr url apiKey model maxTokens maxRounds tools execToolF initialMsgs
       , _toolCall_type     = "function"
       , _toolCall_function = FunctionCall
           { _functionCall_name      = name
-          , _functionCall_arguments = TE.decodeUtf8 $ LBS.toStrict $ Aeson.encode inputVal
+          , _functionCall_arguments = TE.decodeUtf8 $ BL.toStrict $ Aeson.encode inputVal
           }
       }
 -- MERGE NOTE: gs/gets-context ended its askCLI tail here with the ArgMax
@@ -582,5 +578,5 @@ runToolLoop mgr url apiKey model maxTokens maxRounds tools execToolF initialMsgs
 -- so this duplicate tail from gets-context is omitted — the guard is live in
 -- the authoritative askCLI definition rather than preserved as dead code.
 -- newSorted/gs/pre-merge-newSorted-dirty also shipped a third duplicate of
--- this tail (inline flags array, no extraArgs, qualified CE.SomeException);
+-- this tail (inline flags array, no extraArgs, qualified CE.CE.SomeException);
 -- same reasoning applies — dropped here, the HEAD body above is authoritative.
