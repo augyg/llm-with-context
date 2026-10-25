@@ -5,14 +5,16 @@ let
   haskellPackages = if compiler == "default"
                        then pkgs.haskellPackages
                        else pkgs.haskell.packages.${compiler};
+  haskellLib = pkgs.haskell.lib;
+  scrappy-core = haskellLib.dontCheck (haskellLib.doJailbreak (haskellPackages.callCabal2nix "scrappy-core" ../scrappy-core {}));
   variant = if doBenchmark then pkgs.haskell.lib.doBenchmark else pkgs.lib.id;
   pkg = import ./default.nix;
-  drv = variant (haskellPackages.callPackage pkg {}); 
+  drv = variant (haskellPackages.callPackage pkg { inherit scrappy-core; });
 in
 pkgs.mkShell {
   buildInputs = [ pkgs.cabal-install ];
   inputsFrom = [ (if pkgs.lib.inNixShell then drv.env else drv) ];
-} 
+}
 
 
 
