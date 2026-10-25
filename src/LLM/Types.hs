@@ -26,10 +26,26 @@ import Data.ByteString.Lazy as LBS
 import GHC.Generics
 
 
--- | Supported API providers, used as a phantom type on 'APIKey'.
-data APIProvider = OpenAI | Google | AWS | Anthropic
--- | A phantom-typed API key ensuring you don't accidentally pass an OpenAI key
--- to a Google endpoint (or vice versa).
+-- | The set of deployment surfaces we can target. Each constructor is ONE
+-- concrete transport (binary + wire shape), not a vendor. Same vendor with
+-- different transports = different constructors (e.g. @'AnthropicHttp@ for
+-- the HTTPS Messages API vs @'AnthropicCli@ for the local @claude@ binary).
+--
+-- Closed sum kind on purpose — the @LLM (p :: APIProvider)@ effect, the
+-- 'APIKey' phantom, and the per-provider 'LLM.Capability' instances all
+-- pivot on this. Adding a new deployment surface = adding one constructor
+-- + the matching capability instances.
+data APIProvider
+  = AnthropicCli   -- ^ The local @claude@ binary (no API key; capability via subscription).
+  | AnthropicHttp  -- ^ @POST https://api.anthropic.com/v1/messages@.
+  | OpenAIHttp     -- ^ OpenAI chat-completions HTTP API.
+  | GoogleHttp     -- ^ Google's HTTP API (Gemini etc.).
+  | AwsBedrock     -- ^ AWS Bedrock.
+  | DeepSeekHttp   -- ^ DeepSeek HTTP API (and Ollama-hosted DeepSeek).
+-- Define the APIKey type with a phantom type parameter. CLI providers
+-- like 'AnthropicCli' do not consume an 'APIKey' (their auth is the
+-- subscription baked into the binary) — those provider tags simply
+-- aren't used here.
 newtype APIKey (api :: APIProvider) = APIKey { unAPIKey :: T.Text }
 
 -- | OpenAI chat-completion request body. Serializes directly to the JSON
@@ -289,15 +305,69 @@ instance FromJSON a => FromJSON (ConvoAnswer a)
 -- | Convenience alias — DeepSeek answers carry the full 'ContentWithRole'.
 type DeepSeekAnswer = ConvoAnswer ContentWithRole
 
--- | An error from calling an LLM API (network, parse, or API error).
-newtype ConvoError = ConvoError T.Text deriving Show
+-- | Error wrapper for a conversational ask (parse/transport failure surfaced to
+-- the caller). Re-added in the effectful↔upstream merge: the @-X ours@ merge
+-- dropped upstream's definition where our tool types were inserted.
+newtype ConvoError = ConvoError T.Text deriving (Show)
 
--- | Strategy for selecting which history items to inject as context
--- before an OpenAI call.
+-- | A tool definition advertised to the model (provider-neutral). The schema is
+-- a JSON-Schema 'Value'; each provider serialises it into its own @tools@ shape.
+data ToolDef = ToolDef
+  { _toolDef_name :: T.Text
+  , _toolDef_description :: T.Text
+  , _toolDef_inputSchema :: Value
+  } deriving (Show, Generic)
+
+-- | A tool call the model asked for.
+data ToolUse = ToolUse
+  { _toolUse_id :: T.Text
+  , _toolUse_name :: T.Text
+  , _toolUse_input :: Value
+  } deriving (Show, Generic)
+
+-- | A content block in a tool-capable message: assistant text, an assistant
+-- tool call, or a user-supplied tool result.
+data Block
+  = BlockText T.Text
+  | BlockToolUse ToolUse
+  | BlockToolResult T.Text T.Text Bool -- ^ tool_use id, result content, is-error
+  deriving (Show, Generic)
+
+-- | A message in the tool-use conversation (richer than 'ContentWithRole',
+-- which is text-only).
+data RichMessage = RichMessage
+  { _richMessage_role :: GPTRole
+  , _richMessage_blocks :: [Block]
+  } deriving (Show, Generic)
+
+-- | The assistant's turn from a tool-capable ask: any text it emitted, the tool
+-- calls it requested (empty = it's done), and the raw assistant blocks to
+-- append to the conversation before sending tool results back.
+data ToolTurn = ToolTurn
+  { _toolTurn_text :: Maybe T.Text
+  , _toolTurn_toolUses :: [ToolUse]
+  , _toolTurn_assistantBlocks :: [Block]
+  } deriving (Show, Generic)
+
+-- | A glob pattern over tag text: @*@ matches any run of characters, @?@ any
+-- single character (e.g. @"Run0--PartDetail--*"@).
+newtype TagPattern = TagPattern { unTagPattern :: T.Text }
+  deriving (Show, Eq)
+
+-- | One context-selection rule: a tag pattern plus an optional recency budget.
+-- @crBudget == Nothing@ pins all entries matching the pattern; @Just n@ keeps
+-- only the most recent @n@.
+data CtxRule = CtxRule
+  { crPattern :: TagPattern
+  , crBudget :: Maybe Int
+  } deriving (Show, Eq)
+
 data RelevantContext
   = LastN Int                       -- ^ Take the @n@ most recent items
   | Relevants [Tag]                 -- ^ Take items matching specific tags
   | LastNRelevant Int (Tag -> Bool) -- ^ Take the @n@ most recent items whose tag matches a predicate
+  | Gets [CtxRule]                  -- ^ Compose several tag-pattern rules (pin-all / last-n-matching)
+  | NoHistory                       -- ^ Include no prior context
 
 -- | Same as 'RelevantContext' but for the DeepSeek conversation history.
 data RelevantContextDS

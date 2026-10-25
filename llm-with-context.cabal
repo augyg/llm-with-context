@@ -21,54 +21,133 @@ source-repository head
 common warnings
     ghc-options: -Wall -Werror
 
+-- When on (the default), LLM.Effect.Tool.Sandbox bakes the sandbox executable's
+-- absolute path at COMPILE time via staticWhich (bwrap on Linux, sandbox-exec on
+-- macOS) — making it a build- and runtime dependency. Turn it OFF
+-- (-f-static-sandbox-exe) to resolve the executable on PATH at runtime instead,
+-- so a build needs no sandbox tool present (the CPP branch with the splice is
+-- elided before GHC sees it).
+flag static-sandbox-exe
+    description: Bake the sandbox executable path at compile time via staticWhich.
+    default:     True
+    manual:      True
+
 library
     import:           warnings
     exposed-modules:  LLM.JsonExample
                       LLM.LLM
+                      LLM.Retry
                       LLM.Provider
                       LLM.Provider.Backends
                       LLM.ReadLLM
                       LLM.ScrubPrefix
                       LLM.StaticURI
                       LLM.Types
+                      LLM.ProviderMeta
+                      LLM.Provider.Servant
+                      LLM.Provider.Anthropic
+                      LLM.Provider.AnthropicCli
+                      LLM.Provider.AnthropicHttp
+                      LLM.Provider.OpenAI
+                      LLM.Provider.OpenAIHttp
+                      LLM.Capability
+                      LLM.Effect
+                      LLM.Effect.ImageInput
+                      LLM.Effect.Memory
+                      LLM.Effect.Anthropic
+                      LLM.Effect.Backend
+                      LLM.Effect.Validate
+                      LLM.Effect.OpenAI
+                      LLM.Effect.Mock
+                      LLM.Effect.Compaction
+                      LLM.Effect.BrainMd
+                      LLM.Effect.BrainGraph
+                      LLM.Effect.MemoryGraph
+                      LLM.Effect.Tool
+                      LLM.Effect.Tool.Sandbox
+                      LLM.Effect.Budget
+                      LLM.Effect.Budget.Policy
+                      LLM.Effect.Clock
+                      LLM.Effect.Concurrent
+                      LLM.Effect.FileSystem
+                      LLM.Tooling
     -- other-modules:
     -- other-extensions:
-    build-depends: aeson >= 2.2.3 && < 2.3
-                 , base >= 4.20.2 && < 4.21
-                 , bytestring >= 0.12.2 && < 0.13
-                 , containers >= 0.7 && < 0.8
-                 , data-default >= 0.8.0 && < 0.9
-                 , directory >= 1.3.8 && < 1.4
-                 , http-client >= 0.7.19 && < 0.8
-                 , http-client-tls >= 0.3.6 && < 0.4
-                 , http-types >= 0.12.4 && < 0.13
-                 , network-uri
-                 , parsec >= 3.1.18 && < 3.2
-                 , process
-                 , scrappy-core >= 0.1.0 && < 0.2
-                 , scrappy-json
-                 , template-haskell
-                 , text >= 2.1.3 && < 2.2
-                 , transformers >= 0.6.1 && < 0.7
+    build-depends:    base
+                    , aeson
+                    , base64-bytestring
+                    , bytestring
+                    , containers
+                    , data-default
+                    , directory
+                    , fgl
+                    , filepath
+                    , time
+                    , http-client
+                    , http-types
+                    , http-client-tls
+                    , parsec
+                    , process
+                    , scrappy-core
+                    -- scrappy-json: locate + extract JSON from noisy LLM output
+                    -- (LLM.Provider / LLM.ReadLLM / LLM.JsonExample, merged from
+                    -- upstream master).
+                    , scrappy-json
+                    -- network-uri + template-haskell: LLM.StaticURI (upstream).
+                    , network-uri
+                    , template-haskell
+                    , temporary
+                    , text
+                    , transformers
+                    -- staticWhich: bake the sandbox executable's absolute path
+                    -- at compile time (CPP-conditional per platform).
+                    , which
+                    -- servant-client transport for the OpenAI / Anthropic providers
+                    , servant
+                    , servant-client
+                    , servant-client-core
+                    -- the LLM effect layer (effectful). Pin a version whose
+                    -- tested-with still lists GHC 8.10.7 (the 2.2 / 2.3 line);
+                    -- newer releases may have raised the GHC floor.
+                    , effectful-core
+
+                    
+
+
+                    
                     
     hs-source-dirs:   src
     default-language: Haskell2010
+    if flag(static-sandbox-exe)
+        cpp-options: -DSTATIC_SANDBOX_EXE
 
-test-suite tests
+-- Pure tests for the effect layer (mock LLM + Memory/Tool over pure
+-- interpreters, run with runPureEff — no network, no IO). Hand-rolled harness,
+-- no test framework, to keep the dependency/nix footprint minimal.
+-- Compile-only examples (real provider interpreter + a placeholder key). Built
+-- by nix so the wiring can't drift from the API; never executed.
+executable example
+    import:           warnings
+    main-is:          Main.hs
+    hs-source-dirs:   examples
+    build-depends:    base
+                    , effectful-core
+                    , http-client-tls
+                    , llm-with-context
+    default-language: Haskell2010
+
+test-suite llm-with-context-test
     import:           warnings
     type:             exitcode-stdio-1.0
-    main-is:          Main.hs
+    main-is:          Spec.hs
     hs-source-dirs:   test
     build-depends:    base
-                    , llm-with-context
                     , aeson
+                    , base64-bytestring
                     , bytestring
-                    , directory
-                    , hedgehog
-                    , parsec
-                    , scrappy-json
-                    , tasty
-                    , tasty-hedgehog
+                    , http-client
+                    , http-client-tls
                     , text
-                    , transformers
+                    , effectful-core
+                    , llm-with-context
     default-language: Haskell2010

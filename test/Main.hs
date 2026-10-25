@@ -291,13 +291,13 @@ backendsTests =
 
 prop_claudeCLI_name :: Property
 prop_claudeCLI_name = withTests 1 $ property $ do
-  let backend = mkClaudeCLI "haiku"
+  let backend = mkClaudeCLI defaultClaudeCliCfg "haiku"
   _llmBackend_name backend === "claude-cli/haiku"
 
 prop_claudeCLI_model_in_name :: Property
 prop_claudeCLI_model_in_name = property $ do
   model <- forAll $ Gen.element ["haiku", "sonnet", "opus"]
-  let backend = mkClaudeCLI model
+  let backend = mkClaudeCLI defaultClaudeCliCfg model
   assert $ T.isInfixOf model (_llmBackend_name backend)
 
 prop_openAI_name :: Property
@@ -389,7 +389,7 @@ integrationTests =
   ]
 
 claudeEnv :: LLMEnv
-claudeEnv = LLMEnv (mkClaudeCLI "haiku")
+claudeEnv = LLMEnv (mkClaudeCLI defaultClaudeCliCfg "haiku")
 
 prop_llm_single_record :: Property
 prop_llm_single_record = withTests 1 $ property $ do

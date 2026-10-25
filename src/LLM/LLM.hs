@@ -12,7 +12,7 @@
 -- Two backends are supported:
 --
 -- * __OpenAI__ — 'askGPT', 'askGPTTyped', 'askGPTJSON', 'askGPTWithContext',
---   'askGPTWithContextTyped'.  Requires an @'APIKey' \'OpenAI@ and an
+--   'askGPTWithContextTyped'.  Requires an @'APIKey' \'OpenAIHttp@ and an
 --   @http-client@ 'Manager'.
 --
 -- * __DeepSeek \/ Ollama__ — 'askDeepSeek', 'askDeepSeekWithContext'.
@@ -52,6 +52,19 @@ module LLM.LLM
   , gptModel
   , getRelevant
   , TokenLimit
+    -- * Provider-agnostic typed / context helpers (used by the effectful layer
+    -- and the servant providers)
+  , askTypedBy
+  , askWithContextBy
+  , askGPTWithContextTypedBy
+  , renderHistoryWithRole
+  , readTypedAnswer
+  , selectRelevant
+    -- * Context-selection DSL (glob tag patterns)
+  , matchTag
+  , mkPattern
+  , pin
+  , lastNMatching
   ) where
 
 import LLM.Types
@@ -107,21 +120,25 @@ renderHistory = cwr Assistant . ((<>) "Our conversation history so far:") . T.in
     renderItem (ConvoQuery _ (ConvoQuestion q) (ConvoAnswer a)) =
       "Me: " <> (T.decodeUtf8 . LBS.toStrict . Aeson.encode) q <> "\n" <> "Assistant: " <> a
 
+-- | Like 'renderHistory' but lets the caller choose which role the rendered
+-- history is attached to. OpenAI/DeepSeek inject history as an 'Assistant'
+-- turn; Anthropic requires the first message to be a 'User' turn, so the
+-- Anthropic provider injects history as a 'System' turn instead (which
+-- 'LLM.Provider.Anthropic.splitSystem' hoists into the top-level "system"
+-- field).
+renderHistoryWithRole :: GPTRole -> ConversationHistory -> ContentWithRole
+renderHistoryWithRole role =
+  cwr role . ((<>) "Our conversation history so far:") . T.intercalate "\n" . fmap renderItem
+  where
+    renderItem (ConvoQuery _ (ConvoQuestion q) (ConvoAnswer a)) =
+      "Me: " <> (T.decodeUtf8 . LBS.toStrict . Aeson.encode) q <> "\n" <> "ChatGPT: " <> a
+
 
 
 
 -- | Select conversation history items matching a 'RelevantContext' strategy.
 getRelevantCtx :: Monad m => RelevantContext -> StateT ConversationHistory m ConversationHistory
-getRelevantCtx = \case
-  LastN n -> gets (take n)
-  Relevants tags -> gets (flip finds tags)
-  LastNRelevant n anonF -> gets (\x ->
-                               take n
-                               . filter (anonF . _convoQuery_tag) $ x
-                            )
-  where
-    finds hist tags =
-      catMaybes $ fmap (\t -> L.find (\h -> t == _convoQuery_tag h) hist) tags
+getRelevantCtx rc = gets (selectRelevant rc)
 
 -- | Select DeepSeek conversation history items matching a 'RelevantContextDS' strategy.
 getRelevantCtxDeepSeek :: MonadIO m => RelevantContextDS -> MonadDeepSeek m ConversationHistoryDeepSeek
@@ -143,12 +160,12 @@ getRelevantCtxDeepSeek = \case
 -- testctx = do
 --   mgr <- liftIO $ newManager tlsManagerSettings
 --   k <- liftIO $ fmap T.pack $ readFile "config/backend/gptAPIKey"
---   r1 <- askGPTWithContext k mgr (LastN 10) (Tag "Name", GPTQuestion [cwr User "my name is galen"])
---   r2 <- askGPTWithContext k mgr (LastN 10) (Tag "Hey", GPTQuestion [cwr User "please tell me what my name is"])
---   r3 :: Either GPTError (GPTAnswer Int) <- askGPTWithContextTyped k mgr (LastN 10) (Tag "Hey", GPTQuestion [cwr User "how many letters in my name"])
---   r4 :: Either GPTError (GPTAnswer Int) <- askGPTWithContextTyped k mgr (Relevants [Tag "Name"]) (Tag "Hey", GPTQuestion [cwr User "how many letters in my name"])
---   r5 :: Either GPTError (GPTAnswer Int) <- askGPTWithContextTyped k mgr (Relevants []) (Tag "Hey", GPTQuestion [cwr User "how many letters in my name"])
---   r6 :: Either GPTError (GPTAnswer Int) <- askGPTWithContextTyped k mgr (LastN 0) (Tag "Hey", GPTQuestion [cwr User "how many letters in my name"])
+--   r1 <- askGPTWithContext k mgr (LastN 10) (Tag "Name", ConvoQuestion [cwr User "my name is galen"])
+--   r2 <- askGPTWithContext k mgr (LastN 10) (Tag "Hey", ConvoQuestion [cwr User "please tell me what my name is"])
+--   r3 :: Either ConvoError (ConvoAnswer Int) <- askGPTWithContextTyped k mgr (LastN 10) (Tag "Hey", ConvoQuestion [cwr User "how many letters in my name"])
+--   r4 :: Either ConvoError (ConvoAnswer Int) <- askGPTWithContextTyped k mgr (Relevants [Tag "Name"]) (Tag "Hey", ConvoQuestion [cwr User "how many letters in my name"])
+--   r5 :: Either ConvoError (ConvoAnswer Int) <- askGPTWithContextTyped k mgr (Relevants []) (Tag "Hey", ConvoQuestion [cwr User "how many letters in my name"])
+--   r6 :: Either ConvoError (ConvoAnswer Int) <- askGPTWithContextTyped k mgr (LastN 0) (Tag "Hey", ConvoQuestion [cwr User "how many letters in my name"])
 --   liftIO $ print r1
 --   liftIO $ print r2
 --   liftIO $ print r3
@@ -167,7 +184,7 @@ askGPTWithContextTyped
   , Read a
   , MonadIO m
   )
-  => APIKey 'OpenAI
+  => APIKey 'OpenAIHttp
   -> Manager
   -> TokenLimit
   -> RelevantContext
@@ -205,7 +222,7 @@ askGPTWithContextTyped key mgr tokenLimit relCtx (thisTag, ConvoQuestion content
 -- in state on success.
 askGPTWithContext
   :: MonadIO m
-  => APIKey 'OpenAI
+  => APIKey 'OpenAIHttp
   -> Manager
   -> TokenLimit
   -> RelevantContext
@@ -219,6 +236,72 @@ askGPTWithContext key mgr maxTokens relCtx (thisTag, ConvoQuestion contents) = C
       let new = ConvoQuery thisTag (ConvoQuestion contents) (ConvoAnswer answer)
       modify ((:) new)
       pure $ Right $ ConvoAnswer answer
+
+-- | Transport-agnostic version of the "with context" loop, parameterised over
+-- how history is injected and which stateless prim does the request. This lets
+-- the OpenAI and Anthropic servant providers reuse the exact same StateT
+-- bookkeeping without touching 'askGPTWithContext'. @injectHistory@ turns the
+-- recalled turns into prompt messages (an 'Assistant' turn for OpenAI/DeepSeek,
+-- a 'System' turn for Anthropic); @prim@ is the provider's stateless ask.
+askWithContextBy
+  :: MonadIO m
+  => (ConversationHistory -> [ContentWithRole])
+  -> (forall n. MonadIO n => TokenLimit -> [ContentWithRole] -> n (Either T.Text T.Text))
+  -> TokenLimit
+  -> RelevantContext
+  -> (Tag, ConvoQuestion)
+  -> ConvoT m (Either ConvoError (ConvoAnswer T.Text))
+askWithContextBy injectHistory prim maxTokens relCtx (thisTag, ConvoQuestion contents) = ConvoT $ do
+  histItems <- getRelevantCtx relCtx
+  prim maxTokens (injectHistory histItems <> contents) >>= \case
+    Left e -> pure $ Left $ ConvoError e
+    Right answer -> do
+      let new = ConvoQuery thisTag (ConvoQuestion contents) (ConvoAnswer answer)
+      modify ((:) new)
+      pure $ Right $ ConvoAnswer answer
+
+-- | Transport-agnostic version of 'askGPTWithContextTyped', parameterised over
+-- the stateless prim. The typed-decode logic lives here (rather than in a
+-- provider module) so it keeps the same imports and behaviour as
+-- 'askGPTWithContextTyped'. History is injected as an 'Assistant' turn, as the
+-- OpenAI-style typed flow expects.
+askGPTWithContextTypedBy
+  :: forall m a.
+  ( Typeable a
+  , Read a
+  , MonadIO m
+  )
+  => (forall n. MonadIO n => TokenLimit -> [ContentWithRole] -> n (Either T.Text T.Text))
+  -> TokenLimit
+  -> RelevantContext
+  -> (Tag, ConvoQuestion)
+  -> ConvoT m (Either ConvoError (ConvoAnswer a))
+askGPTWithContextTypedBy prim tokenLimit relCtx (thisTag, ConvoQuestion contents) = ConvoT $ do
+  let typeProxy = Proxy :: Proxy a
+  let returnT = gptReturnType typeProxy
+  let
+    readEitherText :: T.Text -> Either T.Text a
+    readEitherText = first T.pack . readEither2 . T.unpack
+      where
+        readEither2 x = case readEither x of
+          Right a -> Right a
+          Left _ -> case readEither $ "\"" <> x <> "\"" of
+            Right a -> Right a
+            Left _ -> readEither $ "\"" <> (T.unpack $ escapeText $ T.pack x) <> "\""
+
+  ctx <- renderHistory <$> getRelevantCtx relCtx
+  prim tokenLimit (ctx : contents <> returnT) >>= \case
+    Left e -> pure . Left . ConvoError $ e
+    Right txt -> case readEitherText txt of
+      Left e -> pure . Left . ConvoError $
+        e <> "When reading return type: (x :: "  <> (T.pack . show $ typeRep typeProxy ) <> ") from base response: " <> txt
+        <> "From Prompt: "
+        <> (T.pack $ show (ctx : contents <> returnT))
+
+      Right typed -> do
+        let new = ConvoQuery thisTag (ConvoQuestion contents) (ConvoAnswer txt)
+        modify ((:) new)
+        pure . Right . ConvoAnswer $ typed
 
 
 
@@ -240,7 +323,7 @@ askGPTWithContext key mgr maxTokens relCtx (thisTag, ConvoQuestion contents) = C
   -- }                        
 
 
--- runStateAction :: MonadIO m => Manager -> DeepSeekModel -> [ContentWithRole] -> MonadDeepSeek m (Either GPTError DeepSeekAnswer)
+-- runStateAction :: MonadIO m => Manager -> DeepSeekModel -> [ContentWithRole] -> MonadDeepSeek m (Either ConvoError DeepSeekAnswer)
 -- runStateAction mgr modelChoice cwrs = askDeepSeekWithContext mgr modelChoice (LastN_DS 1000) (TagDS "sometag" False, DeepSeekQuestion cwrs)
 
 
@@ -285,7 +368,7 @@ askGPTTyped
   , Typeable a
   , Read a
   )
-  => APIKey 'OpenAI
+  => APIKey 'OpenAIHttp
   -> Manager
   -> TokenLimit
   -> ConvoQuestion
@@ -332,12 +415,77 @@ gptReturnType typeProxy =
     then []
     else [ cwr System $ "In responding to the above question, give me only the Haskell type:" <> typeInfo <> " and nothing else in your response: Format should be parsable as the Haskell type:" <> typeInfo ]
 
--- | Optional max-token limit for a request. 'Nothing' = model default.
+-- | Pure core of 'getRelevantCtx': the history-selection logic without the
+-- 'StateT' wrapper, so the effect interpreters (which carry history in an
+-- effectful 'State') can reuse the exact same selection rules.
+selectRelevant :: RelevantContext -> ConversationHistory -> ConversationHistory
+selectRelevant rc hist = case rc of
+  LastN n -> take n hist
+  Relevants tags -> catMaybes $ fmap (\t -> L.find (\h -> t == _convoQuery_tag h) hist) tags
+  LastNRelevant n anonF -> take n (filter (anonF . _convoQuery_tag) hist)
+  Gets rules -> concatMap applyRule rules
+  NoHistory -> []
+  where
+    applyRule (CtxRule pat mb) =
+      let matched = filter (matchTag pat . _convoQuery_tag) hist
+       in maybe matched (`take` matched) mb
+
+-- | Build a tag pattern from glob text (@*@ = any run, @?@ = any single char).
+mkPattern :: T.Text -> TagPattern
+mkPattern = TagPattern
+
+-- | Match a tag against a glob 'TagPattern'.
+matchTag :: TagPattern -> Tag -> Bool
+matchTag (TagPattern pat) (Tag t) = glob (T.unpack pat) (T.unpack t)
+  where
+    glob [] [] = True
+    glob ('*' : ps) cs = glob ps cs || (not (null cs) && glob ('*' : ps) (drop 1 cs))
+    glob ('?' : ps) (_ : cs) = glob ps cs
+    glob (p : ps) (c : cs) = p == c && glob ps cs
+    glob _ _ = False
+
+-- | Pin all entries whose tag matches (an exact tag is a wildcard-free pattern).
+pin :: T.Text -> CtxRule
+pin t = CtxRule (mkPattern t) Nothing
+
+-- | Most recent @n@ entries whose tag matches the glob pattern.
+lastNMatching :: Int -> T.Text -> CtxRule
+lastNMatching n p = CtxRule (mkPattern p) (Just n)
+
+-- | The three-tier read used by the typed variants, factored out of
+-- 'askGPTWithContextTyped' so the plain typed prim ('askTypedBy') and the
+-- effect interpreters share one decoder. Tries the raw text, then quoted, then
+-- escaped-and-quoted.
+readTypedAnswer :: forall a. Read a => T.Text -> Either T.Text a
+readTypedAnswer = first T.pack . readEither2 . T.unpack
+  where
+    readEither2 x = case readEither x of
+      Right a -> Right a
+      Left _ -> case readEither $ "\"" <> x <> "\"" of
+        Right a -> Right a
+        Left _ -> readEither $ "\"" <> (T.unpack $ escapeText $ T.pack x) <> "\""
+
+-- | Transport-agnostic typed prim: append the return-type instruction, run the
+-- supplied stateless text prim, and decode the answer to @a@. Mirrors
+-- 'askGPTTyped' but parameterised over the prim so any provider can reuse it.
+-- The token cap is decided by the prim's own config (Reader), so it is not a
+-- parameter here. 'Monad' rather than 'MonadIO' since this touches no IO — that
+-- also lets the pure mock interpreter reuse it.
+askTypedBy
+  :: forall m a. (Monad m, Typeable a, Read a)
+  => ([ContentWithRole] -> m (Either T.Text T.Text))
+  -> [ContentWithRole]
+  -> m (Either ConvoError (ConvoAnswer a))
+askTypedBy prim contents = do
+  let returnT = gptReturnType (Proxy :: Proxy a)
+  r <- prim (contents <> returnT)
+  pure . bimap ConvoError ConvoAnswer $ readTypedAnswer =<< r
+
 type TokenLimit = Maybe Int
 
 -- | Low-level OpenAI chat-completion call. Sends messages to
 -- @\/v1\/chat\/completions@ and returns the first choice's content or an error.
-askGPT :: MonadIO m => APIKey 'OpenAI -> Manager -> T.Text -> TokenLimit -> [ContentWithRole] -> m (Either T.Text T.Text)
+askGPT :: MonadIO m => APIKey 'OpenAIHttp -> Manager -> T.Text -> TokenLimit -> [ContentWithRole] -> m (Either T.Text T.Text)
 askGPT apiKey mgr modelName maxTokens contents = liftIO $ do
   putStrLn "askGPT"
   let url = "https://api.openai.com/v1/chat/completions"
@@ -445,7 +593,7 @@ askDeepSeek mgr modelDS contents = liftIO $ do
 -- Returns @Right Nothing@ if the response is valid text but not valid JSON for @b@.
 askGPTJSON
   :: FromJSON b
-  => APIKey 'OpenAI
+  => APIKey 'OpenAIHttp
   -> Manager
   -> TokenLimit
   -> [ContentWithRole]
