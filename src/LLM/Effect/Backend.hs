@@ -66,3 +66,9 @@ renderLLMError (LLMHttpError t)         = t
 renderLLMError (LLMParseError t)        = t
 renderLLMError (LLMProcessError code t) =
   "LLM process exited with code " <> T.pack (show code) <> ": " <> t
+-- MERGE SYNTHESIS (step 4): LLMArgMaxExceeded added by gets-context — surface
+-- the actual-vs-limit byte counts so callers can diagnose which prompt / env
+-- block pushed over ARG_MAX.
+renderLLMError (LLMArgMaxExceeded actual limit) =
+  "LLM execve payload too large: "
+  <> T.pack (show actual) <> " bytes vs ARG_MAX " <> T.pack (show limit) <> " bytes"

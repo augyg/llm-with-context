@@ -21,7 +21,7 @@ module LLM.Effect.Compaction
 import LLM.Effect (LLM, ask)
 import LLM.Effect.Memory (Memory, forget, note, recallAll, recallPinned, remember)
 import LLM.LLM (renderHistory)
-import LLM.Types (APIProvider (..), GPTRole (System), cwr)
+import LLM.Types (APIProvider (..), ConvoEntry (..), GPTRole (System), cwr)
 
 import Control.Monad (forM_)
 import qualified Data.Text as T
@@ -46,7 +46,13 @@ compact = summarizeHistory @p >>= \case
     pinned <- recallPinned
     forget
     note summary
-    forM_ (reverse pinned) remember
+    -- MERGE SYNTHESIS (step 4): recallPinned now returns [ConvoEntry T.Text];
+    -- `remember` still takes a raw ConvoQuery. Unwrap ConvoExchange entries;
+    -- ConvoSummary entries don't survive the re-remember round-trip (they'd
+    -- need a dedicated effect — recompaction will produce fresh summaries).
+    forM_ (reverse pinned) $ \e -> case e of
+      ConvoExchange q -> remember q
+      ConvoSummary _ _ -> pure ()
 
 -- | 'compact' pinned to Anthropic.
 compactAnthropic :: (LLM 'AnthropicHttp :> es, Memory :> es) => Eff es ()

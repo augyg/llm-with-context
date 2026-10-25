@@ -80,12 +80,15 @@ import LLM.Types
   ( APIProvider (..)
   , ContentWithRole (..)
   , ConvoAnswer (..)
+  -- , ConvoEntry (..)   -- MERGE SYNTHESIS step 4: imported but unused in the current test file; kept commented in case future tests need ConvoExchange/ConvoSummary pattern-matching
+
   , ConvoQuery (..)
   , ConvoQuestion (..)
   , GPTRole (User)
   , RelevantContext (..)
   , Tag (..)
   , cwr
+  , entryTag          -- MERGE SYNTHESIS step 4: tag accessor across ConvoEntry
   )
 
 import LLM.Brain.Lexicon (PartOfSpeech (..), classifyRules, lemmatize, runLexiconRules)
@@ -104,7 +107,7 @@ import LLM.Brain.Store
   , rememberKeyed
   , runBrainState
   )
-import qualified Data.Text as T
+-- import qualified Data.Text as T  -- MERGE: unused in test file post-ConvoEntry rewrite
 import LLM.Brain.Catalogue
   ( BrainAnswer (..)
   , askWithBrain
@@ -231,7 +234,7 @@ pinnedTags = runPureEff . evalState emptyMemoryStore . runMemoryState $ do
   remember (ConvoQuery (Tag "t1") (ConvoQuestion []) (ConvoAnswer "y"))
   remember (ConvoQuery (Tag "t2") (ConvoQuestion []) (ConvoAnswer "y"))
   prune 0
-  map (unTag . _convoQuery_tag) <$> recallAll
+  map (unTag . entryTag) <$> recallAll
 
 -- Two context-aware asks against the mock provider should leave two turns in
 -- memory. Fully pure: mock LLM + Memory + State, run with runPureEff.
@@ -744,9 +747,9 @@ catalogueKey =
     . evalState emptyBrain
     . runBrainState defaultWeights
     . runLexiconRules
-    . runLLMMock @'Anthropic (const (Right cannedJson))
+    . runLLMMock @'AnthropicHttp (const (Right cannedJson))
     $ do
-        res <- catalogue @'Anthropic "the scrapers detect bots"
+        res <- catalogue @'AnthropicHttp "the scrapers detect bots"
         case res of
           Left _  -> pure Nothing
           Right i -> fmap (fmap beKey) (getEntry i)
@@ -769,9 +772,9 @@ keyForPromptKey =
     . evalState emptyMemoryStore
     . runMemoryState
     . runLexiconRules
-    . runLLMMock @'Anthropic (const (Right focusedKeyJson))
+    . runLLMMock @'AnthropicHttp (const (Right focusedKeyJson))
     $ do
-        e <- keyForPrompt @'Anthropic "tell me about butterflies"
+        e <- keyForPrompt @'AnthropicHttp "tell me about butterflies"
         pure (either (const Nothing) Just e)
 
 keyForPromptOk :: Bool
@@ -786,10 +789,10 @@ recallFocusedVals =
     . evalState emptyBrain
     . runBrainState defaultWeights
     . runLexiconRules
-    . runLLMMock @'Anthropic (const (Right focusedKeyJson))
+    . runLLMMock @'AnthropicHttp (const (Right focusedKeyJson))
     $ do
         _ <- rememberKeyed (canonicalKey [lemmatize "butterflies"] [] []) "BUTTERFLY-NOTE"
-        e <- recallFocused @'Anthropic defaultEffort "tell me about butterflies"
+        e <- recallFocused @'AnthropicHttp defaultEffort "tell me about butterflies"
         pure (either (const []) (map beValue) e)
 
 recallFocusedOk :: Bool
@@ -815,10 +818,10 @@ askWithBrainResult =
     . evalState emptyBrain
     . runBrainState defaultWeights
     . runLexiconRules
-    . runLLMMock @'Anthropic (const (Right "MOCK-ANSWER"))
+    . runLLMMock @'AnthropicHttp (const (Right "MOCK-ANSWER"))
     $ do
         _ <- rememberKeyed (canonicalKey ["cat"] [] []) "## Cats"
-        e <- askWithBrain @'Anthropic defaultEffort "cats"
+        e <- askWithBrain @'AnthropicHttp defaultEffort "cats"
         pure $ case e of
           Left _   -> Nothing
           Right ba -> Just (baAnswer ba, map beValue (baInjected ba))
