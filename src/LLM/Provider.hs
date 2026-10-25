@@ -3,6 +3,7 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE FlexibleContexts #-}
 
 -- | Provider-agnostic LLM execution layer.
 --
@@ -30,6 +31,10 @@ module LLM.Provider
   , askLLMJSON
   , askLLMParsec
   , parseLLMJSON
+    -- * Tool support
+  , ToolResponse(..)
+  , askOpenAITools
+  , runToolLoop
   ) where
 
 import LLM.Types
@@ -53,6 +58,11 @@ import Network.URI (URI)
 import System.Environment (getEnvironment)
 import System.Exit (ExitCode(..))
 import System.Process (readCreateProcessWithExitCode, proc, CreateProcess(..))
+
+import Text.Parsec hiding (try)           -- hide parsec's try, we'll qualify it
+import qualified Text.Parsec as P
+import Text.Parsec.Text (Parser)
+import Data.Maybe
 
 -- | Which HTTP-based LLM provider a backend targets.
 data WebProvider = ProviderOpenAI | ProviderAnthropic | ProviderOllama
@@ -104,7 +114,7 @@ instance MonadTrans ConvoT where
 askBackend :: LLMBackend -> [ContentWithRole] -> IO (Either LLMError T.Text)
 askBackend backend msgs = case _llmBackend_api backend of
   APIWeb mgr url key model maxToks prov -> case prov of
-    ProviderOpenAI    -> askOpenAI mgr (show url) key model maxToks msgs
+    ProviderOpenAI    -> askOpenAI mgr (show url) key model maxToks Nothing msgs
     ProviderAnthropic -> askAnthropic mgr (show url) key model msgs
     ProviderOllama    -> askOllama mgr (show url) model msgs
   APICLI exec model extraArgs -> askCLI exec model extraArgs msgs
@@ -153,32 +163,16 @@ runConvo llmEnv (ConvoT action) = runReaderT (evalStateT action []) llmEnv
 -- Provider-specific HTTP/CLI implementations
 -- ============================================================
 
-askOpenAI :: Manager -> String -> T.Text -> T.Text -> Maybe Int -> [ContentWithRole] -> IO (Either LLMError T.Text)
-askOpenAI mgr url apiKey model maxTokens msgs = do
-  req <- parseRequest url
-  let headers =
-        [ (hAuthorization, TE.encodeUtf8 $ "Bearer " <> T.strip apiKey)
-        , (hContentType, "application/json")
-        ]
-      body = Aeson.object $
-        [ "model"    Aeson..= model
-        , "messages" Aeson..= msgs
-        ] ++ maybe [] (\t -> ["max_tokens" Aeson..= t]) maxTokens
-      req' = req
-        { requestHeaders = headers
-        , method = "POST"
-        , requestBody = RequestBodyLBS $ Aeson.encode body
-        }
-  (CE.try $ fmap responseBody $ httpLbs req' mgr) >>= \case
-    Left (e :: HttpException) -> pure $ Left $ LLMHttpError $ T.pack $ show e
-    Right resBody -> case eitherDecode resBody :: Either String PromptResponse of
-      Left e -> case eitherDecode resBody :: Either String ErrorResponseOpenAI of
-        Left ee -> pure . Left . LLMHttpError . T.pack $ e <> ee
-        Right (ErrorResponseOpenAI (ErrorOpenAI msg _ _ _)) ->
-          pure $ Left $ LLMHttpError msg
-      Right r -> case choices r of
-        [] -> pure $ Left $ LLMParseError "No choices"
-        (c:_) -> pure . Right . _cwr_content . message $ c
+-- | Updated askOpenAI that supports tools. Pass 'Nothing' for mTools to get
+-- the old text-only behaviour.
+askOpenAI :: Manager -> String -> T.Text -> T.Text -> Maybe Int -> Maybe [ToolDef] -> [ContentWithRole] -> IO (Either LLMError T.Text)
+askOpenAI mgr url apiKey model maxTokens mTools msgs = do
+  result <- askOpenAITools mgr url apiKey model maxTokens mTools (map toOpenAIMessage msgs)
+  pure $ case result of
+    Left e                    -> Left e
+    Right (ToolResponseText t) -> Right t
+    Right (ToolResponseCalls _) -> Left $ LLMHttpError "Model returned tool_calls but no tool executor was provided. Use askOpenAITools + runToolLoop."
+
 
 askAnthropic :: Manager -> String -> T.Text -> T.Text -> [ContentWithRole] -> IO (Either LLMError T.Text)
 askAnthropic mgr url apiKey model msgs = do
@@ -266,3 +260,249 @@ askCLI exec model extraArgs msgs = do
       pure $ Right (T.pack out)
     Right (ExitFailure code, _, err) ->
       pure $ Left $ LLMProcessError code (T.pack err)
+
+-- ============================================================
+-- Tool support (OpenAI / OpenRouter)
+-- ============================================================
+
+-- | What the model returned: either plain text or a request to run tools.
+data ToolResponse
+  = ToolResponseText T.Text
+  | ToolResponseCalls [ToolUse]
+  deriving (Show)
+
+-- | Convert OpenAI ToolCall to our ToolUse (parse the JSON arguments).
+toolCallToUse :: ToolCall -> Either String ToolUse
+toolCallToUse tc = case eitherDecode (LBS.fromStrict $ TE.encodeUtf8 args) of
+  Left e  -> Left $ "Failed to parse arguments for " <> T.unpack name <> ": " <> e
+  Right v -> Right $ ToolUse cid name v
+  where
+    cid  = _toolCall_id tc
+    name = _functionCall_name $ _toolCall_function tc
+    args = _functionCall_arguments $ _toolCall_function tc
+
+-- -- | Fallback parser for models that emit tool calls as pseudo-XML text
+-- -- instead of the native OpenAI tool_calls field.
+-- -- Handles: <function/name {"arg": "val"}>  or  <function/name {"arg": "val"}</function>
+-- parseTextToolCalls :: T.Text -> Maybe [ToolUse]
+-- parseTextToolCalls txt = case extractAll (T.strip txt) [] of
+--   [] -> Nothing
+--   us -> Just us
+--   where
+--     extractAll t acc
+--       | T.null t = reverse acc
+--       | otherwise = case T.breakOn "<function/" t of
+--           (_, "") -> reverse acc
+--           (_, rest) ->
+--             let afterTag  = T.drop (T.length "<function/") rest
+--                 (name, afterName) = T.break (== ' ') afterTag
+--                 jsonStart = T.dropWhile (== ' ') afterName
+--             in case extractJson jsonStart of
+--                  Just (jsonRaw, afterJson) ->
+--                    case eitherDecode (LBS.fromStrict $ TE.encodeUtf8 jsonRaw) of
+--                      Right v ->
+--                        let afterJson' = dropClosingTag afterJson
+--                        in extractAll afterJson' (ToolUse ("text-" <> name) name v : acc)
+--                      Left _ -> extractAll (skipTag afterJson) acc
+--                  Nothing -> reverse acc
+
+--     dropClosingTag = T.replace "</function>" "" . T.dropWhile (`elem` ['>', ' '])
+--     skipTag s = T.drop 1 (T.dropWhile (/= '>') s)
+
+--     -- Extract a balanced JSON object starting at the first '{'
+--     extractJson s =
+--       let s' = T.dropWhile (/= '{') s
+--       in if T.null s'
+--          then Nothing
+--          else let (obj, rest) = matchBrace (T.drop 1 s') 1 ""
+--               in Just ("{" <> obj, rest)
+
+--     matchBrace :: T.Text -> Int -> T.Text -> (T.Text, T.Text)
+--     matchBrace t depth acc
+--       | T.null t = (acc, "")
+--       | depth == 0 = (acc, t)
+--       | otherwise =
+--           let c = T.head t
+--               rest = T.tail t
+--           in case c of
+--                '{' -> matchBrace rest (depth + 1) (acc <> "{")
+--                '}' -> matchBrace rest (depth - 1) (acc <> "}")
+--                _   -> matchBrace rest depth (acc <> T.singleton c)
+
+-- | Fallback parser for models that emit tool calls as pseudo-XML text.
+-- Handles multiple formats: <function/name {...}>, <function/name>{...}</function>
+-- parseTextToolCalls :: T.Text -> Maybe [ToolUse]
+-- parseTextToolCalls txt = case extractAll (T.strip txt) [] of
+--   [] -> Nothing
+--   us -> Just us
+--   where
+--     extractAll t acc
+--       | T.null t = reverse acc
+--       | otherwise = case T.breakOn "<function/" t of
+--           (_, rest)
+--             | T.null rest -> reverse acc
+--             | otherwise ->
+--                 let afterTag  = T.drop (T.length "<function/") rest
+--                     -- Handle both: "bash {...}" and "bash>{...}"
+--                     (name, afterName) = T.break (\c -> c == ' ' || c == '>') afterTag
+--                     jsonStart = case T.uncons afterName of
+--                       Just ('>', s) -> s
+--                       Just (' ', s) -> T.dropWhile (== ' ') s
+--                       _ -> afterName
+--                 in case extractJson jsonStart of
+--                      Just (jsonRaw, afterJson) ->
+--                        case eitherDecode (LBS.fromStrict $ TE.encodeUtf8 jsonRaw) of
+--                          Right v ->
+--                            let afterJson' = dropClosingTag afterJson
+--                            in extractAll afterJson' (ToolUse ("text-" <> name) name v : acc)
+--                          Left _ -> extractAll (skipTag afterJson) acc
+--                      Nothing -> extractAll (skipTag afterTag) acc
+
+--     dropClosingTag = T.replace "</function>" "" . T.dropWhile (`elem` ['>', ' '])
+--     skipTag s = T.drop 1 (T.dropWhile (/= '>') s)
+
+--     extractJson s =
+--       let s' = T.dropWhile (/= '{') s
+--       in if T.null s'
+--          then Nothing
+--          else let (obj, rest) = matchBrace (T.drop 1 s') 1 ""
+--               in Just ("{" <> obj, rest)
+
+--     matchBrace :: T.Text -> Int -> T.Text -> (T.Text, T.Text)
+--     matchBrace t depth acc
+--       | T.null t = (acc, "")
+--       | depth == 0 = (acc, t)
+--       | otherwise =
+--           let c = T.head t
+--               rest = T.tail t
+--           in case c of
+--                '{' -> matchBrace rest (depth + 1) (acc <> "{")
+--                '}' -> matchBrace rest (depth - 1) (acc <> "}")
+--                _   -> matchBrace rest depth (acc <> T.singleton c)
+
+-- | Fallback parser for models that emit tool calls as pseudo-XML text.
+-- Handles all observed formats:
+--   <function/name {"arg": "val"}>
+--   <function/name>{"arg": "val"}</function>
+--   <function/name{"arg": "val"}</function>
+-- Extracts from anywhere in the text, skipping prose/reasoning.
+parseTextToolCalls :: T.Text -> Maybe [ToolUse]
+parseTextToolCalls txt = case parse toolCallsParser "" txt of
+  Right us | not (null us) -> Just us
+  _ -> Nothing
+
+toolCallsParser :: Parser [ToolUse]
+toolCallsParser = catMaybes <$> many toolCallOrSkip <* eof
+  where
+    toolCallOrSkip = P.try (Just <$> toolCallParser) <|> (anyChar *> pure Nothing)
+
+toolCallParser :: Parser ToolUse
+toolCallParser = do
+  _ <- string "<function/"
+  name <- many1 (noneOf " >{")
+  -- After name: might be >, space, or directly {
+  _ <- optional (oneOf " >")
+  jsonStr <- balancedBraces
+  -- Optionally consume closing tag variants
+  _ <- optional (string "</function>")
+  _ <- optional (char '>')
+  case eitherDecode (LBS.fromStrict $ TE.encodeUtf8 $ T.pack jsonStr) of
+    Right v -> pure $ ToolUse ("text-" <> T.pack name) (T.pack name) v
+    Left e  -> parserFail $ "Invalid JSON in tool call: " <> e
+
+-- | Parse a balanced {} object, including the opening brace.
+balancedBraces :: Parser String
+balancedBraces = do
+  _ <- char '{'
+  chars <- go 1 ""
+  pure $ '{' : reverse chars
+  where
+    go :: Int -> String -> Parser String
+    go 0 acc = pure acc
+    go n acc = do
+      c <- anyChar
+      case c of
+        '{' -> go (n + 1) (c : acc)
+        '}' -> go (n - 1) (c : acc)
+        _   -> go n     (c : acc)
+
+
+-- | Low-level: send messages to OpenAI/OpenRouter and return either text or tool calls.
+askOpenAITools :: Manager -> String -> T.Text -> T.Text -> Maybe Int -> Maybe [ToolDef] -> [OpenAIMessage] -> IO (Either LLMError ToolResponse)
+askOpenAITools mgr url apiKey model maxTokens mTools msgs = do
+  req <- parseRequest url
+  let headers =
+        [ (hAuthorization, TE.encodeUtf8 $ "Bearer " <> T.strip apiKey)
+        , (hContentType, "application/json")
+        ]
+      body = GPTRequestBody
+        { _gptRequest_model       = model
+        , _gptRequest_max_tokens  = maxTokens
+        , _gptRequest_messages    = msgs
+        , _gptRequest_tools       = mTools
+        , _gptRequest_tool_choice = case mTools of
+            Just ts | not (null ts) -> Just "auto"
+            _                       -> Nothing
+        }
+      req' = req
+        { requestHeaders = headers
+        , method         = "POST"
+        , requestBody    = RequestBodyLBS $ Aeson.encode body
+        }
+  (CE.try $ fmap responseBody $ httpLbs req' mgr) >>= \case
+    Left (e :: HttpException) -> pure $ Left $ LLMHttpError $ T.pack $ show e
+    Right resBody -> do
+      LBS.writeFile "/tmp/openrouter-last.json" resBody
+      case eitherDecode resBody :: Either String OpenAIChatResponse of
+        Left e -> case eitherDecode resBody :: Either String ErrorResponseOpenAI of
+          Left ee -> pure . Left . LLMHttpError . T.pack $ e <> ee
+          Right (ErrorResponseOpenAI (ErrorOpenAI msg _ _ _)) ->
+            pure $ Left $ LLMHttpError msg
+        Right r -> case _oacr_choices r of
+          [] -> pure $ Left $ LLMParseError "No choices"
+          (c:_) -> let msg = _oac_message c in
+            case _oam_tool_calls msg of
+              Just tcs | not (null tcs) -> case traverse toolCallToUse tcs of
+                Left e   -> pure $ Left $ LLMParseError $ T.pack e
+                Right us -> pure $ Right $ ToolResponseCalls us
+              _ -> case _oam_content msg of
+                Just txt -> case parseTextToolCalls txt of
+                  Just us  -> pure $ Right $ ToolResponseCalls us
+                  Nothing  -> pure $ Right $ ToolResponseText txt
+                Nothing  -> pure $ Right $ ToolResponseText ""
+
+-- | Run the full tool loop with a max-round safety cap.
+runToolLoop :: Manager -> String -> T.Text -> T.Text -> Maybe Int -> Int -> [ToolDef] -> ([ToolUse] -> IO [ToolResult]) -> [ContentWithRole] -> IO (Either LLMError T.Text)
+runToolLoop mgr url apiKey model maxTokens maxRounds tools execToolF initialMsgs =
+  go 0 [] (map toOpenAIMessage initialMsgs)
+  where
+    go n acc history
+      | n >= maxRounds =
+          pure $ Right $ T.unlines $
+            "Reached max tool rounds. Here's what I found:" : reverse acc
+      | otherwise = do
+          result <- askOpenAITools mgr url apiKey model maxTokens (Just tools) history
+          case result of
+            Left e -> pure $ Left e
+            Right (ToolResponseText txt) -> pure $ Right txt
+            Right (ToolResponseCalls uses) -> do
+              results <- execToolF uses
+              let outputs = map _toolResult_content results
+                  resultMsgs = map toolResultToMsg results
+                  assistantMsg = OpenAIMessage
+                    { _oam_role         = "assistant"
+                    , _oam_content      = Nothing
+                    , _oam_tool_calls   = Just $ map useToToolCall uses
+                    , _oam_tool_call_id = Nothing
+                    }
+              go (n + 1) (outputs ++ acc) (history ++ [assistantMsg] ++ resultMsgs)
+
+    useToToolCall :: ToolUse -> ToolCall
+    useToToolCall (ToolUse cid name inputVal) = ToolCall
+      { _toolCall_id       = cid
+      , _toolCall_type     = "function"
+      , _toolCall_function = FunctionCall
+          { _functionCall_name      = name
+          , _functionCall_arguments = TE.decodeUtf8 $ LBS.toStrict $ Aeson.encode inputVal
+          }
+      }

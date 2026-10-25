@@ -55,6 +55,7 @@ import LLM.Types
   , ToolTurn (..)
   , ToolUse (..)
   , cwr
+  , toOpenAIMessage
   )
 
 import Control.Monad.IO.Class (MonadIO)
@@ -127,7 +128,18 @@ askGPTServant cfg contents = do
       slack = _gptConfig_maxTokensSlack cfg
       promptLimitReminder =
         [cwr System $ "Please limit your response to about " <> tshow maxT <> " tokens"]
-      body = GPTRequestBody (_gptConfig_model cfg) (Just (maxT + slack)) (promptLimitReminder <> contents)
+      -- body = GPTRequestBody (_gptConfig_model cfg) (Just (maxT + slack)) (promptLimitReminder <> contents)
+      body = GPTRequestBody
+        (_gptConfig_model cfg)
+        (Just (maxT + slack))
+        (map toOpenAIMessage (promptLimitReminder <> contents))
+        Nothing
+        Nothing
+      -- body = GPTRequestBody
+      --   (_gptConfig_model cfg)
+      --   (Just (maxT + slack))
+      --   (map toOpenAIMessage (promptLimitReminder <> contents))
+      --   Nothing
       authHeader = "Bearer " <> (T.strip . unAPIKey $ _gptConfig_apiKey cfg)
   result <- runJSON (_gptConfig_manager cfg) (_gptConfig_baseUrl cfg) (chatCompletionsClient authHeader body)
   pure $ case result of

@@ -1,10 +1,11 @@
-{-# LANGUAGE TemplateHaskell #-}
-{-# LANGUAGE KindSignatures #-}
-{-# LANGUAGE DataKinds #-}
-{-# LANGUAGE DeriveGeneric #-}
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE TemplateHaskell     #-}
+{-# LANGUAGE KindSignatures      #-}
+{-# LANGUAGE DataKinds           #-}
+{-# LANGUAGE DeriveGeneric       #-}
+{-# LANGUAGE DeriveAnyClass      #-}
+{-# LANGUAGE LambdaCase          #-}
+{-# LANGUAGE OverloadedStrings   #-}
+{-# LANGUAGE RankNTypes          #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
 -- | Core types for the llm-with-context library.
@@ -24,7 +25,7 @@ import Data.Aeson.TH
 import qualified Data.Text as T
 import Data.ByteString.Lazy as LBS
 import GHC.Generics
-
+import Data.Maybe (catMaybes)
 
 -- | The set of deployment surfaces we can target. Each constructor is ONE
 -- concrete transport (binary + wire shape), not a vendor. Same vendor with
@@ -42,41 +43,43 @@ data APIProvider
   | GoogleHttp     -- ^ Google's HTTP API (Gemini etc.).
   | AwsBedrock     -- ^ AWS Bedrock.
   | DeepSeekHttp   -- ^ DeepSeek HTTP API (and Ollama-hosted DeepSeek).
+  deriving (Show, Eq, Generic)
+
 -- Define the APIKey type with a phantom type parameter. CLI providers
 -- like 'AnthropicCli' do not consume an 'APIKey' (their auth is the
 -- subscription baked into the binary) — those provider tags simply
 -- aren't used here.
 newtype APIKey (api :: APIProvider) = APIKey { unAPIKey :: T.Text }
-
--- | OpenAI chat-completion request body. Serializes directly to the JSON
--- the @\/v1\/chat\/completions@ endpoint expects.
-data GPTRequestBody = GPTRequestBody
-  { _gptRequest_model :: T.Text
-  -- , _gptRequest_response_format :: GPTResponseFormat
-  , _gptRequest_max_tokens :: Maybe Int
-  , _gptRequest_messages :: [ContentWithRole]
-  } deriving (Show,Generic)
+  deriving (Show, Eq, Generic)
 
 -- | Response format hint: plain text or JSON object.
 data GPTType = GPT_Text | GPT_JSON deriving Show
 
-    
 -- | Wrapper for the @response_format@ field in the OpenAI API.
 data GPTResponseFormat = GPTResponseFormat
   { _gptResponseFormat_type :: GPTType
   } deriving (Generic, Show)
 
+instance ToJSON GPTResponseFormat
+instance FromJSON GPTResponseFormat
 
 -- | Shorthand for ContentWithRole 
 cwr :: GPTRole -> T.Text -> ContentWithRole
 cwr = ContentWithRole 
 
 -- | A single message in a conversation, pairing a role with text content.
--- Serializes to @{\"role\": ..., \"content\": ...}@ for both OpenAI and Ollama.
+-- Serializes to @{"role": ..., "content": ...}@ for both OpenAI and Ollama.
 data ContentWithRole = ContentWithRole
   { _cwr_role :: GPTRole
   , _cwr_content :: T.Text
   } deriving (Show, Generic)
+
+instance FromJSON ContentWithRole where
+  parseJSON = withObject "ContentWithRole" $ \v ->
+    ContentWithRole <$> v .: "role" <*> v .: "content"
+
+instance ToJSON ContentWithRole where
+  toJSON (ContentWithRole r c) = Data.Aeson.object ["role" .= r, "content" .= c]
 
 -- | The role of a message in the conversation.
 data GPTRole
@@ -99,28 +102,51 @@ instance FromJSON GPTRole where
     x -> fail $ show x
 
 
-
 -- | Top-level response from the OpenAI chat-completion endpoint.
-data PromptResponse = PromptResponse { id :: T.Text
-                                     , object :: T.Text
-                                     , created :: Int
-                                     , choices :: [ResMessage]
-                                     , usage :: Usage
-                                     } deriving (Show, Generic)
+data PromptResponse = PromptResponse
+  { id :: T.Text
+  , object :: T.Text
+  , created :: Int
+  , choices :: [ResMessage]
+  , usage :: Usage
+  } deriving (Show, Generic)
 
 -- | A single choice inside a 'PromptResponse'.
-data ResMessage = ResMessage { message :: ContentWithRole
-                             , finish_reason :: T.Text
-                             , index :: Int
-                             } deriving (Show,Generic)
+data ResMessage = ResMessage
+  { message :: ContentWithRole
+  , finish_reason :: T.Text
+  , index :: Int
+  } deriving (Show, Generic)
 
+instance ToJSON ResMessage
+instance FromJSON ResMessage where
+  parseJSON = withObject "ResMessage" $ \v ->
+    ResMessage <$> v .: "message"
+               <*> v .:? "finish_reason" .!= ""
+               <*> v .:? "index" .!= 0
 
 -- | Token usage statistics returned by OpenAI.
-data Usage = Usage { prompt_tokens :: Int
-                   , completion_tokens :: Int
-                   , total_tokens :: Int
-                   } deriving (Show,Generic)
+data Usage = Usage
+  { prompt_tokens :: Int
+  , completion_tokens :: Int
+  , total_tokens :: Int
+  } deriving (Show, Generic)
 
+instance ToJSON Usage
+instance FromJSON Usage where
+  parseJSON = withObject "Usage" $ \v ->
+    Usage <$> v .:? "prompt_tokens" .!= 0
+          <*> v .:? "completion_tokens" .!= 0
+          <*> v .:? "total_tokens" .!= 0
+
+instance ToJSON PromptResponse
+instance FromJSON PromptResponse where
+  parseJSON = withObject "PromptResponse" $ \v ->
+    PromptResponse <$> v .:? "id" .!= ""
+                   <*> v .:? "object" .!= ""
+                   <*> v .:? "created" .!= 0
+                   <*> v .:? "choices" .!= []
+                   <*> v .:? "usage" .!= Usage 0 0 0
 
 
 -- | Wrapper for a raw GPT response body (unparsed JSON bytes).
@@ -131,33 +157,34 @@ data TextToSpeechBody = TextToSpeechBody
   { _textToSpeech_model :: T.Text
   , _textToSpeech_voice :: T.Text
   , _textToSpeech_input :: T.Text
-  }
+  } deriving (Show, Generic)
+
+instance ToJSON TextToSpeechBody
+instance FromJSON TextToSpeechBody
 
 -- | Structured error returned inside an OpenAI error response.
-data ErrorOpenAI = ErrorOpenAI {
-  _errorOpenAI_message :: T.Text,
-  _errorOpenAI_type :: T.Text, -- 'type' is a reserved keyword in Haskell, so we use type' or another name
-  _errorOpenAI_param :: Maybe T.Text,
-  _errorOpenAI_code :: Maybe T.Text
-} deriving (Show, Generic)
+data ErrorOpenAI = ErrorOpenAI
+  { _errorOpenAI_message :: T.Text
+  , _errorOpenAI_type :: T.Text
+  , _errorOpenAI_param :: Maybe T.Text
+  , _errorOpenAI_code :: Maybe T.Text
+  } deriving (Show, Generic)
 
--- | Top-level OpenAI error envelope (@{\"error\": ...}@).
-data ErrorResponseOpenAI = ErrorResponseOpenAI {
-  _errorResponseOpenAI_error :: ErrorOpenAI
-} deriving (Show, Generic)
+instance ToJSON ErrorOpenAI
+instance FromJSON ErrorOpenAI
 
--- instance Show e => Show (RequestError' e) where
---   --show (NoAuth s) = "NoAuth " <> s
---   show (RequestErr e) = "RequestErr " <> show e 
+-- | Top-level OpenAI error envelope (@{"error": ...}@).
+data ErrorResponseOpenAI = ErrorResponseOpenAI
+  { _errorResponseOpenAI_error :: ErrorOpenAI
+  } deriving (Show, Generic)
 
--- data DeepSeekRequestBody = DeepSeekRequestBody
---   { _ds_model :: T.Text
---   , _ds_prompt :: T.Text
---   , _ds_stream :: Bool
---   } deriving Generic
+instance ToJSON ErrorResponseOpenAI
+instance FromJSON ErrorResponseOpenAI
+
 
 -- | Whether the model should return plain text or a JSON object.
-data ResponseFormat = AsText | AsJSON deriving (Eq, Show)
+data ResponseFormat = AsText | AsJSON deriving (Eq, Show, Generic)
+
 instance ToJSON ResponseFormat where
   toJSON = \case
     AsJSON -> String "json_object"
@@ -176,47 +203,25 @@ data DeepSeekRequestBody = DeepSeekRequestBody
   { _deepSeekRequest_messages           :: [ContentWithRole]
   , _deepSeekRequest_model              :: DeepSeekModel
   , _deepSeekRequest_images             :: Maybe T.Text
-  -- , _deepSeekRequest_frequency_penalty  :: Double
-  -- , _deepSeekRequest_max_tokens         :: Int
-  -- , _deepSeekRequest_presence_penalty   :: Double
-  -- , _deepSeekRequest_response_format    :: ResponseFormat
-  -- , _deepSeekRequest_stop               :: Maybe String
   , _deepSeekRequest_stream             :: Bool
-  -- , _deepSeekRequest_stream_options     :: Maybe String
-  -- , _deepSeekRequest_temperature        :: Double
-  -- , _deepSeekRequest_top_p              :: Double
-  -- , _deepSeekRequest_tools              :: Maybe String
-  -- , _deepSeekRequest_tool_choice        :: String
-  -- , _deepSeekRequest_logprobs           :: Bool
-  -- , _deepSeekRequest_top_logprobs       :: Maybe String
   } deriving (Show, Generic)
 
---instance ToJSON DeepSeekRequestBody 
-
+instance ToJSON DeepSeekRequestBody where
+    toJSON = genericToJSON defaultOptions
 
 instance Default DeepSeekRequestBody where
   def = DeepSeekRequestBody
     { _deepSeekRequest_messages          = []
     , _deepSeekRequest_model             = DS_1_5b
     , _deepSeekRequest_images            = Nothing 
-    -- , _deepSeekRequest_frequency_penalty = 0
-    -- , _deepSeekRequest_max_tokens        = 4096
-    -- , _deepSeekRequest_presence_penalty  = 0
-    -- , _deepSeekRequest_response_format   = AsText
-    -- , _deepSeekRequest_stop              = Nothing
     , _deepSeekRequest_stream            = False
-    -- , _deepSeekRequest_stream_options    = Nothing
-    -- , _deepSeekRequest_temperature       = 1
-    -- , _deepSeekRequest_top_p             = 1
-    -- , _deepSeekRequest_tools             = Nothing
-    -- , _deepSeekRequest_tool_choice       = ""
-    -- , _deepSeekRequest_logprobs          = False
-    -- , _deepSeekRequest_top_logprobs      = Nothing
     }
 
 -- | Available DeepSeek-R1 model sizes for local Ollama inference.
--- Ordered smallest to largest; serializes to e.g. @\"deepseek-r1:7b\"@.
-data DeepSeekModel = DS_1_5b | DS_7b | DS_8b | DS_14b | DS_32b | DS_70b | DS_671b deriving (Eq, Ord, Enum, Show, Generic)
+-- Ordered smallest to largest; serializes to e.g. @"deepseek-r1:7b"@.
+data DeepSeekModel = DS_1_5b | DS_7b | DS_8b | DS_14b | DS_32b | DS_70b | DS_671b
+  deriving (Eq, Ord, Enum, Show, Generic)
+
 instance ToJSON DeepSeekModel where
   toJSON = \case
     DS_1_5b -> "deepseek-r1:1.5b"
@@ -225,7 +230,7 @@ instance ToJSON DeepSeekModel where
     DS_14b -> "deepseek-r1:14b"
     DS_32b -> "deepseek-r1:32b"
     DS_70b -> "deepseek-r1:70b"
-    DS_671b -> "deepseek-r1:671b" -- just in case `\_o_/`
+    DS_671b -> "deepseek-r1:671b"
 
 instance FromJSON DeepSeekModel where
   parseJSON = withText "DeepSeekModel" $ \t ->
@@ -238,26 +243,19 @@ instance FromJSON DeepSeekModel where
       "deepseek-r1:70b"  -> pure DS_70b
       "deepseek-r1:671b" -> pure DS_671b
       _                  -> fail $ "Unknown DeepSeekModel: " ++ T.unpack t
---   1.5b
--- 7b
--- 8b
--- 14b
--- 32b
--- 70b
--- 671b
-
 
 -- | Response from the Ollama @\/api\/chat@ endpoint (non-streaming).
 data DeepSeekResponse = DeepSeekResponse
   { _deepSeekResponse_model              :: String
   , _deepSeekResponse_created_at         :: String
-  --, _deepSeekResponse_response           :: String
   , _deepSeekResponse_message           :: ContentWithRole
   , _deepSeekResponse_done               :: Bool
   , _deepSeekResponse_done_reason        :: String
   , _deepSeekResponse_context            :: Maybe [Int]
   } deriving (Show, Generic)
 
+instance ToJSON DeepSeekResponse
+instance FromJSON DeepSeekResponse
 
 
 -- | Monad transformer for DeepSeek\/Ollama conversations.
@@ -266,14 +264,9 @@ type MonadDeepSeek m a = StateT ConversationHistoryDeepSeek m a
 
 -- | Accumulated Q&A pairs from a conversation, most-recent first.
 type ConversationHistory = [ConvoQuery T.Text]
---type ConversationHistoryCWR = [GPTQuery ContentWithRole]
 
 -- | Accumulated tagged message lists from a DeepSeek conversation.
 type ConversationHistoryDeepSeek = [(TagDS, [ContentWithRole])]
-
--- q == x
--- a == x ++ "-answer"
-
 
 -- | A single tagged question\/answer pair stored in conversation history.
 data ConvoQuery a = ConvoQuery
@@ -284,11 +277,14 @@ data ConvoQuery a = ConvoQuery
 
 -- | User-defined label for a conversation turn, used by 'RelevantContext'
 -- to select which history items to include as context.
-newtype Tag = Tag { unTag :: T.Text } deriving (Eq,Show)
+newtype Tag = Tag { unTag :: T.Text } deriving (Eq, Show, Generic)
+
+instance ToJSON Tag
+instance FromJSON Tag
 
 -- | Tag for DeepSeek conversation items; 'isAnswerDS' distinguishes
 -- question entries from answer entries in the flat history list.
-data TagDS = TagDS { unTagDS :: T.Text, isAnswerDS :: Bool } deriving (Eq,Show, Generic)
+data TagDS = TagDS { unTagDS :: T.Text, isAnswerDS :: Bool } deriving (Eq, Show, Generic)
 
 instance ToJSON TagDS
 instance FromJSON TagDS
@@ -318,12 +314,28 @@ data ToolDef = ToolDef
   , _toolDef_inputSchema :: Value
   } deriving (Show, Generic)
 
+-- | Serialize ToolDef to OpenAI's {"type":"function","function":{...}} shape.
+instance ToJSON ToolDef where
+  toJSON (ToolDef n d schema) = Data.Aeson.object
+    [ "type"     .= ("function" :: T.Text)
+    , "function" .= Data.Aeson.object
+        [ "name"        .= n
+        , "description" .= d
+        , "parameters"  .= schema
+        ]
+    ]
+
+instance FromJSON ToolDef
+
 -- | A tool call the model asked for.
 data ToolUse = ToolUse
   { _toolUse_id :: T.Text
   , _toolUse_name :: T.Text
   , _toolUse_input :: Value
   } deriving (Show, Generic)
+
+instance ToJSON ToolUse
+instance FromJSON ToolUse
 
 -- | A content block in a tool-capable message: assistant text, an assistant
 -- tool call, or a user-supplied tool result.
@@ -333,12 +345,18 @@ data Block
   | BlockToolResult T.Text T.Text Bool -- ^ tool_use id, result content, is-error
   deriving (Show, Generic)
 
+instance ToJSON Block
+instance FromJSON Block
+
 -- | A message in the tool-use conversation (richer than 'ContentWithRole',
 -- which is text-only).
 data RichMessage = RichMessage
   { _richMessage_role :: GPTRole
   , _richMessage_blocks :: [Block]
   } deriving (Show, Generic)
+
+instance ToJSON RichMessage
+instance FromJSON RichMessage
 
 -- | The assistant's turn from a tool-capable ask: any text it emitted, the tool
 -- calls it requested (empty = it's done), and the raw assistant blocks to
@@ -349,10 +367,16 @@ data ToolTurn = ToolTurn
   , _toolTurn_assistantBlocks :: [Block]
   } deriving (Show, Generic)
 
+instance ToJSON ToolTurn
+instance FromJSON ToolTurn
+
 -- | A glob pattern over tag text: @*@ matches any run of characters, @?@ any
 -- single character (e.g. @"Run0--PartDetail--*"@).
 newtype TagPattern = TagPattern { unTagPattern :: T.Text }
-  deriving (Show, Eq)
+  deriving (Show, Eq, Generic)
+
+instance ToJSON TagPattern
+instance FromJSON TagPattern
 
 -- | One context-selection rule: a tag pattern plus an optional recency budget.
 -- @crBudget == Nothing@ pins all entries matching the pattern; @Just n@ keeps
@@ -360,7 +384,10 @@ newtype TagPattern = TagPattern { unTagPattern :: T.Text }
 data CtxRule = CtxRule
   { crPattern :: TagPattern
   , crBudget :: Maybe Int
-  } deriving (Show, Eq)
+  } deriving (Show, Eq, Generic)
+
+instance ToJSON CtxRule
+instance FromJSON CtxRule
 
 data RelevantContext
   = LastN Int                       -- ^ Take the @n@ most recent items
@@ -374,11 +401,6 @@ data RelevantContextDS
   = LastN_DS Int
   | Relevants_DS [TagDS]
   | LastNRelevant_DS Int (TagDS -> Bool)
-
--- 3 tags:
---   html-1
---   html-2
---   xml-2342
 
 -- | The prompt messages for a single question to DeepSeek.
 newtype DeepSeekQuestion = DeepSeekQuestion [ContentWithRole]
@@ -403,6 +425,10 @@ instance FromJSON GPTType where
 
 -- | Error response from the Ollama API.
 data OllamaError = OllamaError { _ollama_error :: T.Text }
+  deriving (Show, Generic)
+
+instance ToJSON OllamaError
+instance FromJSON OllamaError
 
 -- | A single content block in an Anthropic response (type + text).
 data AnthropicContent = AnthropicContent
@@ -419,21 +445,192 @@ data AnthropicResponse = AnthropicResponse
 
 deriveJSON (scrubPrefix "_anthropicContent_") ''AnthropicContent
 deriveJSON (scrubPrefix "_anthropicResponse_") ''AnthropicResponse
-deriveJSON (scrubPrefix "_errorOpenAI_") ''ErrorOpenAI
-deriveJSON (scrubPrefix "_errorResponseOpenAI_") ''ErrorResponseOpenAI
-deriveJSON (scrubPrefix "_textToSpeech_") ''TextToSpeechBody
-deriveJSON (scrubPrefix "_gptResponseFormat_") ''GPTResponseFormat
-deriveJSON (scrubPrefix "_cwr_") ''ContentWithRole
-deriveJSON (scrubPrefix "_deepSeekRequest_") ''DeepSeekRequestBody
-deriveJSON (scrubPrefix "_deepSeekResponse_") ''DeepSeekResponse
-deriveJSON (scrubPrefix "_ollama_") ''OllamaError
-
-instance FromJSON Usage
-instance ToJSON Usage
-instance FromJSON PromptResponse
-instance ToJSON PromptResponse
-instance FromJSON ResMessage
-instance ToJSON ResMessage
 
 
-deriveJSON (scrubPrefix "_gptRequest_") ''GPTRequestBody
+-- ============================================================================
+-- OpenAI tool-aware wire-format types
+-- ============================================================================
+
+-- | A tool call as it appears in an OpenAI response.
+data ToolCall = ToolCall
+  { _toolCall_id       :: T.Text
+  , _toolCall_type     :: T.Text
+  , _toolCall_function :: FunctionCall
+  } deriving (Show, Generic)
+
+data FunctionCall = FunctionCall
+  { _functionCall_name      :: T.Text
+  , _functionCall_arguments :: T.Text  -- ^ JSON string, e.g. "{\"command\":\"ls\"}"
+  } deriving (Show, Generic)
+
+-- | Full OpenAI message format (text, assistant tool_calls, or tool result).
+-- We use this internally in the OpenAI provider; 'ContentWithRole' stays
+-- the simple public API.
+data OpenAIMessage = OpenAIMessage
+  { _oam_role         :: T.Text
+  , _oam_content      :: Maybe T.Text
+  , _oam_tool_calls   :: Maybe [ToolCall]
+  , _oam_tool_call_id :: Maybe T.Text   -- ^ present when role == "tool"
+  } deriving (Show, Generic)
+
+-- | Result of executing a tool, sent back as a "tool" message.
+data ToolResult = ToolResult
+  { _toolResult_callId  :: T.Text
+  , _toolResult_content :: T.Text
+  } deriving (Show)
+
+-- | OpenAI chat completion response (tool-aware). Use this instead of
+-- 'PromptResponse' when you expect tool_calls in the response.
+data OpenAIChatResponse = OpenAIChatResponse
+  { _oacr_id      :: T.Text
+  , _oacr_object  :: T.Text
+  , _oacr_created :: Int
+  , _oacr_choices :: [OpenAIChoice]
+  , _oacr_usage   :: Usage
+  } deriving (Show, Generic)
+
+data OpenAIChoice = OpenAIChoice
+  { _oac_message       :: OpenAIMessage
+  , _oac_finish_reason :: T.Text
+  , _oac_index         :: Int
+  } deriving (Show, Generic)
+
+-- JSON instances (omit Nothing fields)
+instance ToJSON OpenAIMessage where
+  toJSON o = Data.Aeson.object $ catMaybes
+    [ Just ("role" .= _oam_role o)
+    , ("content" .=) <$> _oam_content o
+    , ("tool_calls" .=) <$> _oam_tool_calls o
+    , ("tool_call_id" .=) <$> _oam_tool_call_id o
+    ]
+
+instance FromJSON OpenAIMessage where
+  parseJSON = withObject "OpenAIMessage" $ \v ->
+    OpenAIMessage
+      <$> v .:  "role"
+      <*> v .:? "content"
+      <*> v .:? "tool_calls"
+      <*> v .:? "tool_call_id"
+
+instance ToJSON ToolCall where
+  toJSON tc = Data.Aeson.object
+    [ "id"       .= _toolCall_id tc
+    , "type"     .= _toolCall_type tc
+    , "function" .= _toolCall_function tc
+    ]
+
+instance FromJSON ToolCall where
+  parseJSON = withObject "ToolCall" $ \v ->
+    ToolCall
+      <$> v .: "id"
+      <*> v .: "type"
+      <*> v .: "function"
+
+-- instance ToJSON FunctionCall
+-- instance FromJSON FunctionCall
+-- Replace these two lines:
+-- instance ToJSON FunctionCall
+-- instance FromJSON FunctionCall
+
+-- With:
+instance ToJSON FunctionCall where
+  toJSON fc = Data.Aeson.object
+    [ "name"      .= _functionCall_name fc
+    , "arguments" .= _functionCall_arguments fc
+    ]
+
+instance FromJSON FunctionCall where
+  parseJSON = withObject "FunctionCall" $ \v ->
+    FunctionCall
+      <$> v .: "name"
+      <*> v .: "arguments"
+      
+instance ToJSON OpenAIChatResponse
+instance FromJSON OpenAIChatResponse where
+  parseJSON = withObject "OpenAIChatResponse" $ \v ->
+    OpenAIChatResponse
+      <$> v .:? "id" .!= ""
+      <*> v .:? "object" .!= ""
+      <*> v .:? "created" .!= 0
+      <*> v .:? "choices" .!= []
+      <*> v .:? "usage" .!= Usage 0 0 0
+
+instance ToJSON OpenAIChoice
+instance FromJSON OpenAIChoice where
+  parseJSON = withObject "OpenAIChoice" $ \v ->
+    OpenAIChoice
+      <$> v .:  "message"
+      <*> v .:? "finish_reason" .!= ""
+      <*> v .:? "index" .!= 0
+
+
+-- -- | Extend GPTRequestBody with tools.
+-- data GPTRequestBody = GPTRequestBody
+--   { _gptRequest_model       :: T.Text
+--   , _gptRequest_max_tokens  :: Maybe Int
+--   , _gptRequest_messages    :: [OpenAIMessage]
+--   , _gptRequest_tools       :: Maybe [ToolDef]
+--   } deriving (Show, Generic)
+
+-- instance ToJSON GPTRequestBody where
+--   toJSON (GPTRequestBody model maxToks msgs tools) = Data.Aeson.object $ catMaybes
+--     [ Just ("model" .= model)
+--     , ("max_tokens" .=) <$> maxToks
+--     , Just ("messages" .= msgs)
+--     , ("tools" .=) <$> tools
+--     ]
+
+-- instance FromJSON GPTRequestBody where
+--   parseJSON = withObject "GPTRequestBody" $ \v ->
+--     GPTRequestBody
+--       <$> v .:  "model"
+--       <*> v .:? "max_tokens"
+--       <*> v .:  "messages"
+--       <*> v .:? "tools"
+data GPTRequestBody = GPTRequestBody
+  { _gptRequest_model       :: T.Text
+  , _gptRequest_max_tokens  :: Maybe Int
+  , _gptRequest_messages    :: [OpenAIMessage]
+  , _gptRequest_tools       :: Maybe [ToolDef]
+  , _gptRequest_tool_choice :: Maybe T.Text  -- ^ "auto", "none", or "required"
+  } deriving (Show, Generic)
+
+instance ToJSON GPTRequestBody where
+  toJSON (GPTRequestBody model maxToks msgs tools toolChoice) = Data.Aeson.object $ catMaybes
+    [ Just ("model" .= model)
+    , ("max_tokens" .=) <$> maxToks
+    , Just ("messages" .= msgs)
+    , ("tools" .=) <$> tools
+    , ("tool_choice" .=) <$> toolChoice
+    ]
+
+instance FromJSON GPTRequestBody where
+  parseJSON = withObject "GPTRequestBody" $ \v ->
+    GPTRequestBody
+      <$> v .:  "model"
+      <*> v .:? "max_tokens"
+      <*> v .:  "messages"
+      <*> v .:? "tools"
+      <*> v .:? "tool_choice"
+      
+-- Convert simple ContentWithRole to OpenAIMessage
+toOpenAIMessage :: ContentWithRole -> OpenAIMessage
+toOpenAIMessage (ContentWithRole r c) = OpenAIMessage
+  { _oam_role         = roleToText r
+  , _oam_content      = Just c
+  , _oam_tool_calls   = Nothing
+  , _oam_tool_call_id = Nothing
+  }
+  where
+    roleToText System    = "system"
+    roleToText User      = "user"
+    roleToText Assistant = "assistant"
+
+-- Convert a tool result to an OpenAIMessage
+toolResultToMsg :: ToolResult -> OpenAIMessage
+toolResultToMsg (ToolResult cid content) = OpenAIMessage
+  { _oam_role         = "tool"
+  , _oam_content      = Just content
+  , _oam_tool_calls   = Nothing
+  , _oam_tool_call_id = Just cid
+  }

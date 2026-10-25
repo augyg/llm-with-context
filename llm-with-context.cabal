@@ -71,6 +71,7 @@ library
                       LLM.Effect.Concurrent
                       LLM.Effect.FileSystem
                       LLM.Tooling
+                      LLM.Tools.BashEdit
     -- other-modules:
     -- other-extensions:
     build-depends:    base
