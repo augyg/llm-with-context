@@ -50,7 +50,7 @@ pkgs.mkShell {
 
 #   inherit (nixpkgs) pkgs;
 #   scrappy-coreSrc = pkgs.fetchFromGitHub {
-#     owner = "Ace-Interview-Prep";
+#     owner = "TypifyDev";
 #     repo =  "scrappy-core";
 #     rev = "913670f2f83cabb2b56302e17604ec488e89da7b";
 #     sha256 = "0xvxc29x2izm1jpq5zpncyirhadwcx2wf3b61ns9mhvcpkjbw3m8";
