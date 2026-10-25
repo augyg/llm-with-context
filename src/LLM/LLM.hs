@@ -43,6 +43,8 @@ module LLM.LLM
   , getRelevantCtxDeepSeek
     -- * History rendering
   , renderHistory
+  , renderContextLabeled   -- MERGE SYNTHESIS step 4 export: used by newSorted-tests Main.hs
+  , prepareContext         -- MERGE SYNTHESIS step 4 export: used by newSorted-tests Main.hs
     -- * DeepSeek response parsing
   , toThoughtResponse
   , codeBlock

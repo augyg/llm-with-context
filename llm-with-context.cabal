@@ -207,6 +207,39 @@ test-suite llm-with-context-test
                     , llm-with-context
     default-language: Haskell2010
 
+-- newSorted 201-test Tasty/Hedgehog suite — merged in from
+-- newSorted/gs/pre-merge-newSorted-dirty via Phase A step 5. Wired up here
+-- so cabal actually builds + runs it (Phase A.4a, 2026-10-25). Expect this
+-- to surface the same ConvoEntry / 'AnthropicHttp-split / matchTag-record
+-- adaptations the main lib + Spec.hs have already been through — fixing
+-- each as part of Phase A.4 convergence per the never-skip-work rule.
+test-suite llm-with-context-newSorted-tests
+    import:           warnings
+    type:             exitcode-stdio-1.0
+    main-is:          Main.hs
+    hs-source-dirs:   test
+    build-depends:    base
+                    , aeson
+                    , base64-bytestring
+                    , bytestring
+                    , containers
+                    , data-default
+                    , directory
+                    , hedgehog
+                    , http-client
+                    , http-client-tls
+                    , mtl
+                    , parsec
+                    , scrappy-core
+                    , scrappy-json
+                    , tasty
+                    , tasty-hedgehog
+                    , text
+                    , transformers
+                    , effectful-core
+                    , llm-with-context
+    default-language: Haskell2010
+
 -- Runtime smoke test for the beam-postgres brain interpreters. Compile-checked
 -- by nix; run by hand against an ephemeral Postgres (the nix sandbox + doCheck
 -- have no database). See db-smoke/Main.hs for the invocation.

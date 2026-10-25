@@ -212,6 +212,12 @@ data DeepSeekRequestBody = DeepSeekRequestBody
 instance ToJSON DeepSeekRequestBody where
     toJSON = genericToJSON defaultOptions
 
+-- MERGE SYNTHESIS: tests round-trip DeepSeekRequestBody via encode/eitherDecode.
+-- genericParseJSON with the same defaultOptions as ToJSON gives us a symmetric
+-- parser.
+instance FromJSON DeepSeekRequestBody where
+    parseJSON = genericParseJSON defaultOptions
+
 instance Default DeepSeekRequestBody where
   def = DeepSeekRequestBody
     { _deepSeekRequest_messages          = []
