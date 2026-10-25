@@ -35,6 +35,11 @@ module LLM.Provider
   , ToolResponse(..)
   , askOpenAITools
   , runToolLoop
+    -- * Runners and env helpers (from gs/gets-context)
+  , runLLM
+  , runConvo
+  , checkArgMax
+  , mkLLMEnv
   ) where
 
 import LLM.Types
@@ -57,6 +62,7 @@ import Network.HTTP.Types.Header (hAuthorization, hContentType)
 import Network.URI (URI)
 import System.Environment (getEnvironment)
 import System.Exit (ExitCode(..))
+import System.Posix.Unistd (SysVar(..), getSysVar)
 import System.Process (readCreateProcessWithExitCode, proc, CreateProcess(..))
 
 import Text.Parsec hiding (try)           -- hide parsec's try, we'll qualify it
@@ -70,9 +76,10 @@ data WebProvider = ProviderOpenAI | ProviderAnthropic | ProviderOllama
 
 -- | Errors that can occur when calling an LLM backend.
 data LLMError
-  = LLMHttpError T.Text       -- ^ HTTP or network-level failure
-  | LLMParseError T.Text      -- ^ Could not decode the provider's response
+  = LLMHttpError T.Text        -- ^ HTTP or network-level failure
+  | LLMParseError T.Text       -- ^ Could not decode the provider's response
   | LLMProcessError Int T.Text -- ^ CLI subprocess exited with a non-zero code
+  | LLMArgMaxExceeded Int Int  -- ^ actualBytes argMaxBytes — execve arg list exceeded ARG_MAX (from gs/gets-context)
   deriving (Show, Eq, Generic)
 
 -- | Transport + provider data for an LLM backend.
@@ -97,7 +104,15 @@ data LLMBackend = LLMBackend
 -- | Environment for the 'LLMT' monad — holds the active backend.
 data LLMEnv = LLMEnv
   { _llmEnv_backend :: LLMBackend
+  , _llmEnv_maxContextChars :: Maybe Int
+    -- ^ If Just n, context exceeding n chars is summarized before sending.
+    -- Set this for CLI backends where ARG_MAX is a concern.
+    -- Nothing = no limit (HTTP backends, mock backends).
   }
+
+-- | Construct an LLMEnv with no context limit (backward compat).
+mkLLMEnv :: LLMBackend -> LLMEnv
+mkLLMEnv b = LLMEnv b Nothing
 
 -- | Stateless LLM monad transformer.
 newtype LLMT m a = LLMT { unLLMT :: ReaderT LLMEnv m a }
@@ -236,6 +251,18 @@ askOllama mgr url model msgs = do
       Left e -> pure . Left . LLMParseError . T.pack $ e
       Right a -> pure . Right . _cwr_content . _deepSeekResponse_message $ a
 
+-- | Estimate execve payload size. Returns Left (actual, limit) if exceeded.
+-- Pure helper — testable without spawning processes. (From gs/gets-context.)
+checkArgMax :: Int -> [String] -> [(String, String)] -> Either (Int, Int) ()
+checkArgMax argMaxBytes args envPairs =
+  let argBytes = sum [ length a + 1 | a <- args ]       -- each arg + null terminator
+      envBytes = sum [ length k + 1 + length v + 1 | (k, v) <- envPairs ]  -- "k=v\0"
+      ptrOverhead = (length args + 1 + length envPairs + 1) * 8  -- argv/envp pointer arrays
+      totalBytes = argBytes + envBytes + ptrOverhead
+  in if totalBytes > argMaxBytes
+    then Left (totalBytes, argMaxBytes)
+    else Right ()
+
 -- | Shell out to a Claude-style CLI. @extraArgs@ are inserted between
 -- the fixed @-p --model M --dangerously-skip-permissions@ flags and
 -- the prompt body — use them to pin an alternate model, add a debug
@@ -244,6 +271,11 @@ askCLI :: FilePath -> T.Text -> [String] -> [ContentWithRole] -> IO (Either LLME
 askCLI exec model extraArgs msgs = do
   let combinedPrompt = T.unpack $ T.intercalate "\n\n"
         [ _cwr_content m | m <- msgs ]
+      args = [ "-p"
+             , "--model", T.unpack model
+             , "--dangerously-skip-permissions"
+             , combinedPrompt
+             ]
   curEnv <- getEnvironment
   let cleanEnv = filter ((/= "CLAUDECODE") . fst) curEnv
       args = [ "-p"
@@ -252,14 +284,21 @@ askCLI exec model extraArgs msgs = do
              ]
           <> extraArgs
           <> [ combinedPrompt ]
-      cp = (proc exec args) { env = Just cleanEnv }
-  (CE.try $ readCreateProcessWithExitCode cp "" :: IO (Either SomeException (ExitCode, String, String))) >>= \case
-    Left e ->
-      pure $ Left $ LLMProcessError 1 (T.pack $ show e)
-    Right (ExitSuccess, out, _) ->
-      pure $ Right (T.pack out)
-    Right (ExitFailure code, _, err) ->
-      pure $ Left $ LLMProcessError code (T.pack err)
+  -- MERGE: ArgMax guard from gs/gets-context — bail out before execve if the
+  -- argv/envp payload would exceed the kernel's ARG_MAX, so the caller sees
+  -- LLMArgMaxExceeded instead of a bare E2BIG from the OS.
+  argMax <- getSysVar ArgumentLimit
+  case checkArgMax (fromIntegral argMax) (exec : args) cleanEnv of
+    Left (actual, limit) -> pure $ Left $ LLMArgMaxExceeded actual limit
+    Right () -> do
+      let cp = (proc exec args) { env = Just cleanEnv }
+      (CE.try $ readCreateProcessWithExitCode cp "" :: IO (Either SomeException (ExitCode, String, String))) >>= \case
+        Left e ->
+          pure $ Left $ LLMProcessError 1 (T.pack $ show e)
+        Right (ExitSuccess, out, _) ->
+          pure $ Right (T.pack out)
+        Right (ExitFailure code, _, err) ->
+          pure $ Left $ LLMProcessError code (T.pack err)
 
 -- ============================================================
 -- Tool support (OpenAI / OpenRouter)
@@ -506,3 +545,8 @@ runToolLoop mgr url apiKey model maxTokens maxRounds tools execToolF initialMsgs
           , _functionCall_arguments = TE.decodeUtf8 $ LBS.toStrict $ Aeson.encode inputVal
           }
       }
+-- MERGE NOTE: gs/gets-context ended its askCLI tail here with the ArgMax
+-- guard wrapping readCreateProcessWithExitCode. That guard has been INJECTED
+-- into HEAD's askCLI body above (see "MERGE: ArgMax guard from gs/gets-context"),
+-- so this duplicate tail from gets-context is omitted — the guard is live in
+-- the authoritative askCLI definition rather than preserved as dead code.

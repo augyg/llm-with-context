@@ -14,6 +14,7 @@ import qualified Hedgehog.Gen as Gen
 import qualified Hedgehog.Range as Range
 
 import LLM.Types
+import LLM.LLM (renderContextLabeled, prepareContext, getRelevantCtx, renderHistory)
 import LLM.Provider
 import LLM.Provider.Backends
 import LLM.ReadLLM
@@ -23,6 +24,10 @@ import LLM.LLM (getRelevantCtx, getRelevantCtxDeepSeek, renderHistory, askWithCo
 
 import Control.Monad.Trans.State (evalStateT)
 import Data.Aeson (encode, eitherDecode, toJSON, fromJSON, fieldLabelModifier)
+import Control.Monad.Trans.Reader (runReaderT)
+import Control.Monad.Trans.State (evalStateT, execStateT)
+import Data.Functor.Identity (runIdentity)
+import Data.Aeson (encode, eitherDecode, toJSON, fromJSON, Result(..))
 import Data.Typeable (Typeable, typeRep, Proxy(..))
 import GHC.Generics (Generic)
 import Scrappy.JSON.Record (jString, jInt, jDouble, jBool, jNull, jArray)
@@ -39,6 +44,9 @@ tests = testGroup "llm-with-context"
   [ testGroup "Types" typesTests
   , testGroup "Provider" providerTests
   , testGroup "Backends" backendsTests
+  , testGroup "ArgMax" argMaxTests
+  , testGroup "ContextLabeled" contextLabeledTests
+  , testGroup "PrepareContext" prepareContextTests
   , testGroup "Integration" integrationTests
   , testGroup "ScrappyJSON" scrappyTests
   , testGroup "JsonExample" jsonExampleTests
@@ -48,6 +56,8 @@ tests = testGroup "llm-with-context"
   , testGroup "ScrubPrefix" scrubPrefixTests
   , testGroup "ReadLLM Edge Cases" readLLMEdgeTests
   , testGroup "JsonExample Edge Cases" jsonExampleEdgeTests
+  , testGroup "TagPattern" tagPatternTests
+  , testGroup "GetsContext" getsContextTests
   ]
 
 -- ============================================================
@@ -219,14 +229,14 @@ instance FromJValue SimpleRecord where
 prop_askLLM_dispatches :: Property
 prop_askLLM_dispatches = property $ do
   txt <- forAll genNonEmptyText
-  let env = LLMEnv echoBackend
+  let env = mkLLMEnv echoBackend
       msgs = [cwr User txt]
   result <- evalIO $ runLLM env (askLLM msgs)
   result === Right txt
 
 prop_askLLMJSON_parses :: Property
 prop_askLLMJSON_parses = property $ do
-  let env = LLMEnv (jsonBackend "{\"name\":\"Alice\",\"age\":30}")
+  let env = mkLLMEnv (jsonBackend "{\"name\":\"Alice\",\"age\":30}")
   result <- evalIO $ runLLM env (askLLMJSON [cwr User "test"])
   case result of
     Right (Just (r :: SimpleRecord)) -> do
@@ -241,7 +251,7 @@ prop_askLLMJSON_parses = property $ do
 
 prop_askLLMJSON_nonJson :: Property
 prop_askLLMJSON_nonJson = property $ do
-  let env = LLMEnv (jsonBackend "this is not json")
+  let env = mkLLMEnv (jsonBackend "this is not json")
   result <- evalIO $ runLLM env (askLLMJSON [cwr User "test"])
   case (result :: Either LLMError (Maybe SimpleRecord)) of
     Right Nothing -> success
@@ -253,7 +263,7 @@ prop_askLLM_error :: Property
 prop_askLLM_error = property $ do
   errMsg <- forAll genNonEmptyText
   let err = LLMHttpError errMsg
-      env = LLMEnv (failBackend err)
+      env = mkLLMEnv (failBackend err)
   result <- evalIO $ runLLM env (askLLM [cwr User "test"])
   case result of
     Left (LLMHttpError msg) -> msg === errMsg
@@ -263,7 +273,7 @@ prop_askLLM_error = property $ do
 
 prop_askLLMJSON_fenced :: Property
 prop_askLLMJSON_fenced = withTests 1 $ property $ do
-  let env = LLMEnv (jsonBackend "Sure! Here's your JSON:\n\n```json\n{\"name\":\"Bob\",\"age\":25}\n```\n")
+  let env = mkLLMEnv (jsonBackend "Sure! Here's your JSON:\n\n```json\n{\"name\":\"Bob\",\"age\":25}\n```\n")
   result <- evalIO $ runLLM env (askLLMJSON [cwr User "test"])
   case result of
     Right (Just (r :: SimpleRecord)) -> do
@@ -390,6 +400,7 @@ integrationTests =
 
 claudeEnv :: LLMEnv
 claudeEnv = LLMEnv (mkClaudeCLI defaultClaudeCliCfg "haiku")
+claudeEnv = mkLLMEnv (mkClaudeCLI "haiku")
 
 prop_llm_single_record :: Property
 prop_llm_single_record = withTests 1 $ property $ do
@@ -560,7 +571,7 @@ bookFieldBackend = LLMBackend
 
 prop_applicative_search :: Property
 prop_applicative_search = withTests 1 $ property $ do
-  let env = LLMEnv bookFieldBackend
+  let env = mkLLMEnv bookFieldBackend
 
   -- 5 separate calls, each using Proxy+Typeable for prompt + search for parsing
   r1 <- evalIO $ askFieldSearch @String "What is the title of the book?" env
@@ -663,7 +674,7 @@ noisyBookBackend = LLMBackend
 
 prop_applicative_search_noisy :: Property
 prop_applicative_search_noisy = withTests 1 $ property $ do
-  let env = LLMEnv noisyBookBackend
+  let env = mkLLMEnv noisyBookBackend
 
   r1 <- evalIO $ askFieldSearch @BookTitle "What is the title of the book?" env
   r2 <- evalIO $ askFieldSearch @AuthorName "Who is the author of the book?" env
@@ -1659,3 +1670,336 @@ prop_prompt_preamble :: Property
 prop_prompt_preamble = withTests 1 $ property $ do
   let prompt = jsonResponsePrompt (Proxy :: Proxy Double)
   assert $ "Respond with ONLY" `T.isInfixOf` T.pack prompt
+-- ARG_MAX Tests: pure checkArgMax
+-- ============================================================
+
+argMaxTests :: [TestTree]
+argMaxTests =
+  [ testProperty "checkArgMax allows small args under limit" prop_argMax_ok
+  , testProperty "checkArgMax rejects args exceeding limit" prop_argMax_exceeded
+  , testProperty "checkArgMax counts env vars toward total" prop_argMax_env_counted
+  ]
+
+prop_argMax_ok :: Property
+prop_argMax_ok = withTests 1 $ property $ do
+  let args = ["claude", "-p", "--model", "haiku", "hello world"]
+      envVars = [("HOME", "/home/user"), ("PATH", "/usr/bin")]
+  case checkArgMax 2097152 args envVars of
+    Right () -> success
+    Left (actual, limit) -> do
+      annotate $ "Expected Right (), got Left (" ++ show actual ++ ", " ++ show limit ++ ")"
+      failure
+
+prop_argMax_exceeded :: Property
+prop_argMax_exceeded = withTests 1 $ property $ do
+  -- Create a very large arg that exceeds a tiny limit
+  let bigArg = replicate 1000 'x'
+      args = ["claude", bigArg]
+      envVars = []
+  case checkArgMax 500 args envVars of
+    Left (actual, limit) -> do
+      assert $ actual > limit
+      limit === 500
+    Right () -> do
+      annotate "Expected Left, got Right"
+      failure
+
+prop_argMax_env_counted :: Property
+prop_argMax_env_counted = withTests 1 $ property $ do
+  let args = ["claude", "hi"]
+      bigEnv = [(replicate 500 'K', replicate 500 'V')]
+  -- With a 600-byte limit, the env alone (500+500+2 bytes for k=v\0) should exceed it
+  case checkArgMax 600 args bigEnv of
+    Left (actual, _) -> assert $ actual > 600
+    Right () -> do
+      annotate "Expected Left — env vars should push total over limit"
+      failure
+
+-- ============================================================
+-- Context Labeled Tests: renderContextLabeled
+-- ============================================================
+
+contextLabeledTests :: [TestTree]
+contextLabeledTests =
+  [ testProperty "wraps output in <context> tags" prop_context_tags
+  , testProperty "renders ConvoExchange as Me/Assistant" prop_context_exchange
+  , testProperty "renders ConvoSummary with [Summary] prefix" prop_context_summary
+  ]
+
+-- Helper: build a ConvoExchange from question/answer text
+mkExchange :: T.Text -> T.Text -> T.Text -> ConvoEntry T.Text
+mkExchange tagTxt question answer =
+  ConvoExchange $ ConvoQuery (Tag tagTxt) (ConvoQuestion [cwr User question]) (ConvoAnswer answer)
+
+prop_context_tags :: Property
+prop_context_tags = withTests 1 $ property $ do
+  let hist = [mkExchange "tag1" "hello" "world"]
+      rendered = _cwr_content $ renderContextLabeled hist
+  assert $ T.isPrefixOf "<context>" rendered
+  assert $ T.isSuffixOf "</context>" rendered
+
+prop_context_exchange :: Property
+prop_context_exchange = withTests 1 $ property $ do
+  let hist = [mkExchange "tag1" "what color?" "blue"]
+      rendered = _cwr_content $ renderContextLabeled hist
+  assert $ T.isInfixOf "Assistant: blue" rendered
+
+prop_context_summary :: Property
+prop_context_summary = withTests 1 $ property $ do
+  let hist = [ConvoSummary (Tag "Run0--Summary") "The subject is a red fox on a green background."]
+      rendered = _cwr_content $ renderContextLabeled hist
+  assert $ T.isInfixOf "[Summary of prior context]" rendered
+  assert $ T.isInfixOf "red fox" rendered
+
+-- ============================================================
+-- PrepareContext Tests: mock backend
+-- ============================================================
+
+prepareContextTests :: [TestTree]
+prepareContextTests =
+  [ testProperty "no limit returns labeled context" prop_prepare_no_limit
+  , testProperty "under-limit returns labeled context unchanged" prop_prepare_under_limit
+  , testProperty "over-limit triggers summarization" prop_prepare_over_limit
+  , testProperty "summarization failure falls back to truncation" prop_prepare_summarize_fails
+  , testProperty "summary rebinds state with ConvoSummary" prop_prepare_rebinds_state
+  ]
+
+-- | Mock backend that echoes a summary for summarization calls
+summaryMockBackend :: LLMBackend
+summaryMockBackend = LLMBackend
+  { _llmBackend_name = "test/summary-mock"
+  , _llmBackend_api  = APIMock $ \msgs ->
+      let totalLen = sum $ map (T.length . _cwr_content) msgs
+      in pure $ Right $ "Color is blue. Canvas is 800x600. Subject is fox. (condensed from " <> T.pack (show totalLen) <> " chars)"
+  }
+
+-- | Mock backend that always fails (for testing summarization failure fallback)
+summaryFailMockBackend :: LLMBackend
+summaryFailMockBackend = LLMBackend
+  { _llmBackend_name = "test/summary-fail"
+  , _llmBackend_api  = APIMock $ \_ -> pure $ Left $ LLMProcessError 1 "mock summarization failure"
+  }
+
+-- | Seed history with enough entries to generate substantial context
+seedHistory :: ConversationHistory
+seedHistory =
+  [ mkExchange "Run0--Classify" "Classify this: a spider walking" "{\"kind\":\"animation\",\"subject\":\"spider\",\"mood\":\"creepy\",\"keywords\":[\"spider\",\"web\",\"crawl\"]}"
+  , mkExchange "Run0--Canvas" "Pick canvas for spider animation" "{\"width\":1080,\"height\":1920,\"bg\":\"1a1a2e\",\"fps\":30,\"duration\":3.0}"
+  , mkExchange "Run0--Elements" "Design elements for spider" "{\"layers\":[{\"name\":\"body\",\"shape\":\"ellipse\"},{\"name\":\"legs\",\"shape\":\"path\"}]}"
+  ]
+
+prop_prepare_no_limit :: Property
+prop_prepare_no_limit = withTests 1 $ property $ do
+  let backend = LLMBackend "unused" (APIMock $ \_ -> pure $ Right "unused")
+      env = LLMEnv backend Nothing
+  result <- evalIO $ runReaderT (evalStateT (prepareContext (LastN 10) (Tag "test")) seedHistory) env
+  case result of
+    [msg] -> do
+      assert $ T.isInfixOf "<context>" (_cwr_content msg)
+      assert $ T.isInfixOf "</context>" (_cwr_content msg)
+    other -> do
+      annotate $ "Expected 1 message, got " ++ show (length other)
+      failure
+
+prop_prepare_under_limit :: Property
+prop_prepare_under_limit = withTests 1 $ property $ do
+  let backend = LLMBackend "unused" (APIMock $ \_ -> pure $ Right "unused")
+      env = LLMEnv backend (Just 100000)
+  result <- evalIO $ runReaderT (evalStateT (prepareContext (LastN 10) (Tag "test")) seedHistory) env
+  case result of
+    [msg] -> do
+      -- Should return full context since it's under the 100k limit
+      assert $ T.isInfixOf "<context>" (_cwr_content msg)
+      assert $ T.isInfixOf "spider" (_cwr_content msg)
+    other -> do
+      annotate $ "Expected 1 message, got " ++ show (length other)
+      failure
+
+prop_prepare_over_limit :: Property
+prop_prepare_over_limit = withTests 1 $ property $ do
+  -- Set a very small limit to force summarization
+  let env = LLMEnv summaryMockBackend (Just 50)
+  result <- evalIO $ runReaderT (evalStateT (prepareContext (LastN 10) (Tag "test")) seedHistory) env
+  case result of
+    [msg] -> do
+      -- Should contain the mock summary, not the original exchanges
+      assert $ T.isInfixOf "condensed from" (_cwr_content msg)
+    other -> do
+      annotate $ "Expected 1 message, got " ++ show (length other)
+      failure
+
+prop_prepare_summarize_fails :: Property
+prop_prepare_summarize_fails = withTests 1 $ property $ do
+  let env = LLMEnv summaryFailMockBackend (Just 50)
+  result <- evalIO $ runReaderT (evalStateT (prepareContext (LastN 10) (Tag "test")) seedHistory) env
+  case result of
+    [msg] -> do
+      -- Should fall back to truncation
+      assert $ T.isInfixOf "[...truncated]" (_cwr_content msg)
+    other -> do
+      annotate $ "Expected 1 message, got " ++ show (length other)
+      failure
+
+prop_prepare_rebinds_state :: Property
+prop_prepare_rebinds_state = withTests 1 $ property $ do
+  let env = LLMEnv summaryMockBackend (Just 50)
+  newState <- evalIO $ runReaderT (execStateT (prepareContext (LastN 10) (Tag "test")) seedHistory) env
+  -- After summarization, state should contain a ConvoSummary
+  case newState of
+    (ConvoSummary tag _summaryText : _rest) -> do
+      -- Tag should contain "Summary"
+      assert $ T.isInfixOf "Summary" (unTag tag)
+      -- Tag should contain run parts from original entries
+      assert $ T.isInfixOf "Run0" (unTag tag)
+    _ -> do
+      annotate $ "Expected ConvoSummary at head of state"
+      failure
+
+-- ============================================================
+-- TagPattern Tests: matchTag + mkPattern
+-- ============================================================
+
+tagPatternTests :: [TestTree]
+tagPatternTests =
+  [ testProperty "exact match" prop_tag_exact_match
+  , testProperty "wildcard matches any segment" prop_tag_wildcard
+  , testProperty "case insensitive" prop_tag_case_insensitive
+  , testProperty "rejects extra segments" prop_tag_rejects_extra_segments
+  , testProperty "rejects fewer segments" prop_tag_rejects_fewer_segments
+  , testProperty "leading wildcard" prop_tag_leading_wildcard
+  , testProperty "all wildcards match any tag with same segment count" prop_tag_all_wildcards
+  , testProperty "mkPattern splits on --" prop_mkPattern_splits
+  ]
+
+prop_tag_exact_match :: Property
+prop_tag_exact_match = withTests 1 $ property $ do
+  assert $ matchTag (mkPattern "Run0--Decomp") (Tag "Run0--Decomp")
+
+prop_tag_wildcard :: Property
+prop_tag_wildcard = withTests 1 $ property $ do
+  let pat = mkPattern "Run0--PartDetail--*"
+  assert $ matchTag pat (Tag "Run0--PartDetail--cat-legs")
+  assert $ matchTag pat (Tag "Run0--PartDetail--bear-torso")
+  assert $ not $ matchTag pat (Tag "Run0--Fill--cat-legs")
+
+prop_tag_case_insensitive :: Property
+prop_tag_case_insensitive = withTests 1 $ property $ do
+  assert $ matchTag (mkPattern "run0--decomp") (Tag "Run0--Decomp")
+  assert $ matchTag (mkPattern "RUN0--DECOMP") (Tag "run0--decomp")
+
+prop_tag_rejects_extra_segments :: Property
+prop_tag_rejects_extra_segments = withTests 1 $ property $ do
+  assert $ not $ matchTag (mkPattern "Run0--Decomp") (Tag "Run0--Decomp--Extra")
+
+prop_tag_rejects_fewer_segments :: Property
+prop_tag_rejects_fewer_segments = withTests 1 $ property $ do
+  assert $ not $ matchTag (mkPattern "*--*--*") (Tag "A--B")
+
+prop_tag_leading_wildcard :: Property
+prop_tag_leading_wildcard = withTests 1 $ property $ do
+  let pat = mkPattern "*--Fill--ball-body"
+  assert $ matchTag pat (Tag "Run0--Fill--ball-body")
+  assert $ matchTag pat (Tag "Run5--Fill--ball-body")
+  assert $ not $ matchTag pat (Tag "Run0--PartDetail--ball-body")
+
+prop_tag_all_wildcards :: Property
+prop_tag_all_wildcards = withTests 1 $ property $ do
+  let pat = mkPattern "*--*"
+  assert $ matchTag pat (Tag "Run0--Decomp")
+  assert $ matchTag pat (Tag "anything--here")
+  assert $ not $ matchTag pat (Tag "Run0--A--B")
+
+prop_mkPattern_splits :: Property
+prop_mkPattern_splits = withTests 1 $ property $ do
+  unTagPattern (mkPattern "Run0--PartDetail--*") === ["Run0", "PartDetail", "*"]
+  unTagPattern (mkPattern "Decomp") === ["Decomp"]
+  unTagPattern (mkPattern "*--*--*") === ["*", "*", "*"]
+
+-- ============================================================
+-- GetsContext Tests: Gets + NoHistory in getRelevantCtx
+-- ============================================================
+
+-- | Simulated visual pipeline history: 3 structural + 15 PartDetail + 10 Fill = 28 entries
+visualHistory :: ConversationHistory
+visualHistory =
+  [ mkExchange "Run0--Decomp" "decompose the scene" "{\"parts\":[\"body\",\"head\"]}"
+  , mkExchange "Run0--Layout" "position the parts" "{\"parts\":[{\"name\":\"body\",\"x\":0.5}]}"
+  , mkExchange "Run0--PartGuide" "reference guide" "{\"ready\":true}"
+  ]
+  ++ [ mkExchange ("Run0--PartDetail--part" <> T.pack (show i))
+                  ("detail for part " <> T.pack (show i))
+                  ("{\"name\":\"part" <> T.pack (show i) <> "\"}")
+     | i <- [1..15 :: Int]
+     ]
+  ++ [ mkExchange ("Run0--Fill--part" <> T.pack (show i))
+                  ("fill for part " <> T.pack (show i))
+                  ("{\"color\":\"aa0000\"}")
+     | i <- [1..10 :: Int]
+     ]
+
+runGets :: RelevantContext -> ConversationHistory -> ConversationHistory
+runGets ctx hist = runIdentity $ evalStateT (getRelevantCtx ctx) hist
+
+getsContextTests :: [TestTree]
+getsContextTests =
+  [ testProperty "pin returns all matches for exact tag" prop_gets_pin
+  , testProperty "lastNMatching budgets correctly" prop_gets_lastN_budget
+  , testProperty "multiple rules compose" prop_gets_compose
+  , testProperty "chronological order preserved" prop_gets_order
+  , testProperty "no matches returns empty" prop_gets_no_matches
+  , testProperty "NoHistory returns empty" prop_gets_nohistory
+  ]
+
+prop_gets_pin :: Property
+prop_gets_pin = withTests 1 $ property $ do
+  let result = runGets (Gets [pin "Run0--Decomp"]) visualHistory
+  length result === 1
+  entryTag (Prelude.head result) === Tag "Run0--Decomp"
+
+prop_gets_lastN_budget :: Property
+prop_gets_lastN_budget = withTests 1 $ property $ do
+  -- 15 PartDetail entries, budget of 5 → should get 5 most recent
+  let result = runGets (Gets [lastNMatching 5 "Run0--PartDetail--*"]) visualHistory
+  length result === 5
+  -- Most recent means lowest indices in the list (history is newest-first)
+  -- so the first 5 PartDetail matches
+  let tags = map (unTag . entryTag) result
+  assert $ all (T.isInfixOf "PartDetail") tags
+
+prop_gets_compose :: Property
+prop_gets_compose = withTests 1 $ property $ do
+  let ctx = Gets
+        [ pin "Run0--Decomp"
+        , pin "Run0--Layout"
+        , lastNMatching 3 "Run0--PartDetail--*"
+        ]
+      result = runGets ctx visualHistory
+  -- 1 Decomp + 1 Layout + 3 PartDetail = 5
+  length result === 5
+
+prop_gets_order :: Property
+prop_gets_order = withTests 1 $ property $ do
+  let ctx = Gets
+        [ pin "Run0--Decomp"
+        , pin "Run0--Layout"
+        , lastNMatching 2 "Run0--PartDetail--*"
+        ]
+      result = runGets ctx visualHistory
+      tags = map (unTag . entryTag) result
+  -- Decomp comes before Layout comes before PartDetails in the original history
+  -- so the result should preserve that order
+  let decompIdx = Prelude.head [i | (i, t) <- Prelude.zip [0..] tags, T.isInfixOf "Decomp" t]
+      layoutIdx = Prelude.head [i | (i, t) <- Prelude.zip [0..] tags, T.isInfixOf "Layout" t]
+      detailIdxs = [i | (i, t) <- Prelude.zip [0..] tags, T.isInfixOf "PartDetail" t]
+  assert $ decompIdx < layoutIdx
+  assert $ all (> layoutIdx) detailIdxs
+
+prop_gets_no_matches :: Property
+prop_gets_no_matches = withTests 1 $ property $ do
+  let result = runGets (Gets [pin "Run99--Decomp"]) visualHistory
+  length result === 0
+
+prop_gets_nohistory :: Property
+prop_gets_nohistory = withTests 1 $ property $ do
+  let result = runGets NoHistory visualHistory
+  length result === 0

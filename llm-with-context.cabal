@@ -124,6 +124,8 @@ library
                     , beam-core
                     , beam-postgres
                     , beam-migrate
+                    , process
+                    , unix
 
                     
 

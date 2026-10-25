@@ -68,7 +68,7 @@ module LLM.LLM
   ) where
 
 import LLM.Types
-import LLM.Provider (askLLM, LLMT(..), LLMError(..), ConvoT(..), parseLLMJSON)
+import LLM.Provider (askLLM, LLMT(..), LLMError(..), LLMEnv(..), ConvoT(..), parseLLMJSON)
 
 import Scrappy.Elem as S hiding (Tag)
 import Scrappy.JSON.Value (FromJValue)
@@ -78,6 +78,7 @@ import Network.HTTP.Types.Header
 
 import Control.Monad.IO.Class
 import Control.Monad.Trans.Class (lift)
+import Control.Monad.Trans.Reader (ReaderT, asks)
 import Control.Monad.Trans.State
 import Control.Exception as CE
 import Data.Bifunctor
@@ -88,6 +89,7 @@ import Data.Default
 import Text.Read (readEither)
 import Data.Maybe (catMaybes)
 import qualified Data.List as L
+import qualified Data.Set as S
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
 import qualified Data.ByteString.Lazy as LBS
@@ -117,8 +119,22 @@ getRelevant = LastNRelevant 10 $ \(Tag t) -> T.isPrefixOf "html" t
 renderHistory :: ConversationHistory -> ContentWithRole
 renderHistory = cwr Assistant . ((<>) "Our conversation history so far:") . T.intercalate "\n" . fmap renderItem
   where
-    renderItem (ConvoQuery _ (ConvoQuestion q) (ConvoAnswer a)) =
+    renderItem (ConvoExchange (ConvoQuery _ (ConvoQuestion q) (ConvoAnswer a))) =
       "Me: " <> (T.decodeUtf8 . LBS.toStrict . Aeson.encode) q <> "\n" <> "Assistant: " <> a
+    renderItem (ConvoSummary _tag summaryText) =
+      "[Summary of prior context]\n" <> summaryText
+
+-- | Render conversation history with explicit <context> tags.
+-- Summaries are clearly labeled so the LLM knows they are condensed.
+renderContextLabeled :: ConversationHistory -> ContentWithRole
+renderContextLabeled items = cwr Assistant $
+  "<context>\n" <> T.intercalate "\n" (map renderItem items) <> "\n</context>"
+  where
+    renderItem (ConvoExchange (ConvoQuery _ (ConvoQuestion q) (ConvoAnswer a))) =
+      "Me: " <> (T.decodeUtf8 . LBS.toStrict . Aeson.encode) q
+      <> "\nAssistant: " <> a
+    renderItem (ConvoSummary _tag summaryText) =
+      "[Summary of prior context]\n" <> summaryText
 
 -- | Like 'renderHistory' but lets the caller choose which role the rendered
 -- history is attached to. OpenAI/DeepSeek inject history as an 'Assistant'
@@ -130,8 +146,107 @@ renderHistoryWithRole :: GPTRole -> ConversationHistory -> ContentWithRole
 renderHistoryWithRole role =
   cwr role . ((<>) "Our conversation history so far:") . T.intercalate "\n" . fmap renderItem
   where
-    renderItem (ConvoQuery _ (ConvoQuestion q) (ConvoAnswer a)) =
+    renderItem (ConvoExchange (ConvoQuery _ (ConvoQuestion q) (ConvoAnswer a))) =
       "Me: " <> (T.decodeUtf8 . LBS.toStrict . Aeson.encode) q <> "\n" <> "ChatGPT: " <> a
+    renderItem (ConvoSummary _tag summaryText) =
+      "[Summary of prior context]\n" <> summaryText
+
+{- MERGE NOTE: gs/gets-context defined its own getRelevantCtx inline here, but
+   HEAD already provides getRelevantCtx (via `gets (selectRelevant rc)`) plus the
+   full `selectRelevant` pure function (defined later in this file) which handles
+   LastN/Relevants/LastNRelevant/Gets/NoHistory. gets-context's definition is
+   the semantic duplicate — commented out rather than deleted so the design
+   decision is visible in blame. See `selectRelevant :: RelevantContext ->
+   ConversationHistory -> ConversationHistory` below for the authoritative
+   implementation. -}
+{-
+getRelevantCtx :: Monad m => RelevantContext -> StateT ConversationHistory m ConversationHistory
+getRelevantCtx = \case
+  LastN n -> gets (take n)
+  Relevants tags -> gets (flip finds tags)
+  LastNRelevant n anonF -> gets (\x ->
+                               take n
+                               . filter (anonF . entryTag) $ x
+                            )
+  NoHistory -> pure []
+  Gets rules -> gets $ \hist ->
+    let perRule (CtxRule budget pat) =
+          let matches = filter (matchTag pat . entryTag) hist
+          in maybe matches (`take` matches) budget
+        selectedTags = S.fromList $ map entryTag (concatMap perRule rules)
+    in filter (\e -> entryTag e `S.member` selectedTags) hist
+  where
+    finds hist tags =
+      catMaybes $ fmap (\t -> L.find (\h -> t == entryTag h) hist) tags
+-}
+
+-- ============================================================
+-- Context preparation (with optional bounding)
+-- ============================================================
+
+-- | Prepare context for an LLM call, with optional bounding.
+-- Reads _llmEnv_maxContextChars from the LLMEnv ReaderT layer.
+-- If context exceeds the limit, summarizes via an LLM call and rebinds
+-- the ConvoT state with a ConvoSummary entry.
+-- Callers don't pass a strategy — bounding is determined by the environment.
+prepareContext
+  :: MonadIO m
+  => RelevantContext
+  -> Tag                    -- ^ tag for the upcoming query (used for summary tag)
+  -> StateT ConversationHistory (ReaderT LLMEnv m) [ContentWithRole]
+prepareContext relCtx queryTag = do
+  maxCtxChars <- lift $ asks _llmEnv_maxContextChars
+  items <- getRelevantCtx relCtx
+  if null items
+    then pure []
+    else do
+      let rendered = renderContextLabeled items
+      case maxCtxChars of
+        Nothing -> pure [rendered]  -- No limit (HTTP/Mock backend)
+        Just limit ->
+          let len = T.length (_cwr_content rendered)
+          in if len <= limit
+            then pure [rendered]
+            else summarizeAndRebind items rendered limit queryTag
+
+-- | Summarize context that exceeds the char limit, then rebind state.
+-- If summarization fails (LLM error), falls back to hard truncation.
+summarizeAndRebind
+  :: MonadIO m
+  => ConversationHistory       -- ^ filtered items being summarized
+  -> ContentWithRole           -- ^ rendered context (too large)
+  -> Int                       -- ^ target max chars
+  -> Tag                       -- ^ query tag for building summary tag
+  -> StateT ConversationHistory (ReaderT LLMEnv m) [ContentWithRole]
+summarizeAndRebind items rendered maxChars _queryTag = do
+  let summaryPrompt = cwr System $ T.concat
+        [ "Summarize this conversation context in under "
+        , T.pack (show maxChars)
+        , " characters. Preserve all key facts, decisions, colors, and dimensions. "
+        , "Return ONLY the summary."
+        ]
+      prompt = [summaryPrompt, rendered]
+  result <- lift $ unLLMT $ askLLM prompt
+  case result of
+    Left _err ->
+      -- Summarization failed → hard truncation fallback
+      let truncated = T.take maxChars (_cwr_content rendered)
+      in pure [cwr Assistant $ "<context>\n" <> truncated <> "\n[...truncated]\n</context>"]
+    Right summaryText -> do
+      -- Build summary tag: inherit run label parts, add "Summary"
+      let entryTags = map (unTag . entryTag) items
+          runParts = L.nub $ concatMap (T.splitOn "--") entryTags
+          summaryTag = Tag $ T.intercalate "--" (runParts ++ ["Summary"])
+      -- Rebind: replace summarized entries with ConvoSummary
+      let matchedTags = map entryTag items
+      modify $ \hist ->
+        ConvoSummary summaryTag summaryText
+          : filter (\e -> entryTag e `notElem` matchedTags) hist
+      pure [cwr Assistant $ "<context>\n" <> summaryText <> "\n</context>"]
+
+-- ============================================================
+-- DeepSeek context (unchanged)
+-- ============================================================
 
 
 
@@ -213,7 +328,7 @@ askGPTWithContextTyped key mgr tokenLimit relCtx (thisTag, ConvoQuestion content
         <> (T.pack $ show (ctx : contents <> returnT))
 
       Right typed -> do
-        let new = ConvoQuery thisTag (ConvoQuestion contents) (ConvoAnswer txt)
+        let new = ConvoExchange $ ConvoQuery thisTag (ConvoQuestion contents) (ConvoAnswer txt)
         modify ((:) new)
         pure . Right . ConvoAnswer $ typed
 
@@ -233,7 +348,7 @@ askGPTWithContext key mgr maxTokens relCtx (thisTag, ConvoQuestion contents) = C
   askGPT key mgr gptModel maxTokens (renderHistory histItems : contents) >>= \case
     Left e -> pure $ Left $ ConvoError e
     Right answer -> do
-      let new = ConvoQuery thisTag (ConvoQuestion contents) (ConvoAnswer answer)
+      let new = ConvoExchange $ ConvoQuery thisTag (ConvoQuestion contents) (ConvoAnswer answer)
       modify ((:) new)
       pure $ Right $ ConvoAnswer answer
 
@@ -617,12 +732,12 @@ askWithContext :: MonadIO m
   => RelevantContext -> (Tag, ConvoQuestion)
   -> ConvoT m (Either LLMError (ConvoAnswer T.Text))
 askWithContext relCtx (thisTag, ConvoQuestion contents) = ConvoT $ do
-  histItems <- getRelevantCtx relCtx
-  result <- lift $ unLLMT $ askLLM (renderHistory histItems : contents)
+  ctxMsgs <- prepareContext relCtx thisTag
+  result <- lift $ unLLMT $ askLLM (ctxMsgs ++ contents)
   case result of
     Left e -> pure $ Left e
     Right answer -> do
-      let new = ConvoQuery thisTag (ConvoQuestion contents) (ConvoAnswer answer)
+      let new = ConvoExchange $ ConvoQuery thisTag (ConvoQuestion contents) (ConvoAnswer answer)
       modify ((:) new)
       pure $ Right $ ConvoAnswer answer
 
