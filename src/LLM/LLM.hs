@@ -92,7 +92,10 @@ import Data.Default
 import Text.Read (readEither)
 import Data.Maybe (catMaybes)
 import qualified Data.List as L
-import qualified Data.Set as S
+-- MERGE NOTE: Data.Set was used by gets-context's inline getRelevantCtx
+-- for Set-based tag dedup; that block is commented out (HEAD has
+-- selectRelevant handling the same case) so Set is unused.
+-- import qualified Data.Set as S
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import qualified Data.ByteString.Lazy as BL
@@ -332,7 +335,7 @@ askGPTWithContextTyped key mgr tokenLimit relCtx (thisTag, ConvoQuestion content
 
       Right typed -> do
         let new = ConvoExchange $ ConvoQuery thisTag (ConvoQuestion contents) (ConvoAnswer txt)
-        modify ((:) (ConvoExchange new))
+        modify ((:) new)
         pure . Right . ConvoAnswer $ typed
 
 -- | Ask GPT with conversation context injected. Retrieves relevant history
@@ -352,7 +355,7 @@ askGPTWithContext key mgr maxTokens relCtx (thisTag, ConvoQuestion contents) = C
     Left e -> pure $ Left $ ConvoError e
     Right answer -> do
       let new = ConvoExchange $ ConvoQuery thisTag (ConvoQuestion contents) (ConvoAnswer answer)
-      modify ((:) (ConvoExchange new))
+      modify ((:) new)
       pure $ Right $ ConvoAnswer answer
 
 -- | Transport-agnostic version of the "with context" loop, parameterised over
@@ -754,7 +757,7 @@ askWithContext relCtx (thisTag, ConvoQuestion contents) = ConvoT $ do
     Left e -> pure $ Left e
     Right answer -> do
       let new = ConvoExchange $ ConvoQuery thisTag (ConvoQuestion contents) (ConvoAnswer answer)
-      modify ((:) (ConvoExchange new))
+      modify ((:) new)
       pure $ Right $ ConvoAnswer answer
 
 -- | Like 'askWithContext' but parses the response as JSON into type @a@.

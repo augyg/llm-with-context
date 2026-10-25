@@ -55,10 +55,12 @@ import LLM.Types
   ( ContentWithRole (..)
   , ConversationHistory
   , ConvoAnswer (..)
+  , ConvoEntry (..)   -- MERGE SYNTHESIS step 4: ConvoExchange / ConvoSummary wrappers
   , ConvoQuery (..)
   , ConvoQuestion (..)
   , RelevantContext
   , Tag (..)
+  , entryTag          -- tag accessor across ConvoExchange / ConvoSummary
   )
 
 import qualified Data.Text as T
@@ -184,12 +186,24 @@ queryTokens :: ConvoQuery T.Text -> Int
 queryTokens (ConvoQuery _ (ConvoQuestion q) (ConvoAnswer a)) =
   sum (map (estimateTokens . _cwr_content) q) + estimateTokens a
 
+-- | MERGE SYNTHESIS (step 4): adapt per-entry token estimation to the new
+-- ConvoEntry sum. ConvoExchange wraps a ConvoQuery (same as before);
+-- ConvoSummary wraps a Tag + the summary text (so its token cost is just
+-- estimateTokens on the summary).
+entryTokens :: ConvoEntry T.Text -> Int
+entryTokens (ConvoExchange q) = queryTokens q
+entryTokens (ConvoSummary _ summaryText) = estimateTokens summaryText
+
 -- | Estimated tokens of an entire history.
 historyTokens :: ConversationHistory -> Int
-historyTokens = sum . map queryTokens
+historyTokens = sum . map entryTokens
 
-isPinned :: [Tag] -> ConvoQuery T.Text -> Bool
-isPinned pinned q = _convoQuery_tag q `elem` pinned
+-- MERGE SYNTHESIS (step 4): ConversationHistory now holds `ConvoEntry a`
+-- (= ConvoExchange / ConvoSummary) rather than raw ConvoQuery. Taking a Tag
+-- directly keeps the predicate wrapper-agnostic — callers pass entryTag e
+-- for ConvoEntry callsites and _convoQuery_tag q for raw ConvoQuery sites.
+isPinned :: [Tag] -> Tag -> Bool
+isPinned pinned t = t `elem` pinned
 
 -- | Default in-memory backend: interpret 'Memory' over effectful's 'State'.
 -- The 'State' is left in @es@ for a later @evalState emptyMemoryStore@.
@@ -197,8 +211,8 @@ runMemoryState :: (State MemoryStore :> es) => Eff (Memory : es) a -> Eff es a
 runMemoryState = interpret $ \_ -> \case
   Recall relCtx -> gets (selectRelevant relCtx . _memoryStore_history)
   RecallAll -> gets _memoryStore_history
-  RecallPinned -> gets (\ms -> filter (isPinned (_memoryStore_pinned ms)) (_memoryStore_history ms))
-  Remember q -> modify (\ms -> ms { _memoryStore_history = q : _memoryStore_history ms })
+  RecallPinned -> gets (\ms -> filter (isPinned (_memoryStore_pinned ms) . entryTag) (_memoryStore_history ms))
+  Remember q -> modify (\ms -> ms { _memoryStore_history = ConvoExchange q : _memoryStore_history ms })
   Forget -> modify (\ms -> ms { _memoryStore_history = [] })
   Prune n -> modify (prune' n)
   ForgetWhere p -> modify (forgetWhere' p)
@@ -210,7 +224,7 @@ runMemoryState = interpret $ \_ -> \case
   Unpin t -> modify (\ms -> ms { _memoryStore_pinned = filter (/= t) (_memoryStore_pinned ms) })
   Note txt -> modify (\ms ->
     ms { _memoryStore_history =
-           ConvoQuery (Tag "note") (ConvoQuestion []) (ConvoAnswer txt) : _memoryStore_history ms })
+           ConvoExchange (ConvoQuery (Tag "note") (ConvoQuestion []) (ConvoAnswer txt)) : _memoryStore_history ms })
   TrimToTokens n -> modify (trimToTokens' n)
   TokenCount -> gets (historyTokens . _memoryStore_history)
   TurnCount -> gets (length . _memoryStore_history)
@@ -223,18 +237,25 @@ runMemoryState = interpret $ \_ -> \case
       ms { _memoryStore_history =
              [ q
              | (i, q) <- zip [0 :: Int ..] (_memoryStore_history ms)
-             , i < n || isPinned (_memoryStore_pinned ms) q
+             , i < n || isPinned (_memoryStore_pinned ms) (entryTag q)
              ] }
     forgetWhere' p ms =
       ms { _memoryStore_history =
              [ q
              | q <- _memoryStore_history ms
-             , isPinned (_memoryStore_pinned ms) q || not (p (_convoQuery_tag q))
+             , isPinned (_memoryStore_pinned ms) (entryTag q) || not (p (entryTag q))
              ] }
-    amendLast' txt ms = case _memoryStore_history ms of
-      [] -> ms
-      (ConvoQuery t q _ : rest) ->
-        ms { _memoryStore_history = ConvoQuery t q (ConvoAnswer txt) : rest }
+    -- MERGE SYNTHESIS (step 4): history now holds ConvoEntry. amendLast
+    -- rewrites the ANSWER of the most-recent ConvoExchange. If the top is
+    -- a ConvoSummary we leave the summary intact and amend the first
+    -- ConvoExchange below it — this preserves the "last answer" intent
+    -- even when summaries have been inserted by compaction.
+    amendLast' txt ms = ms { _memoryStore_history = go (_memoryStore_history ms) }
+      where
+        go [] = []
+        go (ConvoExchange (ConvoQuery t q _) : rest) =
+          ConvoExchange (ConvoQuery t q (ConvoAnswer txt)) : rest
+        go (s@ConvoSummary{} : rest) = s : go rest
     -- drop oldest unpinned turns one at a time until under budget; stop if only
     -- pinned turns remain. O(n^2) but conversation histories are small.
     trimToTokens' budget ms = ms { _memoryStore_history = go (_memoryStore_history ms) }
@@ -246,7 +267,7 @@ runMemoryState = interpret $ \_ -> \case
               Nothing -> h
               Just h' -> go h'
         dropOldestUnpinned h =
-          let unpinnedIdxs = [ i | (i, q) <- zip [0 :: Int ..] h, not (isPinned pinned q) ]
+          let unpinnedIdxs = [ i | (i, q) <- zip [0 :: Int ..] h, not (isPinned pinned (entryTag q)) ]
           in case reverse unpinnedIdxs of
                [] -> Nothing
                (oldest : _) -> Just [ q | (j, q) <- zip [0 :: Int ..] h, j /= oldest ]
