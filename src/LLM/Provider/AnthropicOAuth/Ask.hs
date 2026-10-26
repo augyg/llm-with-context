@@ -18,7 +18,8 @@
 -- POST.
 --
 -- Reuses 'AnthropicRequest' / 'AnthropicResponse' / 'splitSystem' /
--- 'firstText' / 'renderAnthropicError' from "LLM.Provider.Anthropic"
+-- 'firstText' from "LLM.Provider.Anthropic"; decodes the error-body
+-- shape via 'AnthropicErrorResponse' / 'AnthropicAPIError'
 -- so the body-building + response-parsing logic has one source of
 -- truth.
 module LLM.Provider.AnthropicOAuth.Ask
@@ -38,7 +39,6 @@ module LLM.Provider.AnthropicOAuth.Ask
 import Control.Concurrent.MVar (MVar, modifyMVar, newMVar, readMVar)
 import Control.Exception (SomeException, try)
 import Control.Monad.IO.Class (MonadIO, liftIO)
-import Data.Aeson (Value)
 import qualified Data.Aeson as Aeson
 import qualified Data.ByteString.Lazy as BL
 import Data.Text (Text)
@@ -58,10 +58,11 @@ import Network.HTTP.Types.Header (hAuthorization, hContentType, hUserAgent)
 import Network.HTTP.Types.Status (statusCode, statusMessage)
 
 import LLM.Provider.Anthropic
-  ( AnthropicRequest (..)
+  ( AnthropicAPIError (..)
+  , AnthropicErrorResponse (..)
+  , AnthropicRequest (..)
   , AnthropicResponse
   , firstText
-  , renderAnthropicError
   , splitSystem
   )
 import LLM.Provider.AnthropicOAuth.Credentials
@@ -260,9 +261,14 @@ classifyPostResponse r
           Just t  -> PostOK t
           Nothing -> PostNoContent
   | otherwise =
-      case Aeson.eitherDecode bs :: Either String Value of
-        Right v -> PostApiError (renderAnthropicError v)
-        Left _  -> PostApiError
+      case Aeson.eitherDecode bs :: Either String AnthropicErrorResponse of
+        Right errResp -> PostApiError
+          ( "Anthropic API error ("
+              <> T.pack (show code) <> " "
+              <> _aerr_type (_aerrResp_error errResp) <> "): "
+              <> _aerr_message (_aerrResp_error errResp)
+          )
+        Left _ -> PostApiError
           ("Anthropic non-success status " <> T.pack (show code) <> " " <> msg)
   where
     code = statusCode (responseStatus r)
