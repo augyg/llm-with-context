@@ -117,12 +117,12 @@ splitFrames = go []
   where
     delim = BS.pack [0x0A, 0x0A]   -- "\n\n"
     go acc bs = case BS.breakSubstring delim bs of
-      (frame, rest)
-        | BS.null rest -> (reverse acc, frame)
-          -- ^ no delimiter found — everything is tail
-        | otherwise ->
-            let rest' = BS.drop (BS.length delim) rest
-            in go (frame : acc) rest'
+      -- No delimiter found: everything we have is tail. Done.
+      (tailBs, rest) | BS.null rest ->
+        (reverse acc, tailBs)
+      (frame, rest) ->
+        let rest' = BS.drop (BS.length delim) rest
+        in go (frame : acc) rest'
 
 -- | Parse one complete frame into a 'StreamEvent'. The frame is a
 -- block of @key: value@ lines; we only care about @event:@ (name)
