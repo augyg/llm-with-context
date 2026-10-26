@@ -35,11 +35,13 @@ import Data.Typeable (Typeable, typeRep, Proxy(..))
 import GHC.Generics (Generic)
 import Scrappy.JSON.Record (jString, jInt, jDouble, jBool, jNull, jArray)
 import Scrappy.JSON.Value (FromJValue(..), JValue(..), (.:))
+import Scrappy.Types (Html)
 import Data.Default (def)
 import Data.Either (isLeft)
 import Data.List (nub)
 import Text.Parsec (parse, string, spaces, char, Parsec, ParseError)
 import qualified Data.Text as T
+import Data.String (fromString)
 import System.Directory (findExecutable)
 
 -- | Parse specialised to String streams. scrappy-json's primitives
@@ -48,6 +50,14 @@ import System.Directory (findExecutable)
 -- Pin it to String here so the primitive test suite stays unchanged.
 parseS :: Parsec String () a -> String -> Either ParseError a
 parseS p = parse p ""
+
+-- | Convert a 'String' to whatever Scrappy's 'Html' type synonym resolves
+-- to on the current scrappy-core version (String on some versions, Text
+-- on others, e.g. ace-ws's 8.10 scrappy-core). Mirrors
+-- 'LLM.Provider.toHtml' but takes 'String' directly since the test
+-- generators produce 'String'.
+toSearchHtml :: String -> Html
+toSearchHtml = fromString
 
 main :: IO ()
 main = defaultMain tests
@@ -629,7 +639,7 @@ askFieldSearch question env = do
   pure $ case result of
     Left e -> Left e
     Right txt ->
-      let found = search (T.unpack txt)
+      let found = search (toSearchHtml (T.unpack txt))
       in Right $ case found of
         Just (x:_) -> Just x
         _          -> Nothing
@@ -1664,7 +1674,7 @@ readLLMEdgeTests =
 prop_readllm_int :: Property
 prop_readllm_int = property $ do
   (n, noisy) <- forAll genIntInNoise
-  case search noisy :: Maybe [Int] of
+  case search (toSearchHtml noisy) :: Maybe [Int] of
     Just xs -> assert $ n `elem` xs
     Nothing -> do annotate $ "Expected to find " ++ show n; failure
 
@@ -2607,7 +2617,7 @@ miscGapTests =
 prop_readllm_integer :: Property
 prop_readllm_integer = property $ do
   (n, noisy) <- forAll genIntInNoise
-  case search noisy :: Maybe [Integer] of
+  case search (toSearchHtml noisy) :: Maybe [Integer] of
     Just xs -> assert $ fromIntegral n `elem` xs
     Nothing -> do annotate $ "Expected to find " ++ show n; failure
 
