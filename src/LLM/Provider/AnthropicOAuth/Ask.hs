@@ -99,11 +99,14 @@ import LLM.Types (ContentWithRole (..), GPTRole (..))
 defaultAnthropicVersion :: Text
 defaultAnthropicVersion = "2023-06-01"
 
--- | Default @anthropic-beta@ header value. Matches Claude Code 1.0.21's
--- advertisement of the @claude-code-20250219@ Claude-Code-flavored
--- inference beta.
+-- | Default @anthropic-beta@ header value. For the OAuth path this
+-- is @oauth-2025-04-20@ (NOT @claude-code-20250219@ which Claude
+-- Code reserves for its API-key path — verified via grep of
+-- cli.js 1.0.21). Sending the API-key beta flag with an OAuth
+-- token appears to trigger anomaly-detection soft-blocking
+-- (observed: 429 "Error" with no detail).
 defaultAnthropicBeta :: Text
-defaultAnthropicBeta = "claude-code-20250219"
+defaultAnthropicBeta = "oauth-2025-04-20"
 
 -- | Default @User-Agent@ header value. Mirrors Claude Code 1.0.21's
 -- actual UA prefix @claude-code/<version>@ (verified via grep of
