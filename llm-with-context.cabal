@@ -135,9 +135,14 @@ library
                     , beam-migrate
                     , process
                     , unix
-                    -- henforcer GHC plugin (from gs/henforcer-strict-tests via
-                    -- newSorted/gs/pre-merge-newSorted-dirty).
-                    , henforcer
+                    -- henforcer GHC plugin dep temporarily commented out alongside
+                    -- the plugin invocation (see the commented ghc-options line
+                    -- above). Keeping the dep active while the plugin is disabled
+                    -- forces downstream consumers (ace-ws, pipeline, etc.) to
+                    -- provide a henforcer derivation in their Haskell package set
+                    -- for zero behaviour benefit. Re-enable both lines together
+                    -- when the module-header backfill (Phase A.4b) is done.
+                    -- , henforcer
     -- The newSorted/gs/pre-merge-newSorted-dirty version of this stanza is
     -- preserved below as a comment for the audit trail — its version pins
     -- (base >= 4.20.2, aeson >= 2.2.3, etc.) are not applied because they

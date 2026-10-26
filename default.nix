@@ -112,7 +112,7 @@ let
 
   llm-with-context =
     hlib.addBuildTools
-      (hp.callCabal2nix "llm-with-context" (cleanSrc ./.) { inherit scrappy-core scrappy-json henforcer; })
+      (hp.callCabal2nix "llm-with-context" (cleanSrc ./.) { inherit scrappy-core scrappy-json; })
       [ pkgs.bubblewrap newerPkgs.claude-code ];
 in
 hlib.doCheck llm-with-context
