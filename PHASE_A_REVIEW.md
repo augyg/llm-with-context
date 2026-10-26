@@ -6,15 +6,15 @@ Generated: 2026-10-25 20:00 EDT
 
 - Branch: gs/merge-llm-with-context
 - Workspace: ~/code/llm-with-context-merge
-- Commits ahead: 42
-- HEAD: 2e14aa9 — Phase A.4 fix 5: converge newSorted test-suite (test/Main.hs)
+- Commits ahead: 43
+- HEAD: 9b28a71 — Phase A.4 fix 6: 2 coverage adds; surfaced + fixed ToolDef roundtrip bug
 
 ## Build + Test Results
 
 - Lib compiles clean on GHC 9.10 across all 43 modules
-- test-suite llm-with-context-test: 51/51 PASS
-- test-suite llm-with-context-newSorted-tests: 226/226 PASS
-- Total: 277 tests passing, 0 failures
+- test-suite llm-with-context-test: 52/52 PASS
+- test-suite llm-with-context-newSorted-tests: 227/227 PASS
+- Total: 279 tests passing, 0 failures
 
 ## Diff summary
 
