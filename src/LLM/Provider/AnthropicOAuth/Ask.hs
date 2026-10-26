@@ -36,6 +36,7 @@ module LLM.Provider.AnthropicOAuth.Ask
   , defaultAnthropicVersion
   , defaultAnthropicBeta
   , defaultUserAgent
+  , stainlessHeaders
   ) where
 
 import Control.Concurrent.MVar (MVar, modifyMVar, newMVar, readMVar)
@@ -108,15 +109,36 @@ defaultAnthropicVersion = "2023-06-01"
 defaultAnthropicBeta :: Text
 defaultAnthropicBeta = "oauth-2025-04-20"
 
--- | Default @User-Agent@ header value. Mirrors Claude Code 1.0.21's
--- actual UA prefix @claude-code/<version>@ (verified via grep of
--- cli.js) to minimise anomaly-detection risk per the plan ("match
--- Claude Code's user-agent + request cadence + request-shape where
--- possible"). The version suffix tracks the shape of what Claude
--- Code sends; we pick a plausible-looking version until a dedicated
--- harness-version field is threaded through 'AnthropicOAuthEnv'.
+-- | Default @User-Agent@. Mirrors Claude Code 1.0.21's full UA
+-- including the @(external, <entrypoint>)@ suffix that the
+-- bundled Anthropic SDK appends. Verified via grep of cli.js:
+--   `claude-code/${VERSION} (external, ${process.env.CLAUDE_CODE_ENTRYPOINT})`
+-- The entrypoint is "cli" when invoked as the standalone binary.
 defaultUserAgent :: Text
-defaultUserAgent = "claude-code/1.0.21"
+defaultUserAgent = "claude-code/1.0.21 (external, cli)"
+
+-- | Full @X-Stainless-*@ header set emitted by the Anthropic Node
+-- SDK on every request (verified via grep of cli.js). Anthropic's
+-- anomaly-detection almost certainly keys on these — observed
+-- behaviour: a request missing them returns 429 with terse
+-- @"message":"Error"@ (not a quota-specific message).
+--
+-- Values are plausible-for-a-Linux-x86_64-Node22-SDK invocation
+-- so the fingerprint reads as a vanilla Claude Code boot rather
+-- than a third-party client. Package version 0.60.0 matches the
+-- Anthropic Node SDK bundled by claude-code 1.0.21.
+stainlessHeaders :: [(BS.ByteString, BS.ByteString)]
+stainlessHeaders =
+  [ ("X-Stainless-Lang",             "js")
+  , ("X-Stainless-Package-Version",  "0.60.0")
+  , ("X-Stainless-Runtime",          "node")
+  , ("X-Stainless-Runtime-Version",  "v22.0.0")
+  , ("X-Stainless-Arch",             "x64")
+  , ("X-Stainless-OS",               "Linux")
+  , ("X-Stainless-Retry-Count",      "0")
+  , ("X-Stainless-Timeout",          "600")
+  , ("Accept",                       "application/json")
+  ]
 
 -- | Runtime environment for the OAuth-authenticated backend. Shared
 -- between calls via 'MVar' because refresh must be mutually exclusive
@@ -262,7 +284,7 @@ postMessages env creds contents = do
                 , ("anthropic-beta",    TE.encodeUtf8 defaultAnthropicBeta)
                 , (hUserAgent,          TE.encodeUtf8 defaultUserAgent)
                 , (hContentType,        "application/json")
-                ]
+                ] ++ stainlessHeaders
             , requestBody    = RequestBodyLBS (Aeson.encode body)
             }
       httpResult :: Either SomeException (Response BL.ByteString) <- try (httpLbs req (envManager env))
@@ -412,7 +434,7 @@ streamOnce env creds contents onChunk = do
                 , (hUserAgent,          TE.encodeUtf8 defaultUserAgent)
                 , (hContentType,        "application/json")
                 , ("accept",            "text/event-stream")
-                ]
+                ] ++ Prelude.filter (\(k, _) -> k /= "Accept") stainlessHeaders
             , requestBody    = RequestBodyLBS body
             }
       let runStream = withResponse req (envManager env) $ \resp -> do

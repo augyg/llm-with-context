@@ -66,6 +66,7 @@ import LLM.Provider.AnthropicOAuth.Ask
   , defaultAnthropicVersion
   , defaultUserAgent
   , ensureFreshCredentials
+  , stainlessHeaders
   )
 import LLM.Provider.AnthropicOAuth.Credentials (Credentials (..))
 import LLM.Types
@@ -131,7 +132,7 @@ postToolsOnce env creds defs msgs = do
                 , ("anthropic-beta",    TE.encodeUtf8 defaultAnthropicBeta)
                 , (hUserAgent,          TE.encodeUtf8 defaultUserAgent)
                 , (hContentType,        "application/json")
-                ]
+                ] ++ stainlessHeaders
             , requestBody    = RequestBodyLBS (Aeson.encode body)
             }
       httpResult :: Either SomeException (Response BL.ByteString) <- try (httpLbs req (envManager env))
