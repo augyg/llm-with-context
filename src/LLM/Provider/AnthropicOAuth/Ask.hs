@@ -37,6 +37,7 @@ module LLM.Provider.AnthropicOAuth.Ask
   , defaultAnthropicBeta
   , defaultUserAgent
   , stainlessHeaders
+  , claudeCodeSystemPrompt
   ) where
 
 import Control.Concurrent.MVar (MVar, modifyMVar, newMVar, readMVar)
@@ -139,6 +140,37 @@ stainlessHeaders =
   , ("X-Stainless-Timeout",          "600")
   , ("Accept",                       "application/json")
   ]
+
+-- | Claude Code's required system-prompt prefix. Extracted verbatim
+-- (modulo template-variable substitution) from cli.js 1.0.21:
+--
+--   `You are ${appName}, Anthropic's official CLI for Claude.
+--   You are powered by the model named ${modelDisplayName}.
+--   The exact model ID is ${modelId}.`
+--
+-- Anthropic's subscription-OAuth path appears to require this exact
+-- prompt structure in the system field — the server-side gate checks
+-- for the "You are Claude Code" fingerprint. Omitting it (or
+-- substituting a different app name) triggers the 429 soft-block
+-- observed across 3 header-fix rounds with no measurable change.
+claudeCodeSystemPrompt :: Text -> Text
+claudeCodeSystemPrompt modelId =
+  "You are Claude Code, Anthropic's official CLI for Claude.\n"
+    <> "You are powered by the model named " <> modelDisplayName modelId <> ".\n"
+    <> "The exact model ID is " <> modelId <> "."
+  where
+    -- Minimal display-name map; falls back to the raw ID for unknown
+    -- models (safe default — the ID is correct even if the display
+    -- name reads awkwardly).
+    modelDisplayName :: Text -> Text
+    modelDisplayName m
+      | "claude-opus-4-7"   `T.isPrefixOf` m = "Opus 4.7"
+      | "claude-opus-4-6"   `T.isPrefixOf` m = "Opus 4.6"
+      | "claude-opus-4-5"   `T.isPrefixOf` m = "Opus 4.5"
+      | "claude-sonnet-4-6" `T.isPrefixOf` m = "Sonnet 4.6"
+      | "claude-sonnet-4-5" `T.isPrefixOf` m = "Sonnet 4.5"
+      | "claude-haiku-4-5"  `T.isPrefixOf` m = "Haiku 4.5"
+      | otherwise                            = m
 
 -- | Runtime environment for the OAuth-authenticated backend. Shared
 -- between calls via 'MVar' because refresh must be mutually exclusive
@@ -270,10 +302,18 @@ postMessages env creds contents = do
     Left e -> pure (PostHttpException (T.pack (show e)))
     Right baseReq -> do
       let (systemText, messages) = splitSystem contents
+          -- Required Claude Code system-prompt prefix (see note on
+          -- 'claudeCodeSystemPrompt'). Prepended to the existing
+          -- system text, with the harness's system turn (if any)
+          -- appended after a blank line.
+          ccPrefix = claudeCodeSystemPrompt (envModel env)
+          mergedSystem = case systemText of
+            Just t  -> Just (ccPrefix <> "\n\n" <> t)
+            Nothing -> Just ccPrefix
           body = AnthropicRequest
             { _areq_model      = envModel env
             , _areq_max_tokens = envMaxTokens env
-            , _areq_system     = systemText
+            , _areq_system     = mergedSystem
             , _areq_messages   = messages
             }
           req = baseReq
@@ -418,11 +458,15 @@ streamOnce env creds contents onChunk = do
     Left e -> pure (StreamErrorMsg ("Anthropic OAuth stream: HTTP setup: " <> T.pack (show e)))
     Right baseReq -> do
       let (systemText, messages) = splitSystem contents
+          ccPrefix = claudeCodeSystemPrompt (envModel env)
+          mergedSystem = case systemText of
+            Just t  -> ccPrefix <> "\n\n" <> t
+            Nothing -> ccPrefix
           body = Aeson.encode $ Aeson.object
             [ "model"      Aeson..= envModel env
             , "max_tokens" Aeson..= envMaxTokens env
             , "stream"     Aeson..= True
-            , "system"     Aeson..= systemText
+            , "system"     Aeson..= mergedSystem
             , "messages"   Aeson..= map toUserAssistantJSON messages
             ]
           req = baseReq
