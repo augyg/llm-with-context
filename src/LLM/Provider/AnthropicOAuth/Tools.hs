@@ -36,7 +36,7 @@ module LLM.Provider.AnthropicOAuth.Tools
 import Control.Concurrent.MVar (readMVar)
 import Control.Exception (SomeException, try)
 import Control.Monad.IO.Class (MonadIO, liftIO)
-import Data.Aeson (Value, (.=))
+import Data.Aeson ((.=))
 import qualified Data.Aeson as Aeson
 import qualified Data.ByteString.Lazy as BL
 import Data.Text (Text)
