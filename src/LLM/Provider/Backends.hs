@@ -18,12 +18,17 @@ module LLM.Provider.Backends
   , mkDeepSeek
   , mkClaudeAPI
   , mkClaudeCLI
+    -- * Phase B.2 subscription-OAuth
+  , mkAnthropicOAuth
+  , OAuthLoadError (..)
   , ClaudeCliCfg (..)
   , defaultClaudeCliCfg
   ) where
 
 import LLM.Types (APIKey(..), APIProvider(..), DeepSeekModel, unAPIKey)
-import LLM.Provider (LLMAPI(..), LLMBackend(..), WebProvider(..))
+import LLM.Provider (LLMAPI(..), LLMBackend(..), LLMError(..), WebProvider(..))
+import qualified LLM.Provider.AnthropicOAuth.Ask as OAuth
+import qualified LLM.Provider.AnthropicOAuth.Credentials as OAuthC
 
 import LLM.StaticURI (staticURI)
 
@@ -96,3 +101,47 @@ mkClaudeCLI cfg modelName = LLMBackend
   { _llmBackend_name = "claude-cli/" <> modelName
   , _llmBackend_api  = APICLI (ccBin cfg) modelName (ccExtraArgs cfg)
   }
+
+-- | Re-export of 'OAuthC.LoadError' under a shorter name so callers
+-- that don't want the submodule-import noise can pattern-match on
+-- it. The constructors remain in "LLM.Provider.AnthropicOAuth.Credentials".
+type OAuthLoadError = OAuthC.LoadError
+
+-- | Phase B.2: subscription-OAuth Anthropic backend. Reads
+-- @~/.claude/.credentials.json@, authenticates with the user's
+-- @claudeAiOauth.accessToken@, refreshes on expiry / 401, and
+-- atomically rewrites the file when a refresh succeeds.
+--
+-- The returned 'LLMBackend' uses the 'APIClosure' constructor so the
+-- closure-over-env state (MVar for serialised refresh) stays local
+-- to the backend without 'LLM.Provider' needing to import the
+-- OAuth-specific modules.
+--
+-- @
+-- mgr   <- newTlsManager
+-- cPath <- defaultCredentialsPath
+-- eback <- mkAnthropicOAuth mgr cPath "claude-opus-4-7" 4096
+--            "https://api.anthropic.com"
+-- case eback of
+--   Left err  -> error ("Need `claude login` first: " <> show err)
+--   Right be  -> runLLM (mkLLMEnv be) $ askLLM [cwr User "Hello"]
+-- @
+mkAnthropicOAuth
+  :: Manager
+  -> FilePath   -- ^ credentials path (@defaultCredentialsPath@ for default)
+  -> T.Text     -- ^ model name (e.g. @"claude-opus-4-7"@)
+  -> Int        -- ^ @max_tokens@ output cap
+  -> T.Text     -- ^ Anthropic base URL (typically @"https://api.anthropic.com"@)
+  -> IO (Either OAuthLoadError LLMBackend)
+mkAnthropicOAuth mgr credPath modelName maxToks baseUrl = do
+  envRes <- OAuth.newAnthropicOAuthEnv mgr credPath modelName maxToks baseUrl
+  case envRes of
+    Left e    -> pure (Left e)
+    Right env -> pure $ Right LLMBackend
+      { _llmBackend_name = "anthropic-oauth/" <> modelName
+      , _llmBackend_api  = APIClosure $ \msgs -> do
+          r <- OAuth.askAnthropicOAuth env msgs
+          pure $ case r of
+            Left err -> Left (LLMHttpError err)
+            Right t  -> Right t
+      }

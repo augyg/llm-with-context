@@ -92,10 +92,18 @@ data LLMError
 --         fixed @-p --model M --dangerously-skip-permissions@ flags and
 --         the prompt body (e.g. @["--debug"]@). Pass @[]@ for the
 --         default invocation.
+-- APIClosure: generic closure-based backend — the ask function is
+--         supplied verbatim. Lets provider-specific modules
+--         (e.g. "LLM.Provider.AnthropicOAuth") layer themselves ABOVE
+--         'LLM.Provider' without creating an import cycle. Named
+--         distinctly from 'APIMock' because, unlike a mock, this
+--         constructor is intended for real backends that just happen
+--         to live in a module 'LLM.Provider' can't import directly.
 -- APIMock: pure function (for tests)
 data LLMAPI
   = APIWeb Manager URI T.Text T.Text (Maybe Int) WebProvider
   | APICLI FilePath T.Text [String]
+  | APIClosure ([ContentWithRole] -> IO (Either LLMError T.Text))
   | APIMock ([ContentWithRole] -> IO (Either LLMError T.Text))
 
 -- | A named LLM backend (display name + transport details).
@@ -136,6 +144,7 @@ askBackend backend msgs = case _llmBackend_api backend of
     ProviderAnthropic -> askAnthropic mgr (show url) key model msgs
     ProviderOllama    -> askOllama mgr (show url) model msgs
   APICLI exec model extraArgs -> askCLI exec model extraArgs msgs
+  APIClosure f         -> f msgs
   APIMock f            -> f msgs
 
 -- | Send messages to the configured backend and return the raw text response.

@@ -63,6 +63,13 @@ library
                       LLM.Provider.Anthropic
                       LLM.Provider.AnthropicCli
                       LLM.Provider.AnthropicHttp
+                      -- Phase B.2 subscription-OAuth backend (reads
+                      -- ~/.claude/.credentials.json, Bearer-token auth,
+                      -- refresh-on-401, atomic file rewrite).
+                      LLM.Provider.AnthropicOAuth
+                      LLM.Provider.AnthropicOAuth.Credentials
+                      LLM.Provider.AnthropicOAuth.Refresh
+                      LLM.Provider.AnthropicOAuth.Ask
                       LLM.Provider.OpenAI
                       LLM.Provider.OpenAIHttp
                       LLM.Capability

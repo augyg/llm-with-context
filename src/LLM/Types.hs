@@ -40,12 +40,17 @@ import Data.Maybe (catMaybes)
 -- pivot on this. Adding a new deployment surface = adding one constructor
 -- + the matching capability instances.
 data APIProvider
-  = AnthropicCli   -- ^ The local @claude@ binary (no API key; capability via subscription).
-  | AnthropicHttp  -- ^ @POST https://api.anthropic.com/v1/messages@.
-  | OpenAIHttp     -- ^ OpenAI chat-completions HTTP API.
-  | GoogleHttp     -- ^ Google's HTTP API (Gemini etc.).
-  | AwsBedrock     -- ^ AWS Bedrock.
-  | DeepSeekHttp   -- ^ DeepSeek HTTP API (and Ollama-hosted DeepSeek).
+  = AnthropicCli    -- ^ The local @claude@ binary (no API key; capability via subscription).
+  | AnthropicHttp   -- ^ @POST https://api.anthropic.com/v1/messages@ with @x-api-key@ auth.
+  | AnthropicOAuth  -- ^ @POST https://api.anthropic.com/v1/messages@ with Bearer @access_token@
+                    --   from @~/.claude/.credentials.json@'s @claudeAiOauth@ block — the
+                    --   subscription-OAuth path. Same inference endpoint as 'AnthropicHttp
+                    --   but auth + token-refresh logic differ (see
+                    --   "LLM.Provider.AnthropicOAuth"). Phase B.2 default for the harness.
+  | OpenAIHttp      -- ^ OpenAI chat-completions HTTP API.
+  | GoogleHttp      -- ^ Google's HTTP API (Gemini etc.).
+  | AwsBedrock      -- ^ AWS Bedrock.
+  | DeepSeekHttp    -- ^ DeepSeek HTTP API (and Ollama-hosted DeepSeek).
   deriving (Show, Eq, Generic)
 
 -- Define the APIKey type with a phantom type parameter. CLI providers
