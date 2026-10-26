@@ -47,6 +47,8 @@ import LLM.Types
 import LLM.ReadLLM (ReadLLM(..))
 import Scrappy.JSON.Value (FromJValue, fromJValue, parseJValue)
 import Scrappy.Scrape (scrapeFirst')
+import Scrappy.Types (Html)
+import Data.String (fromString)
 
 import qualified Control.Exception as CE
 import Control.Monad.IO.Class (MonadIO, liftIO)
@@ -142,10 +144,17 @@ askLLM msgs = LLMT $ do
   backend <- asks _llmEnv_backend
   liftIO $ askBackend backend msgs
 
+-- | Convert T.Text to whatever Scrappy's `Html` type synonym resolves to in
+-- the current scrappy-core version (String on some versions, Text on others).
+-- Uses `IsString`'s `fromString` so the compiler picks the right concrete form
+-- without a CPP conditional. Phase A cross-GHC compat.
+toHtml :: T.Text -> Html
+toHtml = fromString . T.unpack
+
 -- | Try to extract a JSON value from LLM output text. Scrapes through prose
 -- and code fences to find the first valid JSON object, then converts via 'FromJValue'.
 parseLLMJSON :: FromJValue a => T.Text -> Maybe a
-parseLLMJSON txt = scrapeFirst' parseJValue (T.unpack txt) >>= fromJValue
+parseLLMJSON txt = scrapeFirst' parseJValue (toHtml txt) >>= fromJValue
 
 -- | Like 'askLLM' but parses the response as JSON via scrappy-json's 'FromJValue'.
 -- Returns @Right Nothing@ when the LLM responds but no valid JSON is found.
@@ -163,7 +172,7 @@ askLLMParsec msgs = do
   result <- askLLM msgs
   pure $ case result of
     Left e -> Left e
-    Right txt -> Right $ case search (T.unpack txt) of
+    Right txt -> Right $ case search (toHtml txt) of
         Just (x:_) -> Just x
         _          -> Nothing
 
