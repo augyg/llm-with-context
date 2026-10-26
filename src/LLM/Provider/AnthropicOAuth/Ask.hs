@@ -454,7 +454,31 @@ consumeStream br onChunk = do
   accRef <- newIORef (mempty :: Text)
   outRef <- newIORef (StreamResult "")   -- overwritten by terminator
   stopRef <- newIORef False
-  let drain = do
+  let processEvents [] = pure ()
+      processEvents (e:es) = do
+        stop <- readIORef stopRef
+        if stop
+          then pure ()
+          else do
+            case e of
+              EventContentBlockDelta _ t -> do
+                modifyIORef' accRef (<> t)
+                onChunk t
+              EventMessageStop -> do
+                acc <- readIORef accRef
+                writeIORef outRef (StreamResult acc)
+                writeIORef stopRef True
+              StreamParseError why -> do
+                writeIORef outRef (StreamErrorMsg
+                  ("Anthropic OAuth stream: SSE parse error — " <> why))
+                writeIORef stopRef True
+              EventError msg -> do
+                writeIORef outRef (StreamErrorMsg
+                  ("Anthropic OAuth stream: server error event — " <> msg))
+                writeIORef stopRef True
+              _ -> pure ()
+            processEvents es
+      drain = do
         stop <- readIORef stopRef
         if stop then pure ()
         else do
@@ -472,32 +496,6 @@ consumeStream br onChunk = do
               drain
   drain
   readIORef outRef
-  where
-    processEvents [] = pure ()
-    processEvents (e:es) = do
-      stop <- readIORef stopRef
-      if stop
-        then pure ()
-        else do
-          case e of
-            EventContentBlockDelta _ t -> do
-              modifyIORef' accRef (<> t)
-              onChunk t
-            EventMessageStop -> do
-              acc <- readIORef accRef
-              writeIORef outRef (StreamResult acc)
-              writeIORef stopRef True
-            StreamParseError why -> do
-              writeIORef outRef (StreamErrorMsg
-                ("Anthropic OAuth stream: SSE parse error — " <> why))
-              writeIORef stopRef True
-            EventError msg -> do
-              writeIORef outRef (StreamErrorMsg
-                ("Anthropic OAuth stream: server error event — " <> msg))
-              writeIORef stopRef True
-            _ -> pure ()
-          processEvents es
-
 
 -- | Refresh once + retry a streaming request. Mirrors
 -- 'retryAfterRefresh' for the non-streaming path.
