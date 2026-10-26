@@ -47,6 +47,10 @@ module LLM.Provider.Anthropic
   , firstText
   , multimodalRequestBody
   , detectImageMediaType
+    -- * Tool-request helpers (exported for the OAuth-authenticated tools path)
+  , toolDefJSON
+  , richMessageJSON
+  , responseToToolTurn
   ) where
 
 import LLM.Effect.ImageInput (ImageInput)

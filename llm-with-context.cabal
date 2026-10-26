@@ -72,6 +72,8 @@ library
                       LLM.Provider.AnthropicOAuth.Ask
                       -- Phase B.3 streaming: SSE parser + driver
                       LLM.Provider.AnthropicOAuth.Stream
+                      -- Phase B.5.4 tool-use loop: Bearer-auth tools
+                      LLM.Provider.AnthropicOAuth.Tools
                       LLM.Provider.OpenAI
                       LLM.Provider.OpenAIHttp
                       LLM.Capability

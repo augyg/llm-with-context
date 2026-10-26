@@ -38,10 +38,13 @@ module LLM.Provider.AnthropicOAuth
     module LLM.Provider.AnthropicOAuth.Credentials
     -- * OAuth refresh
   , module LLM.Provider.AnthropicOAuth.Refresh
-    -- * Ask
+    -- * Ask (text + streaming)
   , module LLM.Provider.AnthropicOAuth.Ask
+    -- * Tool-use loop (Phase B.5.4)
+  , module LLM.Provider.AnthropicOAuth.Tools
   ) where
 
 import LLM.Provider.AnthropicOAuth.Credentials
 import LLM.Provider.AnthropicOAuth.Refresh
 import LLM.Provider.AnthropicOAuth.Ask
+import LLM.Provider.AnthropicOAuth.Tools
