@@ -153,17 +153,20 @@ postToolsOnce env creds defs msgs = do
           -- can decide to retry at a higher level.
           Left "Anthropic OAuth tools: 401 Unauthorized (run `claude login` + retry if persistent)"
       | otherwise =
-          case Aeson.eitherDecode bs :: Either String AnthropicErrorResponse of
+          let rawTail = T.take 400 (TE.decodeUtf8 (BL.toStrict bs))
+          in case Aeson.eitherDecode bs :: Either String AnthropicErrorResponse of
             Right errResp -> Left
               ( "Anthropic API error ("
                   <> T.pack (show code) <> " "
                   <> _aerr_type (_aerrResp_error errResp) <> "): "
                   <> _aerr_message (_aerrResp_error errResp)
+                  <> " [raw: " <> rawTail <> "]"
               )
             Left _ -> Left
               ( "Anthropic non-success status "
                   <> T.pack (show code) <> " "
                   <> TE.decodeUtf8 (statusMessage (responseStatus r))
+                  <> " [raw: " <> rawTail <> "]"
               )
       where
         code = statusCode (responseStatus r)

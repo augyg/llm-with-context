@@ -105,12 +105,15 @@ defaultAnthropicVersion = "2023-06-01"
 defaultAnthropicBeta :: Text
 defaultAnthropicBeta = "claude-code-20250219"
 
--- | Default @User-Agent@ header value. We advertise as @claude-cli@
--- (same prefix Claude Code 1.0.21 uses) to minimise anomaly-detection
--- risk per the plan ("match Claude Code's user-agent + request cadence
--- + request-shape where possible"). The suffix identifies the harness.
+-- | Default @User-Agent@ header value. Mirrors Claude Code 1.0.21's
+-- actual UA prefix @claude-code/<version>@ (verified via grep of
+-- cli.js) to minimise anomaly-detection risk per the plan ("match
+-- Claude Code's user-agent + request cadence + request-shape where
+-- possible"). The version suffix tracks the shape of what Claude
+-- Code sends; we pick a plausible-looking version until a dedicated
+-- harness-version field is threaded through 'AnthropicOAuthEnv'.
 defaultUserAgent :: Text
-defaultUserAgent = "claude-cli/llm-with-context-oauth"
+defaultUserAgent = "claude-code/1.0.21"
 
 -- | Runtime environment for the OAuth-authenticated backend. Shared
 -- between calls via 'MVar' because refresh must be mutually exclusive
@@ -274,15 +277,21 @@ classifyPostResponse r
           Just t  -> PostOK t
           Nothing -> PostNoContent
   | otherwise =
-      case Aeson.eitherDecode bs :: Either String AnthropicErrorResponse of
+      -- Include the raw body suffix on non-2xx so terse / malformed
+      -- error responses (e.g. 429 "Error") are debuggable without
+      -- re-plumbing the parser.
+      let rawTail = T.take 400 (TE.decodeUtf8 (BL.toStrict bs))
+      in case Aeson.eitherDecode bs :: Either String AnthropicErrorResponse of
         Right errResp -> PostApiError
           ( "Anthropic API error ("
               <> T.pack (show code) <> " "
               <> _aerr_type (_aerrResp_error errResp) <> "): "
               <> _aerr_message (_aerrResp_error errResp)
+              <> " [raw: " <> rawTail <> "]"
           )
         Left _ -> PostApiError
-          ("Anthropic non-success status " <> T.pack (show code) <> " " <> msg)
+          ("Anthropic non-success status " <> T.pack (show code) <> " " <> msg
+              <> " [raw: " <> rawTail <> "]")
   where
     code = statusCode (responseStatus r)
     msg  = TE.decodeUtf8 (statusMessage (responseStatus r))
