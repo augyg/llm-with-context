@@ -63,7 +63,7 @@ import Network.HTTP.Client
   , parseRequest
   , withResponse
   )
-import Network.HTTP.Types.Header (hAuthorization, hContentType, hUserAgent)
+import Network.HTTP.Types.Header (Header, hAuthorization, hContentType, hUserAgent)
 import Network.HTTP.Types.Status (statusCode, statusMessage)
 
 import LLM.Provider.Anthropic
@@ -127,7 +127,7 @@ defaultUserAgent = "claude-code/1.0.21 (external, cli)"
 -- so the fingerprint reads as a vanilla Claude Code boot rather
 -- than a third-party client. Package version 0.60.0 matches the
 -- Anthropic Node SDK bundled by claude-code 1.0.21.
-stainlessHeaders :: [(BS.ByteString, BS.ByteString)]
+stainlessHeaders :: [Header]
 stainlessHeaders =
   [ ("X-Stainless-Lang",             "js")
   , ("X-Stainless-Package-Version",  "0.60.0")
