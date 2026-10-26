@@ -1,6 +1,7 @@
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 -- | Description: Read + write Anthropic Claude Code's subscription-OAuth
 -- credentials file (@~/.claude/.credentials.json@).
