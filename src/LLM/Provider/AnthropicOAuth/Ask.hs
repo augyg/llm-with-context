@@ -65,6 +65,7 @@ import Network.HTTP.Client
   , withResponse
   )
 import Network.HTTP.Types.Header (Header, hAuthorization, hContentType, hUserAgent)
+import System.Environment (lookupEnv)
 import Network.HTTP.Types.Status (statusCode, statusMessage)
 
 import LLM.Provider.Anthropic
@@ -192,6 +193,18 @@ data AnthropicOAuthEnv = AnthropicOAuthEnv
 -- | Convenience constructor: 'loadCredentials' + build the MVar.
 -- 'Left' iff the file is missing or malformed — the caller should
 -- surface this to the user (e.g. "run `claude login` first").
+--
+-- Precedence: @CLAUDE_CODE_OAUTH_TOKEN@ env var wins over the file.
+-- When the env var is set, we synthesise a 'Credentials' with the
+-- env-var value as 'credAccessToken', an empty refresh token, and
+-- 'credExpiresAt' far in the future. 'ensureFreshCredentials' never
+-- fires in that case because the far-future expiry makes 'hasExpired'
+-- return False. This matches real @claude-code@'s own convention
+-- (same env-var name) and lets long-lived @setup-token@ tokens
+-- (@sk-ant-oat01-*@, valid 1 year) be used without touching
+-- @~/.claude/.credentials.json@ at all. The MVar IS the source of
+-- truth; the file is only a persistence layer for refresh-capable
+-- short-lived tokens.
 newAnthropicOAuthEnv
   :: Manager
   -> FilePath   -- ^ credentials path (typically 'defaultCredentialsPath')
@@ -199,11 +212,24 @@ newAnthropicOAuthEnv
   -> Int        -- ^ max_tokens
   -> Text       -- ^ base URL (typically @"https://api.anthropic.com"@)
   -> IO (Either LoadError AnthropicOAuthEnv)
-newAnthropicOAuthEnv mgr credPath model maxToks baseUrl =
-  loadCredentials credPath >>= \case
-    Left e  -> pure (Left e)
-    Right c -> do
-      mv <- newMVar c
+newAnthropicOAuthEnv mgr credPath model maxToks baseUrl = do
+  mEnvTok <- lookupEnv "CLAUDE_CODE_OAUTH_TOKEN"
+  case mEnvTok of
+    Just raw | not (null (dropWhile isSpaceChar raw)) -> do
+      let tok = T.strip (T.pack raw)
+          -- Far-future expiry: ~year 2286. Guarantees hasExpired is
+          -- False for the whole session, so refresh never fires.
+          -- Refresh would fail anyway (empty credRefreshToken), so
+          -- this is defence-in-depth, not a shortcut.
+          creds = Credentials
+            { credAccessToken      = tok
+            , credRefreshToken     = ""
+            , credExpiresAt        = 9999999999999
+            , credScopes           = ["user:inference"]
+            , credSubscriptionType = "env-var"
+            , credRateLimitTier    = "env-var"
+            }
+      mv <- newMVar creds
       pure $ Right AnthropicOAuthEnv
         { envManager          = mgr
         , envCredentialsPath  = credPath
@@ -212,6 +238,21 @@ newAnthropicOAuthEnv mgr credPath model maxToks baseUrl =
         , envMaxTokens        = maxToks
         , envAnthropicBaseUrl = baseUrl
         }
+    _ ->
+      loadCredentials credPath >>= \case
+        Left e  -> pure (Left e)
+        Right c -> do
+          mv <- newMVar c
+          pure $ Right AnthropicOAuthEnv
+            { envManager          = mgr
+            , envCredentialsPath  = credPath
+            , envCredentials      = mv
+            , envModel            = model
+            , envMaxTokens        = maxToks
+            , envAnthropicBaseUrl = baseUrl
+            }
+  where
+    isSpaceChar c = c == ' ' || c == '\t' || c == '\n' || c == '\r'
 
 -- | If the current token is within 60s of expiring, refresh it and
 -- persist to BOTH the file and the in-memory 'MVar'. Returns 'Left'
