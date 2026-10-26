@@ -83,7 +83,7 @@ data LLM (p :: APIProvider) :: Effect where
   -- observes text-only 'Ask' calls.
   AskMultimodal :: ImageInput p -> [ContentWithRole] -> LLM p m (Either T.Text T.Text)
 
-type instance DispatchOf (LLM p) = Dynamic
+type instance DispatchOf (LLM p) = 'Dynamic
 
 -- | Ask provider @p@ (pin it: @ask \@'AnthropicHttp ...@).
 ask :: forall p es. (LLM p :> es) => [ContentWithRole] -> Eff es (Either T.Text T.Text)

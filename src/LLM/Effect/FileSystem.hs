@@ -38,7 +38,7 @@ data FileSystem :: Effect where
   ReadJSONBytes           :: FilePath -> FileSystem m (Either String BL.ByteString)
   AtomicWriteBytes        :: FilePath -> BL.ByteString -> FileSystem m ()
 
-type instance DispatchOf FileSystem = Dynamic
+type instance DispatchOf FileSystem = 'Dynamic
 
 doesFileExist :: (FileSystem :> es) => FilePath -> Eff es Bool
 doesFileExist p = send (DoesFileExist p)

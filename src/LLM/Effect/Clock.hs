@@ -29,7 +29,7 @@ import Effectful.Internal.Monad (unsafeEff_)
 data Clock :: Effect where
   GetCurrentTime :: Clock m UTCTime
 
-type instance DispatchOf Clock = Dynamic
+type instance DispatchOf Clock = 'Dynamic
 
 getCurrentTime :: (Clock :> es) => Eff es UTCTime
 getCurrentTime = send GetCurrentTime

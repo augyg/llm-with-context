@@ -72,7 +72,7 @@ data MemoryGraph :: Effect where
   RecallAround :: MsgId -> Int -> MemoryGraph m T.Text
   RemoveTurn :: MsgId -> MemoryGraph m ()
 
-type instance DispatchOf MemoryGraph = Dynamic
+type instance DispatchOf MemoryGraph = 'Dynamic
 
 addTurn :: (MemoryGraph :> es) => T.Text -> Eff es MsgId
 addTurn = send . AddTurn

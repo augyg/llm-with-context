@@ -696,31 +696,31 @@ instance ReadLLM BookTitle where
   readLLM = do
     _ <- string "BookTitle"
     spaces
-    BookTitle <$> jString
+    BookTitle <$> jStringP
 
 instance ReadLLM AuthorName where
   readLLM = do
     _ <- string "AuthorName"
     spaces
-    AuthorName <$> jString
+    AuthorName <$> jStringP
 
 instance ReadLLM YearPublished where
   readLLM = do
     _ <- string "YearPublished"
     spaces
-    YearPublished <$> jInt
+    YearPublished <$> jIntP
 
 instance ReadLLM PageCount where
   readLLM = do
     _ <- string "PageCount"
     spaces
-    PageCount <$> jInt
+    PageCount <$> jIntP
 
 instance ReadLLM IsClassic where
   readLLM = do
     _ <- string "IsClassic"
     spaces
-    IsClassic <$> jBool
+    IsClassic <$> jBoolP
 
 data BookAnalysis2 = BookAnalysis2
   { _ba2_title       :: BookTitle
@@ -1681,7 +1681,7 @@ prop_readllm_unit = withTests 1 $ property $ do
 
 prop_readllm_list :: Property
 prop_readllm_list = withTests 1 $ property $ do
-  case parse (readLLM @[Int]) "" "[1, 2, 3]" of
+  case parse (readLLM @[Int]) "" ("[1, 2, 3]" :: String) of
     Right xs -> xs === [1, 2, 3]
     Left e   -> do annotate (show e); failure
 
@@ -1716,7 +1716,7 @@ instance ReadLLM Score where
     _ <- string "score"
     _ <- char '"'
     _ <- spaces >> char ':' >> spaces
-    n <- jInt
+    n <- jIntP
     _ <- spaces
     _ <- char '}'
     pure (Score n)

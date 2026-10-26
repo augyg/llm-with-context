@@ -63,7 +63,7 @@ data Lexicon :: Effect where
   Classify :: T.Text -> Lexicon m PartOfSpeech
   Lemma    :: T.Text -> Lexicon m T.Text
 
-type instance DispatchOf Lexicon = Dynamic
+type instance DispatchOf Lexicon = 'Dynamic
 
 -- | The 'PartOfSpeech' of a word.
 classify :: (Lexicon :> es) => T.Text -> Eff es PartOfSpeech

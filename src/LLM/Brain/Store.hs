@@ -136,7 +136,7 @@ data Brain :: Effect where
   -- new one. Returns the new id.
   ReplaceEntries :: [BrainId] -> BrainKey -> T.Text -> Brain m BrainId
 
-type instance DispatchOf Brain = Dynamic
+type instance DispatchOf Brain = 'Dynamic
 
 rememberKeyed :: (Brain :> es) => BrainKey -> T.Text -> Eff es BrainId
 rememberKeyed k v = send (RememberKeyed k v)

@@ -102,7 +102,7 @@ data Memory :: Effect where
   Checkpoint :: Memory m MemoryCheckpoint
   Restore :: MemoryCheckpoint -> Memory m ()
 
-type instance DispatchOf Memory = Dynamic
+type instance DispatchOf Memory = 'Dynamic
 
 -- | Recall the turns relevant to the given 'RelevantContext'.
 recall :: (Memory :> es) => RelevantContext -> Eff es ConversationHistory

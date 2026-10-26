@@ -85,7 +85,7 @@ data BrainGraph :: Effect where
   Neighbors :: NodeId -> BrainGraph m [(T.Text, NodeId)]
   RecallAround :: NodeId -> Int -> BrainGraph m T.Text
 
-type instance DispatchOf BrainGraph = Dynamic
+type instance DispatchOf BrainGraph = 'Dynamic
 
 getNode :: (BrainGraph :> es) => NodeId -> Eff es (Maybe T.Text)
 getNode = send . GetNode

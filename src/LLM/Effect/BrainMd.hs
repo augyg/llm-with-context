@@ -32,7 +32,7 @@ data BrainMd :: Effect where
   ReadBrain :: BrainMd m T.Text
   BrainAsTurn :: BrainMd m ContentWithRole
 
-type instance DispatchOf BrainMd = Dynamic
+type instance DispatchOf BrainMd = 'Dynamic
 
 -- | The current guidance text.
 readBrain :: (BrainMd :> es) => Eff es T.Text

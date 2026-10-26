@@ -148,7 +148,7 @@ data Tool :: Effect where
   Glob :: FilePath -> T.Text -> Tool m (Either T.Text [FilePath])
   Stat :: FilePath -> Tool m (Either T.Text FileStat)
 
-type instance DispatchOf Tool = Dynamic
+type instance DispatchOf Tool = 'Dynamic
 
 -- Operations -----------------------------------------------------------------
 

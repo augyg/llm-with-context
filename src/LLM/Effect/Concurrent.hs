@@ -32,7 +32,7 @@ import Effectful.Internal.Monad (unsafeEff_)
 data Atomic s :: Effect where
   WithAtomic :: (s -> m (s, a)) -> Atomic s m a
 
-type instance DispatchOf (Atomic s) = Dynamic
+type instance DispatchOf (Atomic s) = 'Dynamic
 
 -- | Atomically read-modify-write the cell. The transition runs while the
 -- underlying 'MVar' is held; other consumers block.

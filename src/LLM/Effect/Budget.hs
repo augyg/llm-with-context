@@ -94,7 +94,7 @@ data Budget :: Effect where
   PeekBudget    :: Budget m BudgetState
   ForceReset    :: Budget m ()
 
-type instance DispatchOf Budget = Dynamic
+type instance DispatchOf Budget = 'Dynamic
 
 -- | Atomically check whether @n@ tokens fit in the remaining budget; if so,
 -- debit them and return @Right ()@. If not, return @Left 'BudgetExhausted'@.
