@@ -38,9 +38,16 @@ import Scrappy.JSON.Value (FromJValue(..), JValue(..), (.:))
 import Data.Default (def)
 import Data.Either (isLeft)
 import Data.List (nub)
-import Text.Parsec (parse, string, spaces, char)
+import Text.Parsec (parse, string, spaces, char, Parsec, ParseError)
 import qualified Data.Text as T
 import System.Directory (findExecutable)
+
+-- | Parse specialised to String streams. scrappy-json's primitives
+-- (jInt / jString / ...) are now Stream-polymorphic, so a bare
+-- `parse p "" "42"` leaves the stream type ambiguous in these tests.
+-- Pin it to String here so the primitive test suite stays unchanged.
+parseS :: Parsec String () a -> String -> Either ParseError a
+parseS p = parse p ""
 
 main :: IO ()
 main = defaultMain tests
@@ -696,31 +703,31 @@ instance ReadLLM BookTitle where
   readLLM = do
     _ <- string "BookTitle"
     spaces
-    BookTitle <$> jStringP
+    BookTitle <$> jString
 
 instance ReadLLM AuthorName where
   readLLM = do
     _ <- string "AuthorName"
     spaces
-    AuthorName <$> jStringP
+    AuthorName <$> jString
 
 instance ReadLLM YearPublished where
   readLLM = do
     _ <- string "YearPublished"
     spaces
-    YearPublished <$> jIntP
+    YearPublished <$> jInt
 
 instance ReadLLM PageCount where
   readLLM = do
     _ <- string "PageCount"
     spaces
-    PageCount <$> jIntP
+    PageCount <$> jInt
 
 instance ReadLLM IsClassic where
   readLLM = do
     _ <- string "IsClassic"
     spaces
-    IsClassic <$> jBoolP
+    IsClassic <$> jBool
 
 data BookAnalysis2 = BookAnalysis2
   { _ba2_title       :: BookTitle
@@ -833,7 +840,7 @@ scrappyTests =
 
 prop_jInt_pos :: Property
 prop_jInt_pos = withTests 1 $ property $ do
-  case parse jInt "" "42" of
+  case parseS jInt "42" of
     Right n -> n === 42
     Left err -> do
       annotate $ show err
@@ -841,7 +848,7 @@ prop_jInt_pos = withTests 1 $ property $ do
 
 prop_jInt_neg :: Property
 prop_jInt_neg = withTests 1 $ property $ do
-  case parse jInt "" "-7" of
+  case parseS jInt "-7" of
     Right n -> n === (-7)
     Left err -> do
       annotate $ show err
@@ -849,7 +856,7 @@ prop_jInt_neg = withTests 1 $ property $ do
 
 prop_jInt_zero :: Property
 prop_jInt_zero = withTests 1 $ property $ do
-  case parse jInt "" "0" of
+  case parseS jInt "0" of
     Right n -> n === 0
     Left err -> do
       annotate $ show err
@@ -857,7 +864,7 @@ prop_jInt_zero = withTests 1 $ property $ do
 
 prop_jDouble_float :: Property
 prop_jDouble_float = withTests 1 $ property $ do
-  case parse jDouble "" "3.14" of
+  case parseS jDouble "3.14" of
     Right n -> do
       assert $ abs (n - 3.14) < 0.001
     Left err -> do
@@ -866,7 +873,7 @@ prop_jDouble_float = withTests 1 $ property $ do
 
 prop_jDouble_neg :: Property
 prop_jDouble_neg = withTests 1 $ property $ do
-  case parse jDouble "" "-2.5" of
+  case parseS jDouble "-2.5" of
     Right n -> do
       assert $ abs (n - (-2.5)) < 0.001
     Left err -> do
@@ -875,7 +882,7 @@ prop_jDouble_neg = withTests 1 $ property $ do
 
 prop_jBool_true :: Property
 prop_jBool_true = withTests 1 $ property $ do
-  case parse jBool "" "true" of
+  case parseS jBool "true" of
     Right b -> b === True
     Left err -> do
       annotate $ show err
@@ -883,7 +890,7 @@ prop_jBool_true = withTests 1 $ property $ do
 
 prop_jBool_false :: Property
 prop_jBool_false = withTests 1 $ property $ do
-  case parse jBool "" "false" of
+  case parseS jBool "false" of
     Right b -> b === False
     Left err -> do
       annotate $ show err
@@ -892,7 +899,7 @@ prop_jBool_false = withTests 1 $ property $ do
 -- scrappy-json's jBool is case-sensitive: "True" should fail
 prop_jBool_caseSensitive :: Property
 prop_jBool_caseSensitive = withTests 1 $ property $ do
-  case parse jBool "" "True" of
+  case parseS jBool "True" of
     Left _ -> success
     Right _ -> do
       annotate "Expected jBool to reject capitalized 'True'"
@@ -900,7 +907,7 @@ prop_jBool_caseSensitive = withTests 1 $ property $ do
 
 prop_jNull_parse :: Property
 prop_jNull_parse = withTests 1 $ property $ do
-  case parse jNull "" "null" of
+  case parseS jNull "null" of
     Right _ -> success
     Left err -> do
       annotate $ show err
@@ -908,7 +915,7 @@ prop_jNull_parse = withTests 1 $ property $ do
 
 prop_jString_simple :: Property
 prop_jString_simple = withTests 1 $ property $ do
-  case parse jString "" "\"hello\"" of
+  case parseS jString "\"hello\"" of
     Right s -> s === "hello"
     Left err -> do
       annotate $ show err
@@ -917,7 +924,7 @@ prop_jString_simple = withTests 1 $ property $ do
 -- JSON input: "a\"b" → unescaped content: a"b
 prop_jString_escQuotes :: Property
 prop_jString_escQuotes = withTests 1 $ property $ do
-  case parse jString "" "\"a\\\"b\"" of
+  case parseS jString "\"a\\\"b\"" of
     Right s -> s === "a\"b"
     Left err -> do
       annotate $ show err
@@ -926,7 +933,7 @@ prop_jString_escQuotes = withTests 1 $ property $ do
 -- JSON input: "a\\b" → unescaped content: a\b
 prop_jString_escBackslash :: Property
 prop_jString_escBackslash = withTests 1 $ property $ do
-  case parse jString "" "\"a\\\\b\"" of
+  case parseS jString "\"a\\\\b\"" of
     Right s -> s === "a\\b"
     Left err -> do
       annotate $ show err
@@ -935,7 +942,7 @@ prop_jString_escBackslash = withTests 1 $ property $ do
 -- JSON input: "line1\nline2" → unescaped content: line1<newline>line2
 prop_jString_newline :: Property
 prop_jString_newline = withTests 1 $ property $ do
-  case parse jString "" "\"line1\\nline2\"" of
+  case parseS jString "\"line1\\nline2\"" of
     Right s -> s === "line1\nline2"
     Left err -> do
       annotate $ show err
@@ -943,7 +950,7 @@ prop_jString_newline = withTests 1 $ property $ do
 
 prop_jArray_ints :: Property
 prop_jArray_ints = withTests 1 $ property $ do
-  case parse (jArray jInt) "" "[1, 2, 3]" of
+  case parseS (jArray jInt) "[1, 2, 3]" of
     Right xs -> xs === [1, 2, 3]
     Left err -> do
       annotate $ show err
@@ -951,7 +958,7 @@ prop_jArray_ints = withTests 1 $ property $ do
 
 prop_jArray_empty :: Property
 prop_jArray_empty = withTests 1 $ property $ do
-  case parse (jArray jInt) "" "[]" of
+  case parseS (jArray jInt) "[]" of
     Right xs -> xs === []
     Left err -> do
       annotate $ show err
@@ -959,7 +966,7 @@ prop_jArray_empty = withTests 1 $ property $ do
 
 prop_jArray_strings :: Property
 prop_jArray_strings = withTests 1 $ property $ do
-  case parse (jArray jString) "" "[\"a\", \"b\", \"c\"]" of
+  case parseS (jArray jString) "[\"a\", \"b\", \"c\"]" of
     Right xs -> xs === ["a", "b", "c"]
     Left err -> do
       annotate $ show err
@@ -1716,7 +1723,7 @@ instance ReadLLM Score where
     _ <- string "score"
     _ <- char '"'
     _ <- spaces >> char ':' >> spaces
-    n <- jIntP
+    n <- jInt
     _ <- spaces
     _ <- char '}'
     pure (Score n)

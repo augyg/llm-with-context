@@ -72,8 +72,10 @@ let
   scrappy-json-src = pkgs.fetchFromGitHub {
     owner = "TypifyDev";
     repo = "scrappy-json";
-    rev = "fb86f947183a376feb7e0241f0efa30fd4ad5d09";
-    sha256 = "1yfnmn1rc75ayp9jk237m8zl8svggk6m8z7sihg0in6i96zarkfg";
+    # Post-PR-#2 (Stream-polymorphic parseJValue + Record primitives) merged
+    # to master. The merge-commit rev; the PR branch rev was 35daef3.
+    rev = "30cf8bb";
+    sha256 = "1kap2gasrxrmixgzii0j3damy6iz2zxvf643ifqm6gi2k39ynw7l";
   };
   # doJailbreak: scrappy-json caps parsec <3.1.18-ish, but GHC 9.10.1 ships
   # parsec 3.1.17 (the bound is cosmetic — it builds fine on 3.1.17).

@@ -151,8 +151,81 @@ askLLM msgs = LLMT $ do
 toHtml :: T.Text -> Html
 toHtml = fromString . T.unpack
 
+-- | MERGE NOTE: this file used to carry a Stream-polymorphic reimplementation
+-- of scrappy-json's parseJValue (parseJValueP) because scrappy-json's own
+-- parseJValue was specialised to `Parsec String u JValue`. That duplication
+-- has been removed as of TypifyDev/scrappy-json#2 — scrappy-json's parseJValue
+-- is now Stream-polymorphic. The old implementation is commented out below
+-- rather than deleted so blame + the design rationale remain visible.
+{-
+parseJValueP :: (Stream s m Char) => ParsecT s u m JValue
+parseJValueP = P.try pObjectP
+           <|> P.try pArrayP
+           <|> P.try pStringP
+           <|> P.try pNumberP
+           <|> P.try pBoolP
+           <|> pNullP
+  where
+    wsP :: (Stream s m Char) => ParsecT s u m ()
+    wsP = skipMany (oneOf " \t\n\r")
+
+    pObjectP = do
+      _ <- char '{'
+      wsP
+      pairs <- pPairP `sepBy` P.try (wsP >> char ',' >> wsP)
+      wsP
+      _ <- char '}'
+      pure $ JObject pairs
+
+    pPairP = do
+      key <- jsonStringBody
+      wsP
+      _ <- char ':'
+      wsP
+      val <- parseJValueP
+      pure (key, val)
+
+    pArrayP = do
+      _ <- char '['
+      wsP
+      vals <- parseJValueP `sepBy` P.try (wsP >> char ',' >> wsP)
+      wsP
+      _ <- char ']'
+      pure $ JArray vals
+
+    pStringP = JString <$> jsonStringBody
+
+    pNumberP = JNumber <$> numStr
+      where
+        numStr = do
+          sign <- option "" (string "-")
+          int' <- jsonInt
+          frac <- option "" $ do
+            d <- char '.'
+            ds <- P.many1 digit
+            pure (d : ds)
+          ex <- option "" $ do
+            e <- oneOf "eE"
+            s <- option "" (string "+" <|> string "-")
+            ds <- P.many1 digit
+            pure (e : s ++ ds)
+          pure $ sign ++ int' ++ frac ++ ex
+        jsonInt = do
+          d <- digit
+          if d == '0'
+            then pure "0"
+            else (d :) <$> P.many digit
+
+    pBoolP = (P.try (string "true")  >> pure (JBool True))
+         <|> (string "false" >> pure (JBool False))
+
+    pNullP = string "null" >> pure JNull
+-}
+
 -- | Try to extract a JSON value from LLM output text. Scrapes through prose
 -- and code fences to find the first valid JSON object, then converts via 'FromJValue'.
+-- Uses scrappy-json's Stream-polymorphic 'parseJValue'; works regardless of
+-- which concrete type Scrappy's 'Html' resolves to in the current scrappy-core.
 parseLLMJSON :: FromJValue a => T.Text -> Maybe a
 parseLLMJSON txt = scrapeFirst' parseJValue (toHtml txt) >>= fromJValue
 
