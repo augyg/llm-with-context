@@ -49,7 +49,7 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Time.Clock (addUTCTime, getCurrentTime)
 import GHC.Generics (Generic)
-import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
+import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Network.HTTP.Client
   ( BodyReader
   , Manager
@@ -81,8 +81,7 @@ import LLM.Provider.AnthropicOAuth.Credentials
   , loadCredentials
   )
 import LLM.Provider.AnthropicOAuth.Stream
-  ( StreamBuffer
-  , StreamEvent (..)
+  ( StreamEvent (..)
   , emptyStreamBuffer
   , feedBytes
   )
