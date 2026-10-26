@@ -20,7 +20,11 @@ module LLM.Provider.Backends
   , mkClaudeCLI
     -- * Phase B.2 subscription-OAuth
   , mkAnthropicOAuth
-  , OAuthLoadError (..)
+    -- | 'OAuthLoadError' is a type alias to
+    -- 'OAuthC.LoadError' — import the constructors directly from
+    -- "LLM.Provider.AnthropicOAuth.Credentials" if you need to
+    -- pattern-match on them.
+  , OAuthLoadError
   , ClaudeCliCfg (..)
   , defaultClaudeCliCfg
   ) where
