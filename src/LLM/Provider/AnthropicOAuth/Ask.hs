@@ -1,5 +1,6 @@
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
@@ -28,6 +29,7 @@ module LLM.Provider.AnthropicOAuth.Ask
   , newAnthropicOAuthEnv
     -- * Ask
   , askAnthropicOAuth
+  , askAnthropicOAuthStream
     -- * Diagnostics
   , ensureFreshCredentials
     -- * Header constants
@@ -40,19 +42,25 @@ import Control.Concurrent.MVar (MVar, modifyMVar, newMVar, readMVar)
 import Control.Exception (SomeException, try)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import qualified Data.Aeson as Aeson
+import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BL
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Time.Clock (addUTCTime, getCurrentTime)
 import GHC.Generics (Generic)
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Network.HTTP.Client
-  ( Manager
+  ( BodyReader
+  , Manager
   , Request (..)
   , RequestBody (RequestBodyLBS)
   , Response (..)
+  , brConsume
+  , brRead
   , httpLbs
   , parseRequest
+  , withResponse
   )
 import Network.HTTP.Types.Header (hAuthorization, hContentType, hUserAgent)
 import Network.HTTP.Types.Status (statusCode, statusMessage)
@@ -72,12 +80,18 @@ import LLM.Provider.AnthropicOAuth.Credentials
   , hasExpired
   , loadCredentials
   )
+import LLM.Provider.AnthropicOAuth.Stream
+  ( StreamBuffer
+  , StreamEvent (..)
+  , emptyStreamBuffer
+  , feedBytes
+  )
 import LLM.Provider.AnthropicOAuth.Refresh
   ( RefreshError (..)
   , applyRefresh
   , refreshAccessToken
   )
-import LLM.Types (ContentWithRole)
+import LLM.Types (ContentWithRole (..), GPTRole (..))
 
 -- | Default @anthropic-version@ header value, matching Claude Code
 -- 1.0.21's @cli.js@. Changing this means telling Anthropic's server
@@ -305,3 +319,210 @@ retryAfterRefresh env contents = do
         PostApiError t      -> pure (Left t)
         PostUnauthorized    -> pure (Left
           "Anthropic OAuth: 401 Unauthorized after token refresh — refresh_token likely revoked. Run `claude login` and retry.")
+
+-- -------------------------------------------------------------------
+-- Streaming
+-- -------------------------------------------------------------------
+
+-- | Streaming variant of 'askAnthropicOAuth'. Phase B.3. Sets
+-- @stream: true@ in the request body and consumes the Server-Sent-
+-- Events response incrementally.
+--
+-- @onChunk@ fires once per @content_block_delta@ 'text_delta' with
+-- the delta text — the harness wires it to a @performEventAsync@
+-- callback so the TUI re-renders mid-response.
+--
+-- Returns 'Right' with the full accumulated response text when the
+-- stream completes normally ('EventMessageStop'). 'Left' on
+-- transport failure, non-2xx status, mid-stream @error@ event, SSE
+-- parse failure, or persistent 401 (after one refresh attempt).
+--
+-- The 401-retry logic mirrors non-streaming 'askAnthropicOAuth': on
+-- an initial 401 we refresh once + retry the whole stream request.
+-- Partial text accumulated by the first attempt is discarded (we
+-- never saw a valid first chunk — the 401 is reported on the
+-- Response status before any body is read).
+askAnthropicOAuthStream
+  :: MonadIO m
+  => AnthropicOAuthEnv
+  -> [ContentWithRole]
+  -> (Text -> IO ())      -- ^ callback per text delta
+  -> m (Either Text Text)
+askAnthropicOAuthStream env contents onChunk = liftIO $ do
+  freshness <- ensureFreshCredentials env
+  case freshness of
+    Left err -> pure (Left err)
+    Right () -> do
+      current <- readMVar (envCredentials env)
+      firstAttempt <- streamOnce env current contents onChunk
+      case firstAttempt of
+        StreamResult t      -> pure (Right t)
+        StreamUnauthorized  -> retryStreamAfterRefresh env contents onChunk
+        StreamErrorMsg err  -> pure (Left err)
+
+-- | Outcome of one streaming attempt. Distinguishes 401 (caller may
+-- refresh + retry) from other errors (final).
+data StreamOutcome
+  = StreamResult Text
+  | StreamUnauthorized
+  | StreamErrorMsg Text
+
+-- | One streaming request against the configured env + credentials.
+-- Builds the body with @stream: true@, opens an @withResponse@, and
+-- threads the response body through 'feedBytes' until the stream
+-- terminates. Pre-'EventMessageStop' bytes drive 'onChunk'; the
+-- accumulated text is the 'StreamResult'.
+streamOnce
+  :: AnthropicOAuthEnv
+  -> Credentials
+  -> [ContentWithRole]
+  -> (Text -> IO ())
+  -> IO StreamOutcome
+streamOnce env creds contents onChunk = do
+  reqResult <- try (parseRequest (T.unpack (envAnthropicBaseUrl env <> "/v1/messages")))
+    :: IO (Either SomeException Request)
+  case reqResult of
+    Left e -> pure (StreamErrorMsg ("Anthropic OAuth stream: HTTP setup: " <> T.pack (show e)))
+    Right baseReq -> do
+      let (systemText, messages) = splitSystem contents
+          body = Aeson.encode $ Aeson.object
+            [ "model"      Aeson..= envModel env
+            , "max_tokens" Aeson..= envMaxTokens env
+            , "stream"     Aeson..= True
+            , "system"     Aeson..= systemText
+            , "messages"   Aeson..= map toUserAssistantJSON messages
+            ]
+          req = baseReq
+            { method         = "POST"
+            , requestHeaders =
+                [ (hAuthorization,     "Bearer " <> TE.encodeUtf8 (credAccessToken creds))
+                , ("anthropic-version", TE.encodeUtf8 defaultAnthropicVersion)
+                , ("anthropic-beta",    TE.encodeUtf8 defaultAnthropicBeta)
+                , (hUserAgent,          TE.encodeUtf8 defaultUserAgent)
+                , (hContentType,        "application/json")
+                , ("accept",            "text/event-stream")
+                ]
+            , requestBody    = RequestBodyLBS body
+            }
+      let runStream = withResponse req (envManager env) $ \resp -> do
+            let code = statusCode (responseStatus resp)
+                br   = responseBody resp
+            if | code == 401 -> pure StreamUnauthorized
+               | code >= 200, code < 300 -> consumeStream br onChunk
+               | otherwise -> do
+                   chunks <- brConsume br
+                   let bs = BL.fromStrict (BS.concat chunks)
+                   pure $ StreamErrorMsg $ case Aeson.eitherDecode bs :: Either String AnthropicErrorResponse of
+                     Right errResp ->
+                       "Anthropic API error ("
+                         <> T.pack (show code) <> " "
+                         <> _aerr_type (_aerrResp_error errResp) <> "): "
+                         <> _aerr_message (_aerrResp_error errResp)
+                     Left _ ->
+                       "Anthropic non-success status "
+                         <> T.pack (show code) <> " "
+                         <> TE.decodeUtf8 (statusMessage (responseStatus resp))
+      try runStream >>= \case
+        Left (e :: SomeException) ->
+          pure (StreamErrorMsg ("Anthropic OAuth stream: HTTP exception: " <> T.pack (show e)))
+        Right outcome -> pure outcome
+
+-- | Render one 'ContentWithRole' as the Anthropic messages-API shape.
+-- (Mirrors what 'LLM.Provider.Anthropic' does internally; inlined
+-- here to avoid pulling in its servant request type for a single
+-- field reshape under streaming.)
+toUserAssistantJSON :: ContentWithRole -> Aeson.Value
+toUserAssistantJSON cwr =
+  let role = case _cwr_role cwr of
+        Assistant -> "assistant" :: Text
+        _         -> "user"
+  in Aeson.object
+       [ "role"    Aeson..= role
+       , "content" Aeson..= _cwr_content cwr
+       ]
+
+-- | Drain a 'BodyReader' through 'feedBytes', dispatching events to
+-- the chunk callback and the accumulator. Terminates on
+-- 'EventMessageStop' (success), 'StreamParseError' or 'EventError'
+-- (failure), or EOF without a stop (treated as success with the
+-- bytes accumulated so far — Anthropic may close the connection
+-- cleanly without a final 'message_stop' marker, though in practice
+-- it does send one).
+consumeStream :: BodyReader -> (Text -> IO ()) -> IO StreamOutcome
+consumeStream br onChunk = do
+  bufRef <- newIORef emptyStreamBuffer
+  accRef <- newIORef (mempty :: Text)
+  outRef <- newIORef (StreamResult "")   -- overwritten by terminator
+  stopRef <- newIORef False
+  let drain = do
+        stop <- readIORef stopRef
+        if stop then pure ()
+        else do
+          chunk <- brRead br
+          if BS.null chunk
+            then do
+              acc <- readIORef accRef
+              writeIORef outRef (StreamResult acc)
+              writeIORef stopRef True
+            else do
+              buf <- readIORef bufRef
+              let (buf', events) = feedBytes buf chunk
+              writeIORef bufRef buf'
+              processEvents events
+              drain
+  drain
+  readIORef outRef
+  where
+    processEvents [] = pure ()
+    processEvents (e:es) = do
+      stop <- readIORef stopRef
+      if stop
+        then pure ()
+        else do
+          case e of
+            EventContentBlockDelta _ t -> do
+              modifyIORef' accRef (<> t)
+              onChunk t
+            EventMessageStop -> do
+              acc <- readIORef accRef
+              writeIORef outRef (StreamResult acc)
+              writeIORef stopRef True
+            StreamParseError why -> do
+              writeIORef outRef (StreamErrorMsg
+                ("Anthropic OAuth stream: SSE parse error — " <> why))
+              writeIORef stopRef True
+            EventError msg -> do
+              writeIORef outRef (StreamErrorMsg
+                ("Anthropic OAuth stream: server error event — " <> msg))
+              writeIORef stopRef True
+            _ -> pure ()
+          processEvents es
+
+
+-- | Refresh once + retry a streaming request. Mirrors
+-- 'retryAfterRefresh' for the non-streaming path.
+retryStreamAfterRefresh
+  :: AnthropicOAuthEnv
+  -> [ContentWithRole]
+  -> (Text -> IO ())
+  -> IO (Either Text Text)
+retryStreamAfterRefresh env contents onChunk = do
+  now <- getCurrentTime
+  refreshRes <- modifyMVar (envCredentials env) $ \current -> do
+    res <- refreshAccessToken (envManager env) (credRefreshToken current)
+    case res of
+      Left re  -> pure (current, Left re)
+      Right tr -> do
+        let fresh = applyRefresh now current tr
+        atomicWriteCredentials (envCredentialsPath env) fresh
+        pure (fresh, Right ())
+  case refreshRes of
+    Left re  -> pure (Left ("Anthropic OAuth stream: 401 then refresh failed — " <> renderRefreshError re))
+    Right () -> do
+      fresh <- readMVar (envCredentials env)
+      retry <- streamOnce env fresh contents onChunk
+      case retry of
+        StreamResult t       -> pure (Right t)
+        StreamUnauthorized   -> pure (Left
+          "Anthropic OAuth stream: 401 Unauthorized after token refresh — refresh_token likely revoked. Run `claude login` and retry.")
+        StreamErrorMsg err   -> pure (Left err)

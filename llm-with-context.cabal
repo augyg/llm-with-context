@@ -70,6 +70,8 @@ library
                       LLM.Provider.AnthropicOAuth.Credentials
                       LLM.Provider.AnthropicOAuth.Refresh
                       LLM.Provider.AnthropicOAuth.Ask
+                      -- Phase B.3 streaming: SSE parser + driver
+                      LLM.Provider.AnthropicOAuth.Stream
                       LLM.Provider.OpenAI
                       LLM.Provider.OpenAIHttp
                       LLM.Capability
