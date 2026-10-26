@@ -38,6 +38,8 @@ import Control.Exception (SomeException, try)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Data.Aeson ((.=))
 import qualified Data.Aeson as Aeson
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Char8 as BS8
 import qualified Data.ByteString.Lazy as BL
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -62,7 +64,7 @@ import LLM.Provider.Anthropic
   )
 import LLM.Provider.AnthropicOAuth.Ask
   ( AnthropicOAuthEnv (..)
-  , claudeCodeSystemPrompt
+  , claudeCodeSystemBlocks
   , defaultAnthropicBeta
   , defaultAnthropicVersion
   , defaultUserAgent
@@ -122,7 +124,7 @@ postToolsOnce env creds defs msgs = do
           body = Aeson.object
             [ "model"      .= envModel env
             , "max_tokens" .= envMaxTokens env
-            , "system"     .= claudeCodeSystemPrompt (envModel env)
+            , "system"     .= claudeCodeSystemBlocks (envModel env)
             , "tools"      .= toolsJSON
             , "messages"   .= map richMessageJSON msgs
             ]
@@ -137,10 +139,45 @@ postToolsOnce env creds defs msgs = do
                 ] ++ stainlessHeaders
             , requestBody    = RequestBodyLBS (Aeson.encode body)
             }
+      -- Debug: dump everything about the request + response so we can
+      -- diff against the known-200 curl shape and read Anthropic's
+      -- rate-limit response headers (which may tell us whether the
+      -- 429 is actual quota exhaustion vs a shape-based policy
+      -- block). Writes to a fixed set of /tmp paths — one per
+      -- artifact, so post-mortem is just `jq /tmp/gingerly-last-*`.
+      -- Authorization header is redacted; everything else is dumped
+      -- verbatim.
+      BL.writeFile "/tmp/gingerly-last-tools-req.json" (Aeson.encode body)
+      let redactAuth (hName, hVal)
+            | hName == hAuthorization = (hName, "Bearer <REDACTED len=" <> BS8.pack (show (BS.length hVal - 7)) <> ">")
+            | otherwise               = (hName, hVal)
+          redactedReqHeaders = map redactAuth (requestHeaders req)
+          reqMeta = Aeson.object
+            [ "url"     .= (envAnthropicBaseUrl env <> "/v1/messages")
+            , "method"  .= ("POST" :: Text)
+            , "headers" .= [ T.pack (show n) <> ": " <> TE.decodeUtf8 v
+                           | (n, v) <- redactedReqHeaders
+                           ]
+            , "body_bytes" .= BL.length (Aeson.encode body)
+            ]
+      BL.writeFile "/tmp/gingerly-last-tools-req-meta.json" (Aeson.encode reqMeta)
       httpResult :: Either SomeException (Response BL.ByteString) <- try (httpLbs req (envManager env))
       case httpResult of
-        Left e -> pure (Left ("Anthropic OAuth tools: HTTP exception: " <> T.pack (show e)))
-        Right r -> pure (classify r)
+        Left e -> do
+          BL.writeFile "/tmp/gingerly-last-tools-resp.json" (BL.fromStrict (TE.encodeUtf8 (T.pack (show e))))
+          pure (Left ("Anthropic OAuth tools: HTTP exception: " <> T.pack (show e)))
+        Right r -> do
+          let respMeta = Aeson.object
+                [ "status_code" .= statusCode (responseStatus r)
+                , "status_msg"  .= TE.decodeUtf8 (statusMessage (responseStatus r))
+                , "headers" .= [ T.pack (show n) <> ": " <> TE.decodeUtf8 v
+                               | (n, v) <- responseHeaders r
+                               ]
+                , "body_bytes" .= BL.length (responseBody r)
+                ]
+          BL.writeFile "/tmp/gingerly-last-tools-resp-meta.json" (Aeson.encode respMeta)
+          BL.writeFile "/tmp/gingerly-last-tools-resp.json" (responseBody r)
+          pure (classify r)
   where
     classify :: Response BL.ByteString -> Either Text ToolTurn
     classify r

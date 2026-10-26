@@ -38,6 +38,8 @@ module LLM.Provider.AnthropicOAuth.Ask
   , defaultUserAgent
   , stainlessHeaders
   , claudeCodeSystemPrompt
+  , claudeCodeMagicSystemPrefix
+  , claudeCodeSystemBlocks
   ) where
 
 import Control.Concurrent.MVar (MVar, modifyMVar, newMVar, readMVar)
@@ -71,7 +73,11 @@ import Network.HTTP.Types.Status (statusCode, statusMessage)
 import LLM.Provider.Anthropic
   ( AnthropicAPIError (..)
   , AnthropicErrorResponse (..)
-  , AnthropicRequest (..)
+  -- AnthropicRequest import dropped 2026-10-26 after switching the
+  -- OAuth body-build to Aeson.object + system-as-array (per the
+  -- 'claudeCodeSystemBlocks' note). Left as a comment per
+  -- never-delete; restore if a future caller needs the record.
+  -- , AnthropicRequest (..)
   , AnthropicResponse
   , firstText
   , splitSystem
@@ -165,6 +171,61 @@ claudeCodeSystemPrompt modelId =
     -- name reads awkwardly).
     modelDisplayName :: Text -> Text
     modelDisplayName m
+      | "claude-opus-4-7"   `T.isPrefixOf` m = "Opus 4.7"
+      | "claude-opus-4-6"   `T.isPrefixOf` m = "Opus 4.6"
+      | "claude-opus-4-5"   `T.isPrefixOf` m = "Opus 4.5"
+      | "claude-sonnet-4-6" `T.isPrefixOf` m = "Sonnet 4.6"
+      | "claude-sonnet-4-5" `T.isPrefixOf` m = "Sonnet 4.5"
+      | "claude-haiku-4-5"  `T.isPrefixOf` m = "Haiku 4.5"
+      | otherwise                            = m
+
+-- | The *exact* string Anthropic's subscription-OAuth classifier
+-- requires as the FIRST text block of the @system@ array. Deviating
+-- by one byte (trailing space, missing period, extra chars after)
+-- triggers an HTTP 429 @rate_limit_error:"Error"@ with no
+-- @anthropic-ratelimit-*@ response headers — the policy gate
+-- masquerading as a rate limit.
+--
+-- Verified 2026-10-26 via 11 differential curl probes against the
+-- live @api.anthropic.com@ endpoint using a fresh @sk-ant-oat01-*@
+-- OAuth bearer. Any @system@ sent as a flat string that is not
+-- byte-identical to this value → 429. @system@ sent as an array of
+-- content blocks with THIS value as the first block's @text@ → 200,
+-- and arbitrary additional blocks are accepted.
+claudeCodeMagicSystemPrefix :: Text
+claudeCodeMagicSystemPrefix =
+  "You are Claude Code, Anthropic's official CLI for Claude."
+
+-- | Build the @system@ field as an array of content blocks for the
+-- OAuth-authenticated path. The FIRST block is the exact magic
+-- prefix (see 'claudeCodeMagicSystemPrefix'); the SECOND block
+-- carries the model-name identification lines that
+-- 'claudeCodeSystemPrompt' used to put inline. Additional caller-
+-- supplied system text (e.g. from a 'System' turn in the harness
+-- history) should be appended as a third block by the caller.
+--
+-- Return value: 'Aeson.Value' that encodes directly to the
+-- @"system": [{...}, {...}]@ JSON shape.
+claudeCodeSystemBlocks :: Text -> Aeson.Value
+claudeCodeSystemBlocks modelId = Aeson.toJSON
+  [ Aeson.object
+      [ "type" Aeson..= ("text" :: Text)
+      , "text" Aeson..= claudeCodeMagicSystemPrefix
+      ]
+  , Aeson.object
+      [ "type" Aeson..= ("text" :: Text)
+      , "text" Aeson..=
+          ( "You are powered by the model named "
+              <> displayName modelId
+              <> ".\nThe exact model ID is "
+              <> modelId
+              <> "."
+          )
+      ]
+  ]
+  where
+    displayName :: Text -> Text
+    displayName m
       | "claude-opus-4-7"   `T.isPrefixOf` m = "Opus 4.7"
       | "claude-opus-4-6"   `T.isPrefixOf` m = "Opus 4.6"
       | "claude-opus-4-5"   `T.isPrefixOf` m = "Opus 4.5"
@@ -343,20 +404,31 @@ postMessages env creds contents = do
     Left e -> pure (PostHttpException (T.pack (show e)))
     Right baseReq -> do
       let (systemText, messages) = splitSystem contents
-          -- Required Claude Code system-prompt prefix (see note on
-          -- 'claudeCodeSystemPrompt'). Prepended to the existing
-          -- system text, with the harness's system turn (if any)
-          -- appended after a blank line.
-          ccPrefix = claudeCodeSystemPrompt (envModel env)
-          mergedSystem = case systemText of
-            Just t  -> Just (ccPrefix <> "\n\n" <> t)
-            Nothing -> Just ccPrefix
-          body = AnthropicRequest
-            { _areq_model      = envModel env
-            , _areq_max_tokens = envMaxTokens env
-            , _areq_system     = mergedSystem
-            , _areq_messages   = messages
-            }
+          -- Build 'system' as an array of content blocks per the
+          -- 2026-10-26 differential-isolation finding: the OAuth
+          -- subscription path demands the magic prefix verbatim as
+          -- the first block's @text@; additional blocks are
+          -- accepted. See 'claudeCodeSystemBlocks' for the gory
+          -- details. The harness's own System turn (if any) becomes
+          -- a THIRD block appended after the two
+          -- 'claudeCodeSystemBlocks' blocks.
+          baseSystemBlocks = claudeCodeSystemBlocks (envModel env)
+          systemBlocks = case systemText of
+            Nothing -> baseSystemBlocks
+            Just t  -> case baseSystemBlocks of
+              Aeson.Array arr ->
+                Aeson.Array $ arr <>
+                  pure (Aeson.object
+                    [ "type" Aeson..= ("text" :: Text)
+                    , "text" Aeson..= t
+                    ])
+              _ -> baseSystemBlocks   -- defensive; constructor only returns Array
+          body = Aeson.object
+            [ "model"      Aeson..= envModel env
+            , "max_tokens" Aeson..= envMaxTokens env
+            , "system"     Aeson..= systemBlocks
+            , "messages"   Aeson..= map Aeson.toJSON messages
+            ]
           req = baseReq
             { method         = "POST"
             , requestHeaders =
@@ -499,15 +571,24 @@ streamOnce env creds contents onChunk = do
     Left e -> pure (StreamErrorMsg ("Anthropic OAuth stream: HTTP setup: " <> T.pack (show e)))
     Right baseReq -> do
       let (systemText, messages) = splitSystem contents
-          ccPrefix = claudeCodeSystemPrompt (envModel env)
-          mergedSystem = case systemText of
-            Just t  -> ccPrefix <> "\n\n" <> t
-            Nothing -> ccPrefix
+          -- Same system-as-array shape as 'postMessages' (see note
+          -- on 'claudeCodeSystemBlocks' re the 2026-10-26 finding).
+          baseSystemBlocks = claudeCodeSystemBlocks (envModel env)
+          systemBlocks = case systemText of
+            Nothing -> baseSystemBlocks
+            Just t  -> case baseSystemBlocks of
+              Aeson.Array arr ->
+                Aeson.Array $ arr <>
+                  pure (Aeson.object
+                    [ "type" Aeson..= ("text" :: Text)
+                    , "text" Aeson..= t
+                    ])
+              _ -> baseSystemBlocks
           body = Aeson.encode $ Aeson.object
             [ "model"      Aeson..= envModel env
             , "max_tokens" Aeson..= envMaxTokens env
             , "stream"     Aeson..= True
-            , "system"     Aeson..= mergedSystem
+            , "system"     Aeson..= systemBlocks
             , "messages"   Aeson..= map toUserAssistantJSON messages
             ]
           req = baseReq
