@@ -24,7 +24,7 @@ bashTool = ToolDef
   { _toolDef_name        = "bash"
   , _toolDef_description = "Run a bash shell command. Use this for file listing, searching, building, running tests, etc."
   , _toolDef_inputSchema = Data.Aeson.object
-      [ "type" .= ("Data.Aeson.object" :: T.Text)
+      [ "type" .= ("object" :: T.Text)
       , "properties" .= Data.Aeson.object
           [ "command" .= Data.Aeson.object
               [ "type"        .= ("string" :: T.Text)
@@ -41,7 +41,7 @@ editTool = ToolDef
   { _toolDef_name        = "edit"
   , _toolDef_description = "Edit a file by replacing an exact string with new text. The old_string must match exactly."
   , _toolDef_inputSchema = Data.Aeson.object
-      [ "type" .= ("Data.Aeson.object" :: T.Text)
+      [ "type" .= ("object" :: T.Text)
       , "properties" .= Data.Aeson.object
           [ "path"       .= Data.Aeson.object [ "type" .= ("string" :: T.Text), "description" .= ("Absolute or relative file path" :: T.Text) ]
           , "old_string" .= Data.Aeson.object [ "type" .= ("string" :: T.Text), "description" .= ("Exact text to find and replace" :: T.Text) ]
