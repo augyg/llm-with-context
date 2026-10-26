@@ -24,6 +24,7 @@ import LLM.ScrubPrefix (scrubPrefix)
 import LLM.LLM (getRelevantCtxDeepSeek, askWithContext, askJSONWithContext, toThoughtResponse, codeBlock, escapeText, escape, gptReturnType, tshow, mkDSPrompt, gptModel, getRelevant)
 
 -- import Control.Monad.Trans.State (evalStateT)  -- MERGE: dup of line 28
+import qualified Data.Aeson as Aeson
 import Data.Aeson (fieldLabelModifier)  -- MERGE: dedup encode/eitherDecode/toJSON/fromJSON with line 31
 import Control.Monad.Trans.Reader (runReaderT)
 import Control.Monad.Trans.State (evalStateT, execStateT)
@@ -1506,11 +1507,52 @@ prop_ctx_json = withTests 1 $ property $ do
 typeConstructionTests :: [TestTree]
 typeConstructionTests =
   [ testProperty "GPTRequestBody round-trips through JSON" prop_gptRequestBody_roundtrip
+  , testProperty "GPTRequestBody with tools+tool_choice round-trips" prop_gptRequestBody_roundtrip_withTools
   , testProperty "Tag equality" prop_tag_eq
   , testProperty "TagDS equality" prop_tagDS_eq
   , testProperty "ConvoQuery preserves fields" prop_convoQuery_fields
   , testProperty "LLMError Eq instance" prop_llmError_eq
   ]
+
+-- | Phase A merge-synthesis coverage: the new tool_use fields on GPTRequestBody
+-- (`_gptRequest_tools`, `_gptRequest_tool_choice`) are only exercised in the
+-- Nothing/Nothing shape by prop_gptRequestBody_roundtrip. This test exercises
+-- the Just shape so the ToJSON/FromJSON asymmetry can't silently regress.
+prop_gptRequestBody_roundtrip_withTools :: Property
+prop_gptRequestBody_roundtrip_withTools = withTests 1 $ property $ do
+  let td = ToolDef
+        { _toolDef_name        = "run_bash"
+        , _toolDef_description = "Execute a shell command"
+        , _toolDef_inputSchema = Aeson.object
+            [ ("type", Aeson.String "object")
+            , ("properties", Aeson.object
+                [ ("cmd", Aeson.object [("type", Aeson.String "string")]) ])
+            ]
+        }
+      body = GPTRequestBody
+        { _gptRequest_model       = "gpt-4"
+        , _gptRequest_max_tokens  = Just 500
+        , _gptRequest_messages    = [toOpenAIMessage (cwr User "run ls")]
+        , _gptRequest_tools       = Just [td]
+        , _gptRequest_tool_choice = Just "required"
+        }
+      bs = encode body
+  case eitherDecode bs of
+    Right (body' :: GPTRequestBody) -> do
+      _gptRequest_model body'       === "gpt-4"
+      _gptRequest_max_tokens body'  === Just 500
+      _gptRequest_tool_choice body' === Just "required"
+      -- Tools field is a Maybe [ToolDef]; verify the Just-with-one-tool path.
+      case _gptRequest_tools body' of
+        Just [td'] -> do
+          _toolDef_name td'        === "run_bash"
+          _toolDef_description td' === "Execute a shell command"
+        other -> do
+          annotate $ "Expected Just [one ToolDef], got " ++ show other
+          failure
+    Left e -> do
+      annotate $ "Round-trip decode failed: " ++ e
+      failure
 
 prop_gptRequestBody_roundtrip :: Property
 prop_gptRequestBody_roundtrip = withTests 1 $ property $ do

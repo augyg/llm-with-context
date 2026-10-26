@@ -395,7 +395,22 @@ instance ToJSON ToolDef where
         ]
     ]
 
-instance FromJSON ToolDef
+-- | Deserialize ToolDef from the SAME OpenAI shape ToJSON emits. Previously
+-- the default Generic FromJSON instance was derived — asymmetric with the
+-- hand-written ToJSON — so an encode/decode roundtrip failed (surfaced by
+-- prop_gptRequestBody_roundtrip_withTools in Phase A). This explicit parser
+-- mirrors the writer. Phase A test-coverage addition.
+instance FromJSON ToolDef where
+  parseJSON = withObject "ToolDef" $ \o -> do
+    (ty :: T.Text) <- o .: "type"
+    if ty /= "function"
+      then fail $ "ToolDef: expected type=\"function\", got " <> T.unpack ty
+      else do
+        fn <- o .: "function"
+        n  <- fn .: "name"
+        d  <- fn .: "description"
+        p  <- fn .: "parameters"
+        pure (ToolDef n d p)
 
 -- | A tool call the model asked for.
 data ToolUse = ToolUse

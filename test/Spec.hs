@@ -15,7 +15,7 @@ import qualified Data.Text as T
 import System.Exit (exitFailure)
 
 import Effectful (runPureEff)
-import Effectful.State.Static.Local (evalState)
+import Effectful.State.Static.Local (evalState, modify)
 
 import qualified Control.Exception as CE
 import LLM.Capability (TransportError (..), askJson, askText, askWithImages)
@@ -47,7 +47,9 @@ import Network.HTTP.Client (newManager)
 import Network.HTTP.Client.TLS (tlsManagerSettings)
 import System.Environment (lookupEnv)
 import LLM.Effect.Memory
-  ( emptyMemoryStore
+  ( MemoryStore (..)   -- expose _memoryStore_history for amendLastSkipsSummary
+  , amendLast
+  , emptyMemoryStore
   , pin
   , prune
   , recallAll
@@ -80,8 +82,7 @@ import LLM.Types
   ( APIProvider (..)
   , ContentWithRole (..)
   , ConvoAnswer (..)
-  -- , ConvoEntry (..)   -- MERGE SYNTHESIS step 4: imported but unused in the current test file; kept commented in case future tests need ConvoExchange/ConvoSummary pattern-matching
-
+  , ConvoEntry (..)   -- MERGE SYNTHESIS step 4: ConvoExchange / ConvoSummary wrappers; needed by amendLastSkipsSummary test
   , ConvoQuery (..)
   , ConvoQuestion (..)
   , GPTRole (User)
@@ -162,6 +163,8 @@ main = do
   let checks =
         [ ("memory: remember/recallAll round-trip", memCount == 2)
         , ("memory: pinned turn survives prune", pinnedTags == ["keep"])
+        , ("memory: amendLast skips ConvoSummary, rewrites first ConvoExchange's answer"
+          , fst amendLastSkipsSummary && snd amendLastSkipsSummary == "amended-answer")
         , ("effect: context loop records each turn", ctxTurns == 2)
         , ("tool: runCommand with pure handlers", toolStdout == "ls")
         , ("sandbox: jail accepts relative, rejects absolute + ..", jailOk)
@@ -235,6 +238,36 @@ pinnedTags = runPureEff . evalState emptyMemoryStore . runMemoryState $ do
   remember (ConvoQuery (Tag "t2") (ConvoQuestion []) (ConvoAnswer "y"))
   prune 0
   map (unTag . entryTag) <$> recallAll
+
+-- | amendLast must skip over ConvoSummary entries at the head of history and
+-- rewrite the ANSWER of the first ConvoExchange it finds, preserving the
+-- summary in place. Introduced in Phase A step-4 merge-synthesis
+-- (LLM.Effect.Memory.runMemoryState's amendLast' walker) and previously
+-- UNCOVERED — adding this test here so a future regression (e.g. rewriting
+-- the walker to amend the summary itself, or to stop at the first summary)
+-- is caught in CI. Confidence 95% this behavior was uncovered before.
+--
+-- Returns (summaryTagStillPresent, firstExchangeAnswer).
+amendLastSkipsSummary :: (Bool, Text)
+amendLastSkipsSummary = runPureEff . evalState emptyMemoryStore . runMemoryState $ do
+  -- Setup: two exchanges, then a summary at the TOP of history. amendLast
+  -- should walk past the summary and rewrite the newest exchange below it.
+  remember (ConvoQuery (Tag "older") (ConvoQuestion []) (ConvoAnswer "older-answer"))
+  remember (ConvoQuery (Tag "newer") (ConvoQuestion []) (ConvoAnswer "stale"))
+  -- Inject a ConvoSummary at the head directly, since there is no public
+  -- "noteSummary" effect — this mirrors what compaction would produce.
+  modify (\ms -> ms { _memoryStore_history =
+                        ConvoSummary (Tag "compact-summary") "compacted-text"
+                          : _memoryStore_history ms })
+  amendLast "amended-answer"
+  hist <- recallAll
+  let summaryPreserved = case hist of
+        (ConvoSummary _ _ : _) -> True
+        _                      -> False
+      amendedAnswer = case hist of
+        (_ : ConvoExchange (ConvoQuery _ _ (ConvoAnswer a)) : _) -> a
+        _ -> "<no-exchange-found>"
+  pure (summaryPreserved, amendedAnswer)
 
 -- Two context-aware asks against the mock provider should leave two turns in
 -- memory. Fully pure: mock LLM + Memory + State, run with runPureEff.
