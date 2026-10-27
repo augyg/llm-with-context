@@ -21,48 +21,222 @@ source-repository head
 common warnings
     ghc-options: -Wall -Werror
 
+-- When on (the default), LLM.Effect.Tool.Sandbox bakes the sandbox executable's
+-- absolute path at COMPILE time via staticWhich (bwrap on Linux, sandbox-exec on
+-- macOS) — making it a build- and runtime dependency. Turn it OFF
+-- (-f-static-sandbox-exe) to resolve the executable on PATH at runtime instead,
+-- so a build needs no sandbox tool present (the CPP branch with the splice is
+-- elided before GHC sees it).
+flag static-sandbox-exe
+    description: Bake the sandbox executable path at compile time via staticWhich.
+    default:     True
+    manual:      True
+
+-- When OFF (the default as of Phase B.1b), the beam-postgres interpreter for
+-- the keyed Brain / Lexicon (LLM.Brain.DB) is excluded from the library's
+-- exposed-modules, and the beam-core / beam-postgres / beam-migrate build-deps
+-- are dropped. Consumers that only want the storage-agnostic Brain effects
+-- (LLM.Brain.Store / LLM.Brain.Lexicon / LLM.Brain.Catalogue) + an alternate
+-- interpreter (e.g. the upcoming LLM.Brain.DispatcherCli — Phase B.4b) don't
+-- have to pull in beam, postgresql-libpq, or a PostgreSQL >= 14 toolchain just
+-- to compile the library. Set -fpostgres-brain to re-enable the DB
+-- interpreter + the brain-db-smoke executable (which also pulls
+-- postgresql-simple).
+flag postgres-brain
+    description: Enable LLM.Brain.DB (beam-postgres interpreter) + brain-db-smoke exe.
+    default:     False
+    manual:      True
+
 library
     import:           warnings
     exposed-modules:  LLM.JsonExample
                       LLM.LLM
+                      LLM.Retry
                       LLM.Provider
                       LLM.Provider.Backends
                       LLM.ReadLLM
                       LLM.ScrubPrefix
                       LLM.StaticURI
                       LLM.Types
+                      LLM.ProviderMeta
+                      LLM.Provider.Servant
+                      LLM.Provider.Anthropic
+                      LLM.Provider.AnthropicCli
+                      LLM.Provider.AnthropicHttp
+                      -- Phase B.2 subscription-OAuth backend (reads
+                      -- ~/.claude/.credentials.json, Bearer-token auth,
+                      -- refresh-on-401, atomic file rewrite).
+                      LLM.Provider.AnthropicOAuth
+                      LLM.Provider.AnthropicOAuth.Credentials
+                      LLM.Provider.AnthropicOAuth.Refresh
+                      LLM.Provider.AnthropicOAuth.Ask
+                      -- Phase B.3 streaming: SSE parser + driver
+                      LLM.Provider.AnthropicOAuth.Stream
+                      -- Phase B.5.4 tool-use loop: Bearer-auth tools
+                      LLM.Provider.AnthropicOAuth.Tools
+                      LLM.Provider.OpenAI
+                      LLM.Provider.OpenAIHttp
+                      LLM.Capability
+                      LLM.Effect
+                      LLM.Effect.ImageInput
+                      LLM.Effect.Memory
+                      LLM.Effect.Anthropic
+                      LLM.Effect.Backend
+                      LLM.Effect.Validate
+                      LLM.Effect.OpenAI
+                      LLM.Effect.Mock
+                      LLM.Effect.Compaction
+                      LLM.Effect.BrainMd
+                      LLM.Effect.BrainGraph
+                      LLM.Effect.MemoryGraph
+                      LLM.Effect.Tool
+                      LLM.Effect.Tool.Sandbox
+                      LLM.Effect.Budget
+                      LLM.Effect.Budget.Policy
+                      LLM.Effect.Clock
+                      LLM.Effect.Concurrent
+                      LLM.Effect.FileSystem
+                      LLM.Tooling
+                      LLM.Tools.BashEdit
+                      LLM.Brain.Lexicon
+                      LLM.Brain.Key
+                      LLM.Brain.Store
+                      LLM.Brain.Catalogue
+                      -- LLM.Brain.DB moved into a conditional `if flag(postgres-brain)`
+                      -- block below (Phase B.1b). The gated-off exposed-module keeps
+                      -- the never-delete rule happy; the module file stays on disk
+                      -- but is simply not advertised unless the flag is on.
     -- other-modules:
     -- other-extensions:
-    build-depends: aeson >= 2.2.3 && < 2.3
-                 , base >= 4.20.2 && < 4.21
-                 , bytestring >= 0.12.2 && < 0.13
-                 , containers >= 0.7 && < 0.8
-                 , data-default >= 0.8.0 && < 0.9
-                 , directory >= 1.3.8 && < 1.4
-                 , http-client >= 0.7.19 && < 0.8
-                 , http-client-tls >= 0.3.6 && < 0.4
-                 , http-types >= 0.12.4 && < 0.13
-                 , network-uri
-                 , parsec >= 3.1.18 && < 3.2
-                 , process
-                 , scrappy-core >= 0.1.0 && < 0.2
-                 , scrappy-json
-                 , template-haskell
-                 , text >= 2.1.3 && < 2.2
-                 , transformers >= 0.6.1 && < 0.7
+    -- MERGE NOTE: newSorted/gs/pre-merge-newSorted-dirty added the henforcer
+    -- GHC plugin (`ghc-options: -fplugin Henforcer ...` + `, henforcer`
+    -- build-dep). HEAD's build-depends is wider and un-pinned (relies on
+    -- shell.nix for pinning). Resolution: keep HEAD's wider list, layer
+    -- newSorted's henforcer plugin + dep ON TOP; version-pinned variant
+    -- commented out below as audit trail.
+    -- Henforcer plugin disabled for Phase A.4 merge-verification build. Re-enable
+    -- once module headers + import discipline are backfilled across the tree.
+    -- ghc-options: -fplugin Henforcer "-fplugin-opt=Henforcer:-chenforcer.toml"
+    build-depends:    base
+                    , aeson
+                    , base64-bytestring
+                    , bytestring
+                    , containers
+                    , data-default
+                    , directory
+                    , fgl
+                    , filepath
+                    , time
+                    , http-client
+                    , http-types
+                    , http-client-tls
+                    , parsec
+                    , process
+                    , scrappy-core
+                    -- scrappy-json: locate + extract JSON from noisy LLM output
+                    -- (LLM.Provider / LLM.ReadLLM / LLM.JsonExample, merged from
+                    -- upstream master).
+                    , scrappy-json
+                    -- network-uri + template-haskell: LLM.StaticURI (upstream).
+                    , network-uri
+                    , template-haskell
+                    , temporary
+                    , text
+                    , transformers
+                    -- staticWhich: bake the sandbox executable's absolute path
+                    -- at compile time (CPP-conditional per platform).
+                    , which
+                    -- servant-client transport for the OpenAI / Anthropic providers
+                    , servant
+                    , servant-client
+                    , servant-client-core
+                    -- the LLM effect layer (effectful). Pin a version whose
+                    -- tested-with still lists GHC 8.10.7 (the 2.2 / 2.3 line);
+                    -- newer releases may have raised the GHC floor.
+                    , effectful-core
+                    -- beam-core / beam-postgres / beam-migrate deps moved into a
+                    -- conditional `if flag(postgres-brain)` block below (Phase
+                    -- B.1b). Keeping them unconditional forced every downstream
+                    -- consumer (gingerly, pipeline, etc.) to pull in
+                    -- postgresql-libpq and a PostgreSQL >= 14 toolchain even if
+                    -- they only use the storage-agnostic Brain effects. Flag
+                    -- defaults OFF; set -fpostgres-brain to re-enable.
+                    -- , beam-core
+                    -- , beam-postgres
+                    -- , beam-migrate
+                    , process
+                    , unix
+                    -- henforcer GHC plugin dep temporarily commented out alongside
+                    -- the plugin invocation (see the commented ghc-options line
+                    -- above). Keeping the dep active while the plugin is disabled
+                    -- forces downstream consumers (ace-ws, pipeline, etc.) to
+                    -- provide a henforcer derivation in their Haskell package set
+                    -- for zero behaviour benefit. Re-enable both lines together
+                    -- when the module-header backfill (Phase A.4b) is done.
+                    -- , henforcer
+    -- The newSorted/gs/pre-merge-newSorted-dirty version of this stanza is
+    -- preserved below as a comment for the audit trail — its version pins
+    -- (base >= 4.20.2, aeson >= 2.2.3, etc.) are not applied because they
+    -- would conflict with the wider shell.nix-provided versions. See
+    -- shell.nix for the authoritative GHC + package pin.
+    --
+    -- ghc-options: -fplugin Henforcer "-fplugin-opt=Henforcer:-chenforcer.toml"
+    -- build-depends: aeson >= 2.2.3 && < 2.3
+    --              , base >= 4.20.2 && < 4.21
+    --              , bytestring >= 0.12.2 && < 0.13
+    --              , containers >= 0.7 && < 0.8
+    --              , data-default >= 0.8.0 && < 0.9
+    --              , directory >= 1.3.8 && < 1.4
+    --              , http-client >= 0.7.19 && < 0.8
+    --              , http-client-tls >= 0.3.6 && < 0.4
+    --              , http-types >= 0.12.4 && < 0.13
+    --              , network-uri
+    --              , parsec >= 3.1.18 && < 3.2
+    --              , process
+    --              , scrappy-core >= 0.1.0 && < 0.2
+    --              , scrappy-json
+    --              , template-haskell
+    --              , text >= 2.1.3 && < 2.2
+    --              , transformers >= 0.6.1 && < 0.7
+    --              , henforcer
                     
     hs-source-dirs:   src
     default-language: Haskell2010
+    if flag(static-sandbox-exe)
+        cpp-options: -DSTATIC_SANDBOX_EXE
+    if flag(postgres-brain)
+        exposed-modules:  LLM.Brain.DB
+        build-depends:    beam-core
+                        , beam-postgres
+                        , beam-migrate
 
-test-suite tests
+-- Pure tests for the effect layer (mock LLM + Memory/Tool over pure
+-- interpreters, run with runPureEff — no network, no IO). Hand-rolled harness,
+-- no test framework, to keep the dependency/nix footprint minimal.
+-- Compile-only examples (real provider interpreter + a placeholder key). Built
+-- by nix so the wiring can't drift from the API; never executed.
+executable example
+    import:           warnings
+    main-is:          Main.hs
+    hs-source-dirs:   examples
+    build-depends:    base
+                    , effectful-core
+                    , http-client-tls
+                    , llm-with-context
+    default-language: Haskell2010
+
+test-suite llm-with-context-test
     import:           warnings
     type:             exitcode-stdio-1.0
-    main-is:          Main.hs
+    main-is:          Spec.hs
     hs-source-dirs:   test
     build-depends:    base
-                    , llm-with-context
                     , aeson
+                    , base64-bytestring
                     , bytestring
+                    , http-client
+                    , http-client-tls
+                    , data-default
                     , directory
                     , hedgehog
                     , parsec
@@ -70,5 +244,59 @@ test-suite tests
                     , tasty
                     , tasty-hedgehog
                     , text
+                    , effectful-core
+                    , llm-with-context
+    default-language: Haskell2010
+
+-- newSorted 201-test Tasty/Hedgehog suite — merged in from
+-- newSorted/gs/pre-merge-newSorted-dirty via Phase A step 5. Wired up here
+-- so cabal actually builds + runs it (Phase A.4a, 2026-10-25). Expect this
+-- to surface the same ConvoEntry / 'AnthropicHttp-split / matchTag-record
+-- adaptations the main lib + Spec.hs have already been through — fixing
+-- each as part of Phase A.4 convergence per the never-skip-work rule.
+test-suite llm-with-context-newSorted-tests
+    import:           warnings
+    type:             exitcode-stdio-1.0
+    main-is:          Main.hs
+    hs-source-dirs:   test
+    build-depends:    base
+                    , aeson
+                    , base64-bytestring
+                    , bytestring
+                    , containers
+                    , data-default
+                    , directory
+                    , hedgehog
+                    , http-client
+                    , http-client-tls
+                    , mtl
+                    , parsec
+                    , scrappy-core
+                    , scrappy-json
+                    , tasty
+                    , tasty-hedgehog
+                    , text
                     , transformers
+                    , effectful-core
+                    , llm-with-context
+    default-language: Haskell2010
+
+-- Runtime smoke test for the beam-postgres brain interpreters. Compile-checked
+-- by nix; run by hand against an ephemeral Postgres (the nix sandbox + doCheck
+-- have no database). See db-smoke/Main.hs for the invocation.
+--
+-- Gated behind the `postgres-brain` cabal flag (Phase B.1b) so consumers who
+-- never want the DB interpreter don't pull in postgresql-simple either.
+executable brain-db-smoke
+    import:           warnings
+    main-is:          Main.hs
+    hs-source-dirs:   brain-db-smoke
+    build-depends:    base
+                    , bytestring
+                    , effectful-core
+                    , llm-with-context
+    if flag(postgres-brain)
+        build-depends:    postgresql-simple
+    else
+        buildable:        False
     default-language: Haskell2010

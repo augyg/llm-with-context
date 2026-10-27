@@ -1,0 +1,863 @@
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TypeApplications #-}
+
+-- | Pure tests for the effect layer. Everything here runs via 'runPureEff' —
+-- no network, no IO — by interpreting the LLM effect with the mock backend and
+-- Memory/Tool over their pure interpreters. Dependency-light on purpose (just
+-- base/text/effectful-core/the lib): a hand-rolled harness, no test framework.
+module Main (main) where
+
+import Control.Monad (forM_, unless)
+import Data.Text (Text)
+import qualified Data.Text as T
+import System.Exit (exitFailure)
+
+import Effectful (runPureEff)
+import Effectful.State.Static.Local (evalState, modify)
+
+import qualified Control.Exception as CE
+import LLM.Capability (TransportError (..), askJson, askText, askWithImages)
+import LLM.Effect (askMultimodal, askWithContext)
+import LLM.Provider.AnthropicCli
+  ( AskArgs (..)
+  , askArgs
+  , defaultAskArgs
+  , multimodalAskArgs
+  , readPreamble
+  )
+-- Importing these brings the real HTTP capability instances into scope
+-- so the shape / smoke tests can typecheck. The modules themselves
+-- export nothing other than their instances.
+import LLM.Provider.AnthropicHttp ()
+import LLM.Provider.OpenAIHttp ()
+import qualified LLM.Provider.Anthropic as A
+import qualified LLM.Provider.OpenAI as O
+import LLM.Effect.Anthropic (runLLMAnthropic)
+import LLM.Effect.OpenAI (runLLMOpenAI)
+import LLM.Types (APIKey (..))
+import qualified Data.Aeson as Aeson
+import qualified Data.Aeson.Types as Aeson (Parser, parseEither, parseMaybe)
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Base64 as B64
+import qualified Data.ByteString.Lazy as LBS
+import qualified Data.Text.Encoding as TE
+import Network.HTTP.Client (newManager)
+import Network.HTTP.Client.TLS (tlsManagerSettings)
+import System.Environment (lookupEnv)
+import LLM.Effect.Memory
+  ( MemoryStore (..)   -- expose _memoryStore_history for amendLastSkipsSummary
+  , amendLast
+  , emptyMemoryStore
+  , pin
+  , prune
+  , recallAll
+  , remember
+  , runMemoryState
+  )
+import Data.IORef (newIORef, readIORef)
+import LLM.Effect.Mock (runLLMMock, runLLMMockRecording)
+import Effectful (runEff)
+import LLM.Effect.Tool
+  ( ShellCommand (..)
+  , ToolHandlers (..)
+  , ToolResult (..)
+  , defaultRunOptions
+  , defaultToolHandlers
+  , renderShellCommand
+  , runCommand
+  , runToolWith
+  )
+import LLM.Effect.Tool.Sandbox
+  ( bubblewrapArgv
+  , defaultBWrapConfig
+  , defaultSbExecConfig
+  , jail
+  , sandboxExecProfile
+  , shellCommandPaths
+  )
+import Data.List (isInfixOf)
+import LLM.Types
+  ( APIProvider (..)
+  , ContentWithRole (..)
+  , ConvoAnswer (..)
+  , ConvoEntry (..)   -- MERGE SYNTHESIS step 4: ConvoExchange / ConvoSummary wrappers; needed by amendLastSkipsSummary test
+  , ConvoQuery (..)
+  , ConvoQuestion (..)
+  , GPTRole (User)
+  , RelevantContext (..)
+  , Tag (..)
+  , cwr
+  , entryTag          -- MERGE SYNTHESIS step 4: tag accessor across ConvoEntry
+  )
+
+import LLM.Brain.Lexicon (PartOfSpeech (..), classifyRules, lemmatize, runLexiconRules)
+import LLM.Brain.Key (BrainKey (..), canonicalKey, keyOf)
+import LLM.Brain.Store
+  ( BrainEntry (..)
+  , allEntries
+  , collisions
+  , compactConcat
+  , defaultEffort
+  , defaultWeights
+  , emptyBrain
+  , getEntry
+  , linkEntries
+  , recallByKey
+  , rememberKeyed
+  , runBrainState
+  )
+-- import qualified Data.Text as T  -- MERGE: unused in test file post-ConvoEntry rewrite
+import LLM.Brain.Catalogue
+  ( BrainAnswer (..)
+  , askWithBrain
+  , catalogue
+  , keyForPrompt
+  , recallFocused
+  , renderRecalled
+  )
+
+main :: IO ()
+main = do
+  -- The HTTP capability instances now delegate via 'send (Ask ...)' to
+  -- the active LLM interpreter. Pointing them at the mock backend
+  -- routes the prompt through and returns the canned response — no
+  -- network, no throw.
+  let anthropicProbe :: Either TransportError Text
+      anthropicProbe = runPureEff
+        . evalState emptyMemoryStore
+        . runMemoryState
+        . runLLMMock @'AnthropicHttp (\_ -> Right "ok-anthropic")
+        $ askText @'AnthropicHttp "x"
+      openAIProbe    :: Either TransportError Text
+      openAIProbe    = runPureEff
+        . evalState emptyMemoryStore
+        . runMemoryState
+        . runLLMMock @'OpenAIHttp (\_ -> Right "ok-openai")
+        $ askText @'OpenAIHttp "x"
+      -- Left-bubble probes: configure the mock to return Left and
+      -- confirm the capability surfaces the failure as Left without
+      -- throwing. Pinned per-class.
+      anthropicTextLeft :: Either TransportError Text
+      anthropicTextLeft = runPureEff
+        . evalState emptyMemoryStore
+        . runMemoryState
+        . runLLMMock @'AnthropicCli (\_ -> Left "boom-text")
+        $ askText @'AnthropicCli "x"
+      anthropicImgLeft :: Either TransportError Text
+      anthropicImgLeft = runPureEff
+        . evalState emptyMemoryStore
+        . runMemoryState
+        . runLLMMock @'AnthropicCli (\_ -> Left "boom-img")
+        $ askWithImages @'AnthropicCli ["/img/x.png"] "x"
+      anthropicJsonLeft :: Either TransportError Text
+      anthropicJsonLeft = runPureEff
+        . evalState emptyMemoryStore
+        . runMemoryState
+        . runLLMMock @'AnthropicCli (\_ -> Left "boom-json")
+        $ askJson @'AnthropicCli "{}" "x"
+  liveSmokeChecks <- runLiveSmokeChecks
+  recordingAskCapturesPrompt   <- recordingAskTest
+  recordingMultimodalCapturesText <- recordingMultimodalTest
+  let checks =
+        [ ("memory: remember/recallAll round-trip", memCount == 2)
+        , ("memory: pinned turn survives prune", pinnedTags == ["keep"])
+        , ("memory: amendLast skips ConvoSummary, rewrites first ConvoExchange's answer"
+          , fst amendLastSkipsSummary && snd amendLastSkipsSummary == "amended-answer")
+        , ("effect: context loop records each turn", ctxTurns == 2)
+        , ("tool: runCommand with pure handlers", toolStdout == "ls")
+        , ("sandbox: jail accepts relative, rejects absolute + ..", jailOk)
+        , ("sandbox: shellCommandPaths extracts the path", shellCommandPaths (Grep "x" "sub/dir" False False) == ["sub/dir"])
+        , ("sandbox: bwrap argv binds root + ro-binds store + runs exe", bwrapArgvOk)
+        , ("sandbox: sandbox-exec profile confines writes to root", sbProfileOk)
+        , ("anthropic-cli: readPreamble [] is empty", readPreamble [] == "")
+        , ("anthropic-cli: readPreamble [p] uses Read tool wording"
+          , readPreamble ["/img/a.png"] == "Read the image file at /img/a.png using your Read tool.\n\n")
+        , ("anthropic-cli: readPreamble [p1,p2] enumerates as bullets", multiPreambleOk)
+        , ("anthropic-cli: askArgs emits --add-dir=DIR (equals-bound)", addDirEqualsBound)
+        , ("anthropic-cli: askArgs prepends -p and skip-perms", argvFrontMatter)
+        , ("anthropic-http: askText routes through interpreter (mock)", anthropicProbe == Right "ok-anthropic")
+        , ("openai-http: askText routes through interpreter (mock)", openAIProbe == Right "ok-openai")
+        , ("anthropic-cli: askText returns Left on transport failure (no error/throw)"
+          , anthropicTextLeft == Left (TransportError "boom-text"))
+        , ("anthropic-cli: askWithImages returns Left on transport failure (no error/throw)"
+          , anthropicImgLeft == Left (TransportError "boom-img"))
+        , ("anthropic-cli: askJson returns Left on transport failure (no error/throw)"
+          , anthropicJsonLeft == Left (TransportError "boom-json"))
+        , ("anthropic-http: detectImageMediaType identifies PNG magic", A.detectImageMediaType pngMagic == "image/png")
+        , ("anthropic-http: detectImageMediaType identifies JPEG magic", A.detectImageMediaType jpegMagic == "image/jpeg")
+        , ("anthropic-http: detectImageMediaType defaults to PNG on unknown bytes", A.detectImageMediaType "????" == "image/png")
+        , ("anthropic-http: multimodal body has model/max_tokens/messages", anthropicBodyShapeOk)
+        , ("anthropic-http: multimodal body base64-encodes image bytes", anthropicBodyBase64Ok)
+        , ("anthropic-http: multimodal body places text block AFTER image blocks", anthropicBodyOrderOk)
+        , ("openai-http: multimodal body has model/max_tokens/messages", openaiBodyShapeOk)
+        , ("openai-http: multimodal body carries image_url parts", openaiBodyImageUrlOk)
+        , ("openai-http: multimodal body places text part AFTER image parts", openaiBodyOrderOk)
+        , ("anthropic-http: 1x1 PNG fixture decodes to bytes starting with PNG magic", onePixelPngIsPng)
+        , ("anthropic-cli: multimodalAskArgs binds --add-dir per unique parent dir", multimodalArgsDirsOk)
+        , ("anthropic-cli: multimodalAskArgs prepends Read-tool preamble to prompt", multimodalArgsPreambleOk)
+        , ("effect: AskMultimodal routes through Mock backend's responder", askMultimodalRoutesOk)
+        , ("mock-recording: Ask is recorded with original contents", recordingAskCapturesPrompt)
+        , ("mock-recording: AskMultimodal records text turns (no image carrier)", recordingMultimodalCapturesText)
+        , ("anthropic-cli: askJson prepends schema header to user prompt", askJsonCliPromptShapeOk)
+        , ("anthropic-cli: askJson happy-path returns canned JSON verbatim", askJsonCliHappyPathOk)
+        , ("anthropic-cli: askJson surfaces malformed response unchanged (no in-instance retry)", askJsonCliMalformedBubblesOk)
+        , ("anthropic-http: askJson prepends schema header to user prompt", askJsonAnthropicHttpPromptShapeOk)
+        , ("openai-http: askJson prepends schema header to user prompt", askJsonOpenAIHttpPromptShapeOk)
+        , ("brain/lexicon: inflections collapse to one lemma", lemmaConsistency)
+        , ("brain/lexicon: POS buckets (noise / noun / adjective)", posBuckets)
+        , ("brain/key: keyOf buckets nouns vs verbs, drops noise", keyBucketsOk)
+        , ("brain/recall: ranks by weighted overlap, excludes non-matches", recallRankingOk)
+        , ("brain/recall: spreading activation reaches a linked entry", spreadRecallOk)
+        , ("brain/compact: identical-key entries merge (Concat)", collisionMergeOk)
+        , ("brain/catalogue: mock write path keys via the Lexicon", catalogueKeyOk)
+        , ("brain/focused: keyForPrompt extracts a focused key via the LLM", keyForPromptOk)
+        , ("brain/focused: recallFocused recalls the keyed entry", recallFocusedOk)
+        , ("brain/render: renderRecalled joins values, empty for none", renderRecalledOk)
+        , ("brain/inject: askWithBrain injects recalled context + reports it", askWithBrainOk)
+        ]
+        <> liveSmokeChecks
+  forM_ checks $ \(name, ok) ->
+    putStrLn $ (if ok then "PASS  " else "FAIL  ") <> name
+  unless (all snd checks) exitFailure
+
+-- Two remembered turns should both be recallable.
+memCount :: Int
+memCount = runPureEff . evalState emptyMemoryStore . runMemoryState $ do
+  remember (ConvoQuery (Tag "a") (ConvoQuestion []) (ConvoAnswer "first"))
+  remember (ConvoQuery (Tag "b") (ConvoQuestion []) (ConvoAnswer "second"))
+  length <$> recallAll
+
+-- prune 0 drops everything unpinned; the pinned turn must remain.
+pinnedTags :: [Text]
+pinnedTags = runPureEff . evalState emptyMemoryStore . runMemoryState $ do
+  remember (ConvoQuery (Tag "keep") (ConvoQuestion []) (ConvoAnswer "x"))
+  pin (Tag "keep")
+  remember (ConvoQuery (Tag "t1") (ConvoQuestion []) (ConvoAnswer "y"))
+  remember (ConvoQuery (Tag "t2") (ConvoQuestion []) (ConvoAnswer "y"))
+  prune 0
+  map (unTag . entryTag) <$> recallAll
+
+-- | amendLast must skip over ConvoSummary entries at the head of history and
+-- rewrite the ANSWER of the first ConvoExchange it finds, preserving the
+-- summary in place. Introduced in Phase A step-4 merge-synthesis
+-- (LLM.Effect.Memory.runMemoryState's amendLast' walker) and previously
+-- UNCOVERED — adding this test here so a future regression (e.g. rewriting
+-- the walker to amend the summary itself, or to stop at the first summary)
+-- is caught in CI. Confidence 95% this behavior was uncovered before.
+--
+-- Returns (summaryTagStillPresent, firstExchangeAnswer).
+amendLastSkipsSummary :: (Bool, Text)
+amendLastSkipsSummary = runPureEff . evalState emptyMemoryStore . runMemoryState $ do
+  -- Setup: two exchanges, then a summary at the TOP of history. amendLast
+  -- should walk past the summary and rewrite the newest exchange below it.
+  remember (ConvoQuery (Tag "older") (ConvoQuestion []) (ConvoAnswer "older-answer"))
+  remember (ConvoQuery (Tag "newer") (ConvoQuestion []) (ConvoAnswer "stale"))
+  -- Inject a ConvoSummary at the head directly, since there is no public
+  -- "noteSummary" effect — this mirrors what compaction would produce.
+  modify (\ms -> ms { _memoryStore_history =
+                        ConvoSummary (Tag "compact-summary") "compacted-text"
+                          : _memoryStore_history ms })
+  amendLast "amended-answer"
+  hist <- recallAll
+  let summaryPreserved = case hist of
+        (ConvoSummary _ _ : _) -> True
+        _                      -> False
+      amendedAnswer = case hist of
+        (_ : ConvoExchange (ConvoQuery _ _ (ConvoAnswer a)) : _) -> a
+        _ -> "<no-exchange-found>"
+  pure (summaryPreserved, amendedAnswer)
+
+-- Two context-aware asks against the mock provider should leave two turns in
+-- memory. Fully pure: mock LLM + Memory + State, run with runPureEff.
+ctxTurns :: Int
+ctxTurns =
+  runPureEff
+    . evalState emptyMemoryStore
+    . runMemoryState
+    . runLLMMock @'AnthropicHttp (\_ -> Right "ok")
+    $ do
+        _ <- askWithContext @'AnthropicHttp (LastN 10) (Tag "q1", ConvoQuestion [cwr User "hi"])
+        _ <- askWithContext @'AnthropicHttp (LastN 10) (Tag "q2", ConvoQuestion [cwr User "again"])
+        length <$> recallAll
+
+-- A custom (pure) Tool backend: stdout is just the rendered command name.
+-- Uses defaultToolHandlers so only the one handler we exercise is overridden.
+toolStdout :: Text
+toolStdout = runPureEff . runToolWith handlers $ do
+  result <- runCommand (Ls "." True False)
+  pure (_toolResult_stdout result)
+  where
+    handlers =
+      defaultToolHandlers
+        { _toolHandlers_runCommand = \_opts cmd -> pure (ToolResult 0 (fst (renderShellCommand cmd)) "")
+        }
+
+-- Sandbox path jail: relative paths pass (rebased under root); absolute paths
+-- and '..' traversal are rejected.
+jailOk :: Bool
+jailOk =
+  jail "/root" "sub/file.txt" == Right "/root/sub/file.txt"
+    && isLeft (jail "/root" "/etc/passwd")
+    && isLeft (jail "/root" "../escape")
+  where
+    isLeft = either (const True) (const False)
+
+-- The bwrap argv must bind the sandbox root at the project mount, ro-bind the
+-- configured store path, and end by invoking the rendered command.
+bwrapArgvOk :: Bool
+bwrapArgvOk =
+  all (`elem` argv) ["--bind", "/srv/root", "/project", "--ro-bind", "/nix/store", "--chdir", "ls"]
+  where
+    argv = bubblewrapArgv defaultBWrapConfig "/srv/root" "/tmp/box" "/usr/bin:/bin"
+             defaultRunOptions (renderShellCommand (Ls "." True False))
+
+-- The generated Seatbelt profile must confine writes to the root and (with the
+-- default config) deny network.
+sbProfileOk :: Bool
+sbProfileOk =
+  ("(allow file-write* (subpath \"/srv/root\"))" `isInfixOf` profile)
+    && not ("(allow network*)" `isInfixOf` profile)
+  where
+    profile = sandboxExecProfile defaultSbExecConfig "/srv/root"
+
+-- A two-path preamble must enumerate the paths as a bullet list inside the
+-- "Read the following image files" header.
+multiPreambleOk :: Bool
+multiPreambleOk =
+  let p = readPreamble ["/a/x.png", "/a/y.png"]
+  in "Read the following image files" `T.isInfixOf` p
+       && "  - /a/x.png" `T.isInfixOf` p
+       && "  - /a/y.png" `T.isInfixOf` p
+  where
+    -- shadowed import to keep this self-contained without changing the
+    -- top of the file
+    _shadow = ()
+
+-- Two-path askArgs must emit BOTH --add-dir flags in the equals-bound form
+-- ("--add-dir=DIR"), never as separate "--add-dir" "DIR" tokens, because the
+-- CLI's argparse otherwise greedily consumes the following positional prompt.
+addDirEqualsBound :: Bool
+addDirEqualsBound =
+  let a   = (defaultAskArgs "hello") { aAddDirs = ["/srv/a", "/srv/b"] }
+      av  = askArgs a
+  in    "--add-dir=/srv/a" `elem` av
+     && "--add-dir=/srv/b" `elem` av
+     && "--add-dir" `notElem` av  -- bare form must not appear
+     && last av == "hello"        -- prompt is last positional
+
+-- The default args must put -p and --dangerously-skip-permissions in front of
+-- the prompt body.
+argvFrontMatter :: Bool
+argvFrontMatter =
+  let av = askArgs (defaultAskArgs "hello")
+  in take 2 av == ["-p", "--dangerously-skip-permissions"]
+       && last av == "hello"
+
+-- Two-image multimodal: --add-dir must appear once per unique parent dir
+-- (equals-bound), in the same order as nub-deduped takeDirectory.
+multimodalArgsDirsOk :: Bool
+multimodalArgsDirsOk =
+  let a   = multimodalAskArgs ["/srv/a/1.png", "/srv/a/2.png", "/srv/b/3.png"] [cwr User "go"]
+      av  = askArgs a
+  in    "--add-dir=/srv/a" `elem` av
+     && "--add-dir=/srv/b" `elem` av
+     && length (filter (== "--add-dir=/srv/a") av) == 1
+     && aAddDirs a == ["/srv/a", "/srv/b"]
+
+-- The constructed prompt body must lead with the Read-tool preamble and
+-- carry the flattened user contents after it.
+multimodalArgsPreambleOk :: Bool
+multimodalArgsPreambleOk =
+  let a = multimodalAskArgs ["/img/x.png"] [cwr User "describe please"]
+  in    "Read the image file at /img/x.png using your Read tool." `T.isInfixOf` aPrompt a
+     && "describe please" `T.isInfixOf` aPrompt a
+
+-- Routing 'askMultimodal' through the Mock interpreter must reach the
+-- responder with the text contents intact (the image carrier is dropped
+-- by the mock, by design — the assertion is on the text path).
+askMultimodalRoutesOk :: Bool
+askMultimodalRoutesOk =
+  let result = runPureEff
+        . evalState emptyMemoryStore
+        . runMemoryState
+        . runLLMMock @'AnthropicCli (\contents ->
+            if any (\c -> "frame.png" `T.isInfixOf` _cwr_content c) contents
+              then Right "saw-frame"
+              else Right "no-frame")
+        $ askMultimodal @'AnthropicCli ["/img/frame.png"] [cwr User "frame.png is the image"]
+  in result == Right "saw-frame"
+
+-- Recording variant: an 'Ask' against the recording mock must append
+-- the exact prompt contents to the sink, and the canned responder's
+-- text must still come back to the caller.
+recordingAskTest :: IO Bool
+recordingAskTest = do
+  sink <- newIORef []
+  let promptText = "what is the capital of France?"
+  answer <-
+    runEff
+      . evalState emptyMemoryStore
+      . runMemoryState
+      . runLLMMockRecording @'AnthropicCli sink (\_ -> Right "Paris")
+      $ askText @'AnthropicCli promptText
+  recorded <- reverse <$> readIORef sink
+  pure $ answer == Right "Paris"
+       && length recorded == 1
+       && case recorded of
+            (cs:_) -> any (\c -> _cwr_content c == promptText) cs
+            []     -> False
+
+-- Recording + multimodal: image carrier is dropped (matches
+-- 'runLLMMock' behaviour), text turns ARE recorded.
+recordingMultimodalTest :: IO Bool
+recordingMultimodalTest = do
+  sink <- newIORef []
+  let userText = "describe this frame"
+  result <-
+    runEff
+      . evalState emptyMemoryStore
+      . runMemoryState
+      . runLLMMockRecording @'AnthropicCli sink (\_ -> Right "a cat")
+      $ askMultimodal @'AnthropicCli ["/img/frame.png"] [cwr User userText]
+  recorded <- reverse <$> readIORef sink
+  pure $ result == Right "a cat"
+       && length recorded == 1
+       && case recorded of
+            (cs:_) -> any (\c -> _cwr_content c == userText) cs
+            []     -> False
+
+-- =========================================================================
+-- HTTP multimodal request-body shape tests (pure, no network).
+-- =========================================================================
+
+-- Standard PNG file signature (8-byte magic).
+pngMagic :: BS.ByteString
+pngMagic = BS.pack [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
+
+-- Standard JPEG SOI + APP0/APP1 marker prefix.
+jpegMagic :: BS.ByteString
+jpegMagic = BS.pack [0xFF, 0xD8, 0xFF, 0xE0]
+
+-- Minimal valid 1x1 PNG — round-trip test: base64-decoding then encoding
+-- the bytes should equal the original base64.
+onePixelPng :: BS.ByteString
+onePixelPng =
+  let b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNgAAIAAAUAAarVyFEAAAAASUVORK5CYII="
+  in case B64.decode (TE.encodeUtf8 b64) of
+       Right bs -> bs
+       Left e   -> error ("test: cannot decode onePixelPng base64: " <> e)
+
+-- The decoded bytes must start with the PNG magic.
+onePixelPngIsPng :: Bool
+onePixelPngIsPng = BS.take 8 onePixelPng == pngMagic
+
+-- Anthropic body has the three required top-level keys.
+anthropicBodyShapeOk :: Bool
+anthropicBodyShapeOk =
+  let v = A.multimodalRequestBody "claude-test" 1024 [pngMagic] "hi"
+  in case Aeson.parseEither (Aeson.withObject "body" $ \o -> do
+                                _ <- o Aeson..: "model"      :: Aeson.Parser Text
+                                _ <- o Aeson..: "max_tokens" :: Aeson.Parser Int
+                                _ <- o Aeson..: "messages"   :: Aeson.Parser Aeson.Value
+                                pure ()) v of
+       Right () -> True
+       Left _   -> False
+
+-- Anthropic body base64-encodes the bytes inside source.data.
+anthropicBodyBase64Ok :: Bool
+anthropicBodyBase64Ok =
+  let v = A.multimodalRequestBody "claude-test" 1024 [pngMagic] "hi"
+      expectedB64 = TE.decodeUtf8 (B64.encode pngMagic)
+      -- Drill: body.messages[0].content[0].source.data
+      dataField = Aeson.parseMaybe (Aeson.withObject "body" $ \o -> do
+        msgs    <- o Aeson..: "messages"
+        case (msgs :: [Aeson.Value]) of
+          (m:_) -> flip (Aeson.withObject "msg") m $ \mo -> do
+            cs <- mo Aeson..: "content"
+            case (cs :: [Aeson.Value]) of
+              (c:_) -> flip (Aeson.withObject "block") c $ \bo -> do
+                src <- bo Aeson..: "source"
+                Aeson.withObject "src" (\so -> so Aeson..: "data") src
+              [] -> fail "no content"
+          [] -> fail "no msgs") v
+  in dataField == Just expectedB64
+
+-- The text block must come AFTER the image blocks (model attention order).
+anthropicBodyOrderOk :: Bool
+anthropicBodyOrderOk =
+  let v = A.multimodalRequestBody "claude-test" 1024 [pngMagic] "the-prompt"
+      typeList = Aeson.parseMaybe (Aeson.withObject "body" $ \o -> do
+        msgs <- o Aeson..: "messages"
+        case (msgs :: [Aeson.Value]) of
+          (m:_) -> flip (Aeson.withObject "msg") m $ \mo -> do
+            cs <- mo Aeson..: "content"
+            traverse (Aeson.withObject "block" (\bo -> bo Aeson..: "type")) (cs :: [Aeson.Value])
+          [] -> fail "no msgs") v
+  in typeList == Just ["image", "text" :: Text]
+
+-- OpenAI body has the three required top-level keys.
+openaiBodyShapeOk :: Bool
+openaiBodyShapeOk =
+  let v = O.multimodalRequestBody "gpt-4o-test" 1024 ["https://x/y.png"] "hi"
+  in case Aeson.parseEither (Aeson.withObject "body" $ \o -> do
+                                _ <- o Aeson..: "model"      :: Aeson.Parser Text
+                                _ <- o Aeson..: "max_tokens" :: Aeson.Parser Int
+                                _ <- o Aeson..: "messages"   :: Aeson.Parser Aeson.Value
+                                pure ()) v of
+       Right () -> True
+       Left _   -> False
+
+-- The image part must be image_url.url == the supplied URL.
+openaiBodyImageUrlOk :: Bool
+openaiBodyImageUrlOk =
+  let url = "https://example.com/x.png"
+      v = O.multimodalRequestBody "gpt-4o-test" 1024 [url] "hi"
+      gotUrl = Aeson.parseMaybe (Aeson.withObject "body" $ \o -> do
+        msgs <- o Aeson..: "messages"
+        case (msgs :: [Aeson.Value]) of
+          (m:_) -> flip (Aeson.withObject "msg") m $ \mo -> do
+            cs <- mo Aeson..: "content"
+            case (cs :: [Aeson.Value]) of
+              (c:_) -> flip (Aeson.withObject "part") c $ \po -> do
+                iu <- po Aeson..: "image_url"
+                Aeson.withObject "iu" (\io -> io Aeson..: "url") iu
+              [] -> fail "no content"
+          [] -> fail "no msgs") v
+  in gotUrl == Just url
+
+-- Text part after image part.
+openaiBodyOrderOk :: Bool
+openaiBodyOrderOk =
+  let v = O.multimodalRequestBody "gpt-4o-test" 1024 ["https://x/y.png"] "hi"
+      typeList = Aeson.parseMaybe (Aeson.withObject "body" $ \o -> do
+        msgs <- o Aeson..: "messages"
+        case (msgs :: [Aeson.Value]) of
+          (m:_) -> flip (Aeson.withObject "msg") m $ \mo -> do
+            cs <- mo Aeson..: "content"
+            traverse (Aeson.withObject "part" (\po -> po Aeson..: "type")) (cs :: [Aeson.Value])
+          [] -> fail "no msgs") v
+  in typeList == Just ["image_url", "text" :: Text]
+
+-- silence "unused" warnings for Aeson.encode / LBS in case we change strategy
+_unusedHandle :: LBS.ByteString
+_unusedHandle = Aeson.encode (Aeson.Null :: Aeson.Value)
+
+-- =========================================================================
+-- Live-API smoke tests, GATED on ANTHROPIC_API_KEY / OPENAI_API_KEY.
+-- If the env var is absent the check is reported as a no-op pass so CI
+-- never breaks on a missing key.
+-- =========================================================================
+
+runLiveSmokeChecks :: IO [(String, Bool)]
+runLiveSmokeChecks = do
+  anthropicCheck <- runAnthropicLive
+  openaiCheck    <- runOpenAILive
+  pure [anthropicCheck, openaiCheck]
+
+runAnthropicLive :: IO (String, Bool)
+runAnthropicLive = do
+  mk <- lookupEnv "ANTHROPIC_API_KEY"
+  case mk of
+    Nothing -> pure ("anthropic-http live smoke: SKIPPED (ANTHROPIC_API_KEY unset)", True)
+    Just k -> do
+      mgr <- newManager tlsManagerSettings
+      let cfg = A.defaultClaudeConfig (APIKey (T.pack k)) mgr
+      ok <- CE.try (runEff
+                      . evalState emptyMemoryStore
+                      . runMemoryState
+                      . runLLMAnthropic cfg
+                      $ askText @'AnthropicHttp "Reply with exactly the word: YES")
+              :: IO (Either CE.SomeException (Either TransportError Text))
+      case ok of
+        Right (Right t) -> pure ("anthropic-http live smoke: round-trip OK (got " <> T.unpack (T.take 60 t) <> ")", "YES" `T.isInfixOf` t)
+        Right (Left te) -> pure ("anthropic-http live smoke: transport-Left (" <> T.unpack (unTransportError te) <> ")", False)
+        Left e          -> pure ("anthropic-http live smoke: FAILED (" <> take 200 (show e) <> ")", False)
+
+runOpenAILive :: IO (String, Bool)
+runOpenAILive = do
+  mk <- lookupEnv "OPENAI_API_KEY"
+  case mk of
+    Nothing -> pure ("openai-http live smoke: SKIPPED (OPENAI_API_KEY unset)", True)
+    Just k -> do
+      mgr <- newManager tlsManagerSettings
+      let cfg = O.defaultGPTConfig (APIKey (T.pack k)) mgr
+      ok <- CE.try (runEff
+                      . evalState emptyMemoryStore
+                      . runMemoryState
+                      . runLLMOpenAI cfg
+                      $ askText @'OpenAIHttp "Reply with exactly the word: YES")
+              :: IO (Either CE.SomeException (Either TransportError Text))
+      case ok of
+        Right (Right t) -> pure ("openai-http live smoke: round-trip OK (got " <> T.unpack (T.take 60 t) <> ")", "YES" `T.isInfixOf` t)
+        Right (Left te) -> pure ("openai-http live smoke: transport-Left (" <> T.unpack (unTransportError te) <> ")", False)
+        Left e          -> pure ("openai-http live smoke: FAILED (" <> take 200 (show e) <> ")", False)
+
+-- =========================================================================
+-- CanJsonOutput tests.
+--
+-- The class returns RAW response text — parsing is the consumer's
+-- problem (honest-API rule: parse errors bubble up at the call site,
+-- never swallowed inside the instance, no in-instance retry). These
+-- tests pin three properties per provider:
+--   1. The instance compiles + dispatches through the LLM effect.
+--   2. The schema + a "Respond with ONLY a JSON object..." header are
+--      visibly prepended to the user prompt the interpreter receives.
+--   3. A malformed response (e.g. "not json at all") bubbles up
+--      VERBATIM as the instance's return value — there's no retry, no
+--      empty-string substitution, no implicit parsing inside the
+--      instance.
+-- =========================================================================
+
+-- Shared example schema string. Mirrors the shape 'LLM.JsonExample'
+-- would emit for a Generic-deriving record.
+exampleSchema :: String
+exampleSchema = "{\"title\": \"...\", \"score\": N}"
+
+-- The user prompt the consumer sends, distinct from the schema and
+-- from the response text so we can assert on each independently.
+exampleUserPrompt :: Text
+exampleUserPrompt = "rate the title of this clip"
+
+-- Helper: run askJson against the AnthropicCli provider with a
+-- responder that inspects what the interpreter actually saw and lets
+-- us assert on it.
+runCliJson
+  :: ([ContentWithRole] -> Either Text Text) -> Either TransportError Text
+runCliJson respond = runPureEff
+  . evalState emptyMemoryStore
+  . runMemoryState
+  . runLLMMock @'AnthropicCli respond
+  $ askJson @'AnthropicCli exampleSchema exampleUserPrompt
+
+-- The prompt the interpreter receives must carry the schema header,
+-- the schema text itself, and the original user prompt.
+askJsonCliPromptShapeOk :: Bool
+askJsonCliPromptShapeOk =
+  let result = runCliJson $ \contents ->
+        let seen = T.concat (map _cwr_content contents)
+            hasHeader = "Respond with ONLY a JSON object" `T.isInfixOf` seen
+            hasSchema = T.pack exampleSchema `T.isInfixOf` seen
+            hasUser   = exampleUserPrompt `T.isInfixOf` seen
+        in if hasHeader && hasSchema && hasUser
+             then Right "{\"title\": \"ok\", \"score\": 7}"
+             else Left ("did not see all parts; saw=" <> seen)
+  in result == Right "{\"title\": \"ok\", \"score\": 7}"
+
+-- Happy path: a well-formed JSON response comes back unchanged.
+askJsonCliHappyPathOk :: Bool
+askJsonCliHappyPathOk =
+  let canned = "{\"title\": \"hello\", \"score\": 42}"
+      result = runCliJson (\_ -> Right (T.pack canned))
+  in result == Right (T.pack canned)
+
+-- Malformed response bubbles up VERBATIM through the instance. The
+-- honest-API contract is that the instance does NOT parse, does NOT
+-- retry, does NOT substitute a default — whatever the transport
+-- produced reaches the consumer untouched, and the consumer's parser
+-- decides what to do with it.
+askJsonCliMalformedBubblesOk :: Bool
+askJsonCliMalformedBubblesOk =
+  let garbage = "not json at all, just prose"
+      result = runCliJson (\_ -> Right (T.pack garbage))
+      -- Negative checks: nothing in the response was silently
+      -- normalised, replaced with a default, or stripped.
+  in case result of
+       Right t -> t == T.pack garbage
+                && not (T.null t)
+                && not ("null" `T.isInfixOf` t && T.length t <= 4)
+       Left _  -> False
+
+-- Symmetric prompt-shape test for the AnthropicHttp provider.
+askJsonAnthropicHttpPromptShapeOk :: Bool
+askJsonAnthropicHttpPromptShapeOk =
+  let result = runPureEff
+        . evalState emptyMemoryStore
+        . runMemoryState
+        . runLLMMock @'AnthropicHttp (\contents ->
+            let seen = T.concat (map _cwr_content contents)
+            in if "Respond with ONLY a JSON object" `T.isInfixOf` seen
+                  && T.pack exampleSchema `T.isInfixOf` seen
+                  && exampleUserPrompt `T.isInfixOf` seen
+                 then Right "{}"
+                 else Left "missing parts")
+        $ askJson @'AnthropicHttp exampleSchema exampleUserPrompt
+  in result == Right "{}"
+
+-- Symmetric prompt-shape test for the OpenAIHttp provider.
+askJsonOpenAIHttpPromptShapeOk :: Bool
+askJsonOpenAIHttpPromptShapeOk =
+  let result = runPureEff
+        . evalState emptyMemoryStore
+        . runMemoryState
+        . runLLMMock @'OpenAIHttp (\contents ->
+            let seen = T.concat (map _cwr_content contents)
+            in if "Respond with ONLY a JSON object" `T.isInfixOf` seen
+                  && T.pack exampleSchema `T.isInfixOf` seen
+                  && exampleUserPrompt `T.isInfixOf` seen
+                 then Right "{}"
+                 else Left "missing parts")
+        $ askJson @'OpenAIHttp exampleSchema exampleUserPrompt
+  in result == Right "{}"
+
+-- Brain: keyed-memory system -------------------------------------------------
+
+-- Inflections must collapse to the same lemma (this is what lets a written
+-- "scrape" match a read "scraping"), while doubling vs e-restoration is kept
+-- distinct (hopping/hoping).
+lemmaConsistency :: Bool
+lemmaConsistency =
+  lemmatize "scraping" == lemmatize "scrape"
+    && lemmatize "running" == "run"
+    && lemmatize "studies" == lemmatize "study"
+    && lemmatize "queries" == "query"
+    && lemmatize "hopping" /= lemmatize "hoping"
+
+-- Closed-class words are noise; suffix morphology recovers noun/adjective.
+posBuckets :: Bool
+posBuckets =
+  classifyRules "the" == OtherNoise
+    && classifyRules "happiness" == Noun
+    && classifyRules "beautiful" == Adjective
+
+-- keyOf splits a sentence into noun/verb buckets and drops function words.
+keyBuckets :: BrainKey
+keyBuckets = runPureEff . runLexiconRules $ keyOf "barking dogs chase the cat"
+
+keyBucketsOk :: Bool
+keyBucketsOk =
+  "bark" `elem` bkVerbs keyBuckets
+    && "dog" `elem` bkNouns keyBuckets
+    && "cat" `elem` bkNouns keyBuckets
+    && "the" `notElem` (bkNouns keyBuckets ++ bkVerbs keyBuckets)
+
+-- Recall ranks by weighted overlap: a perfect noun match (A) beats a partial
+-- one (C); a non-overlapping entry (B) is not a candidate at all.
+recallRanking :: [Text]
+recallRanking = runPureEff . evalState emptyBrain . runBrainState defaultWeights $ do
+  _ <- rememberKeyed (canonicalKey ["scrape", "bot"] [] []) "A"
+  _ <- rememberKeyed (canonicalKey ["effect", "memory"] [] []) "B"
+  _ <- rememberKeyed (canonicalKey ["scrape", "proxy"] [] []) "C"
+  map beValue <$> recallByKey (canonicalKey ["scrape", "bot"] [] []) defaultEffort
+
+recallRankingOk :: Bool
+recallRankingOk = recallRanking == ["A", "C"]
+
+-- Spreading activation: a linked entry is recalled even with a disjoint key.
+spreadRecall :: [Text]
+spreadRecall = runPureEff . evalState emptyBrain . runBrainState defaultWeights $ do
+  a <- rememberKeyed (canonicalKey ["alpha"] [] []) "A"
+  b <- rememberKeyed (canonicalKey ["zzz"] [] []) "B"
+  linkEntries a "see" b
+  map beValue <$> recallByKey (canonicalKey ["alpha"] [] []) defaultEffort
+
+spreadRecallOk :: Bool
+spreadRecallOk = spreadRecall == ["A", "B"]
+
+-- Two entries with an identical canonical key are one collision group, and
+-- compactConcat fuses their values into a single entry.
+collisionMerge :: (Int, Int, [Text])
+collisionMerge = runPureEff . evalState emptyBrain . runBrainState defaultWeights $ do
+  _ <- rememberKeyed (canonicalKey ["dog"] [] []) "v1"
+  _ <- rememberKeyed (canonicalKey ["dog"] [] []) "v2"
+  before <- length <$> collisions
+  merged <- compactConcat
+  vals <- map beValue <$> allEntries
+  pure (before, merged, vals)
+
+collisionMergeOk :: Bool
+collisionMergeOk = collisionMerge == (1, 1, ["v1\n\nv2"])
+
+-- Catalogue (write path) via the mock LLM: the model's raw terms are lemmatised
+-- through the same Lexicon the read path uses and stored as a canonical key
+-- (scrapers -> scraper, bots -> bot).
+catalogueKey :: Maybe BrainKey
+catalogueKey =
+  runPureEff
+    . evalState emptyMemoryStore
+    . runMemoryState
+    . evalState emptyBrain
+    . runBrainState defaultWeights
+    . runLexiconRules
+    . runLLMMock @'AnthropicHttp (const (Right cannedJson))
+    $ do
+        res <- catalogue @'AnthropicHttp "the scrapers detect bots"
+        case res of
+          Left _  -> pure Nothing
+          Right i -> fmap (fmap beKey) (getEntry i)
+  where
+    cannedJson =
+      "{\"nouns\":[\"scrapers\",\"bots\"],\"verbs\":[\"detect\"],\"adjectives\":[],\"value\":\"## note\"}"
+
+catalogueKeyOk :: Bool
+catalogueKeyOk = catalogueKey == Just (canonicalKey ["scraper", "bot"] ["detect"] [])
+
+-- Focused read path: an LLM pre-call (mocked) extracts just the salient
+-- keyword + POS for "tell me about butterflies", canonicalised through the same
+-- Lexicon as everything else.
+focusedKeyJson :: Text
+focusedKeyJson = "{\"nouns\":[\"butterflies\"],\"verbs\":[],\"adjectives\":[]}"
+
+keyForPromptKey :: Maybe BrainKey
+keyForPromptKey =
+  runPureEff
+    . evalState emptyMemoryStore
+    . runMemoryState
+    . runLexiconRules
+    . runLLMMock @'AnthropicHttp (const (Right focusedKeyJson))
+    $ do
+        e <- keyForPrompt @'AnthropicHttp "tell me about butterflies"
+        pure (either (const Nothing) Just e)
+
+keyForPromptOk :: Bool
+keyForPromptOk = keyForPromptKey == Just (canonicalKey [lemmatize "butterflies"] [] [])
+
+-- recallFocused: the focused key then recalls the entry stored under it.
+recallFocusedVals :: [Text]
+recallFocusedVals =
+  runPureEff
+    . evalState emptyMemoryStore
+    . runMemoryState
+    . evalState emptyBrain
+    . runBrainState defaultWeights
+    . runLexiconRules
+    . runLLMMock @'AnthropicHttp (const (Right focusedKeyJson))
+    $ do
+        _ <- rememberKeyed (canonicalKey [lemmatize "butterflies"] [] []) "BUTTERFLY-NOTE"
+        e <- recallFocused @'AnthropicHttp defaultEffort "tell me about butterflies"
+        pure (either (const []) (map beValue) e)
+
+recallFocusedOk :: Bool
+recallFocusedOk = recallFocusedVals == ["BUTTERFLY-NOTE"]
+
+-- renderRecalled: empty for no entries; joins the values otherwise.
+renderRecalledOk :: Bool
+renderRecalledOk =
+  renderRecalled [] == ""
+    && T.isInfixOf "alpha" rendered
+    && T.isInfixOf "beta" rendered
+  where
+    rendered = renderRecalled [mkEntry "alpha", mkEntry "beta"]
+    mkEntry v = BrainEntry 0 (canonicalKey [] [] []) v 0
+
+-- askWithBrain (memory injection): store an entry, ask with a mock model, and
+-- check the answer comes back AND the injected entry is reported in baInjected.
+askWithBrainResult :: Maybe (Text, [Text])
+askWithBrainResult =
+  runPureEff
+    . evalState emptyMemoryStore
+    . runMemoryState
+    . evalState emptyBrain
+    . runBrainState defaultWeights
+    . runLexiconRules
+    . runLLMMock @'AnthropicHttp (const (Right "MOCK-ANSWER"))
+    $ do
+        _ <- rememberKeyed (canonicalKey ["cat"] [] []) "## Cats"
+        e <- askWithBrain @'AnthropicHttp defaultEffort "cats"
+        pure $ case e of
+          Left _   -> Nothing
+          Right ba -> Just (baAnswer ba, map beValue (baInjected ba))
+
+askWithBrainOk :: Bool
+askWithBrainOk = askWithBrainResult == Just ("MOCK-ANSWER", ["## Cats"])

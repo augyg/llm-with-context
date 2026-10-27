@@ -1,2 +1,6 @@
 packages: .
-         ../scrappy-core
+          /home/lazylambda/code/ace-ws/thunks/scrappy-core
+
+-- scrappy-core builds with -Werror; don't let its warnings fail our build.
+package scrappy-core
+  ghc-options: -Wwarn

@@ -1,4 +1,7 @@
--- | Aeson field label modifier for stripping record prefixes.
+-- | Description: Aeson field label modifier for stripping record prefixes.
+-- Copyright: (c) lazyLambda, 2024-2026
+-- License: MIT
+-- Maintainer: galen.sprout@gmail.com
 --
 -- Used with @deriveJSON@ to remove the underscore-delimited prefix from record
 -- fields so the JSON keys match the bare field names. For example, a field

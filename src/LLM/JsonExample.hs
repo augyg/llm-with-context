@@ -5,6 +5,10 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeOperators #-}
 
+-- | Description: Generate JSON example strings from Haskell types via GHC Generics.
+-- Copyright: (c) lazyLambda, 2024-2026
+-- License: MIT
+-- Maintainer: galen.sprout@gmail.com
 module LLM.JsonExample
   ( -- * Typeclass
     JsonExample(..)
