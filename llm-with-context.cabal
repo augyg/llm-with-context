@@ -53,6 +53,9 @@ library
                       LLM.LLM
                       LLM.Retry
                       LLM.Provider
+                      -- Dev-gated LLM substitution: three ask-* variants
+                      -- + 'LLMDefaultable' class. See module header.
+                      LLM.Defaultable
                       LLM.Provider.Backends
                       LLM.ReadLLM
                       LLM.ScrubPrefix
