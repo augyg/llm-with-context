@@ -65,6 +65,7 @@ import LLM.Provider.Anthropic
 import LLM.Provider.AnthropicOAuth.Ask
   ( AnthropicOAuthEnv (..)
   , claudeCodeSystemBlocks
+  , markLastSystemBlockCached
   , defaultAnthropicBeta
   , defaultAnthropicVersion
   , defaultUserAgent
@@ -124,7 +125,7 @@ postToolsOnce env creds defs msgs = do
           body = Aeson.object
             [ "model"      .= envModel env
             , "max_tokens" .= envMaxTokens env
-            , "system"     .= claudeCodeSystemBlocks (envModel env)
+            , "system"     .= markLastSystemBlockCached (claudeCodeSystemBlocks (envModel env))
             , "tools"      .= toolsJSON
             , "messages"   .= map richMessageJSON msgs
             ]

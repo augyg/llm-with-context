@@ -40,12 +40,16 @@ module LLM.Provider.AnthropicOAuth.Ask
   , claudeCodeSystemPrompt
   , claudeCodeMagicSystemPrefix
   , claudeCodeSystemBlocks
+  , withEphemeralCacheControl
+  , markLastSystemBlockCached
   ) where
 
 import Control.Concurrent.MVar (MVar, modifyMVar, newMVar, readMVar)
 import Control.Exception (SomeException, try)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import qualified Data.Aeson as Aeson
+import qualified Data.Aeson.KeyMap as AKM
+import Data.Foldable (toList)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BL
 import Data.Text (Text)
@@ -195,6 +199,48 @@ claudeCodeSystemPrompt modelId =
 claudeCodeMagicSystemPrefix :: Text
 claudeCodeMagicSystemPrefix =
   "You are Claude Code, Anthropic's official CLI for Claude."
+
+-- | Wrap a content block with Anthropic's @cache_control: ephemeral@
+-- marker. Caches the block's token range server-side for ~5 minutes
+-- (default TTL). Mirrors the shape 'cli.js' uses verbatim:
+--
+--   @{..., "cache_control": {"type": "ephemeral"}}@
+--
+-- Does NOT add TTL — the extended-TTL variants require a specific
+-- beta header the OAuth path isn't opted into. Default 5m is fine for
+-- gingerly's turn cadence (same session reuses memory within the
+-- window; cache-hit saves ~90% on input tokens for the cached range).
+--
+-- If the input isn't a JSON object, returns it unchanged (defensive;
+-- real callers only pass 'Aeson.Object' blocks).
+withEphemeralCacheControl :: Aeson.Value -> Aeson.Value
+withEphemeralCacheControl val = case val of
+  Aeson.Object km ->
+    Aeson.Object (AKM.insert "cache_control" cc km)
+  other -> other
+  where
+    cc = Aeson.object [ "type" Aeson..= ("ephemeral" :: Text) ]
+
+-- | Apply 'withEphemeralCacheControl' to the LAST element of an array
+-- of content blocks. Earlier elements are left alone. Matches
+-- 'cli.js's @content.map((z,w)=>({...z, ...w===content.length-1 ?
+-- {cache_control:...} : {}}))@ pattern: one cache boundary per
+-- message\/system field, placed at the stable prefix's end.
+--
+-- Returns the input unchanged if it isn't a JSON array (defensive).
+markLastSystemBlockCached :: Aeson.Value -> Aeson.Value
+markLastSystemBlockCached val = case val of
+  Aeson.Array arr
+    | not (null arr) ->
+        let n = length arr
+            arr' = fmap (\(i, v) ->
+                           if i == n - 1
+                             then withEphemeralCacheControl v
+                             else v)
+                     (zip [0..] (toList arr))
+        in Aeson.toJSON arr'
+    | otherwise -> val
+  other -> other
 
 -- | Build the @system@ field as an array of content blocks for the
 -- OAuth-authenticated path. The FIRST block is the exact magic
@@ -426,7 +472,7 @@ postMessages env creds contents = do
           body = Aeson.object
             [ "model"      Aeson..= envModel env
             , "max_tokens" Aeson..= envMaxTokens env
-            , "system"     Aeson..= systemBlocks
+            , "system"     Aeson..= markLastSystemBlockCached systemBlocks
             , "messages"   Aeson..= map Aeson.toJSON messages
             ]
           req = baseReq
@@ -588,7 +634,7 @@ streamOnce env creds contents onChunk = do
             [ "model"      Aeson..= envModel env
             , "max_tokens" Aeson..= envMaxTokens env
             , "stream"     Aeson..= True
-            , "system"     Aeson..= systemBlocks
+            , "system"     Aeson..= markLastSystemBlockCached systemBlocks
             , "messages"   Aeson..= map toUserAssistantJSON messages
             ]
           req = baseReq
