@@ -8,6 +8,7 @@ module LLM.Tools.BashEdit
   ) where
 
 import LLM.Types
+import LLM.Tools.FileOps (execRead, execGrep, execGlob)
 
 import Data.Aeson
 import qualified Data.Aeson.KeyMap as KM
@@ -57,6 +58,9 @@ defaultToolExecutor = mapM $ \tu -> do
   content <- case _toolUse_name tu of
     "bash" -> execBash (_toolUse_input tu)
     "edit" -> execEdit (_toolUse_input tu)
+    "Read" -> execRead (_toolUse_input tu)
+    "Grep" -> execGrep (_toolUse_input tu)
+    "Glob" -> execGlob (_toolUse_input tu)
     other  -> pure $ "Unknown tool: " <> other
   pure $ ToolResult (_toolUse_id tu) content
 

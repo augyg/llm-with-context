@@ -101,6 +101,7 @@ library
                       LLM.Effect.FileSystem
                       LLM.Tooling
                       LLM.Tools.BashEdit
+                      LLM.Tools.FileOps
                       LLM.Brain.Lexicon
                       LLM.Brain.Key
                       LLM.Brain.Store
@@ -149,6 +150,9 @@ library
                     -- staticWhich: bake the sandbox executable's absolute path
                     -- at compile time (CPP-conditional per platform).
                     , which
+                    -- Glob: pure Haskell file-pattern matcher used by
+                    -- LLM.Tools.FileOps.execGlob (Phase E).
+                    , Glob
                     -- servant-client transport for the OpenAI / Anthropic providers
                     , servant
                     , servant-client
