@@ -102,6 +102,7 @@ library
                       LLM.Tooling
                       LLM.Tools.BashEdit
                       LLM.Tools.FileOps
+                      LLM.Provider.AnthropicOAuth.Bootstrap
                       LLM.Brain.Lexicon
                       LLM.Brain.Key
                       LLM.Brain.Store
@@ -153,6 +154,12 @@ library
                     -- Glob: pure Haskell file-pattern matcher used by
                     -- LLM.Tools.FileOps.execGlob (Phase E).
                     , Glob
+                    -- Phase F: Bootstrap PKCE needs SHA256 + base64url +
+                    -- random bytes.
+                    , cryptonite
+                    , memory
+                    , base64-bytestring
+                    , random
                     -- servant-client transport for the OpenAI / Anthropic providers
                     , servant
                     , servant-client

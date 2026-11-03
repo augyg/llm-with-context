@@ -86,6 +86,7 @@ import LLM.Provider.Anthropic
   , firstText
   , splitSystem
   )
+import qualified LLM.Provider.AnthropicOAuth.Bootstrap as Bootstrap
 import LLM.Provider.AnthropicOAuth.Credentials
   ( Credentials (..)
   , LoadError (..)
@@ -345,21 +346,56 @@ newAnthropicOAuthEnv mgr credPath model maxToks baseUrl = do
         , envMaxTokens        = maxToks
         , envAnthropicBaseUrl = baseUrl
         }
-    _ ->
-      loadCredentials credPath >>= \case
-        Left e  -> pure (Left e)
-        Right c -> do
-          mv <- newMVar c
-          pure $ Right AnthropicOAuthEnv
-            { envManager          = mgr
-            , envCredentialsPath  = credPath
-            , envCredentials      = mv
-            , envModel            = model
-            , envMaxTokens        = maxToks
-            , envAnthropicBaseUrl = baseUrl
-            }
+    _ -> do
+      -- Fallback 1: ~/.config/gingerly/oauth-token (Phase F — written
+      -- by the first-run bootstrap or by hand). Treated identically
+      -- to the env-var case: synthesise a far-future-expiry
+      -- Credentials value from the token string.
+      mFileTok <- Bootstrap.readTokenFile
+      case mFileTok of
+        Just tok -> buildFromToken tok
+        Nothing  ->
+          -- Fallback 2: real claude-code's short-lived
+          -- ~/.claude/.credentials.json (the subscription OAuth file
+          -- that `claude login` writes). This path WORKS for text-only
+          -- requests but currently hits the model-gating and
+          -- system-prompt-shape rules server-side for tool-use —
+          -- gingerly ends up with the "oat01-less" short-lived token
+          -- which has user:inference scope but a different session
+          -- binding. Kept as a convenience fallback.
+          loadCredentials credPath >>= \case
+            Left e  -> pure (Left e)
+            Right c -> do
+              mv <- newMVar c
+              pure $ Right AnthropicOAuthEnv
+                { envManager          = mgr
+                , envCredentialsPath  = credPath
+                , envCredentials      = mv
+                , envModel            = model
+                , envMaxTokens        = maxToks
+                , envAnthropicBaseUrl = baseUrl
+                }
   where
     isSpaceChar c = c == ' ' || c == '\t' || c == '\n' || c == '\r'
+    buildFromToken :: Text -> IO (Either LoadError AnthropicOAuthEnv)
+    buildFromToken tok = do
+      let creds = Credentials
+            { credAccessToken      = tok
+            , credRefreshToken     = ""
+            , credExpiresAt        = 9999999999999
+            , credScopes           = ["user:inference"]
+            , credSubscriptionType = "oauth-token-file"
+            , credRateLimitTier    = "oauth-token-file"
+            }
+      mv <- newMVar creds
+      pure $ Right AnthropicOAuthEnv
+        { envManager          = mgr
+        , envCredentialsPath  = credPath
+        , envCredentials      = mv
+        , envModel            = model
+        , envMaxTokens        = maxToks
+        , envAnthropicBaseUrl = baseUrl
+        }
 
 -- | If the current token is within 60s of expiring, refresh it and
 -- persist to BOTH the file and the in-memory 'MVar'. Returns 'Left'
