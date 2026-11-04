@@ -30,9 +30,13 @@ module LLM.Tools.FileOps
   ( readTool
   , grepTool
   , globTool
+  , writeTool
+  , multiEditTool
   , execRead
   , execGrep
   , execGlob
+  , execWrite
+  , execMultiEdit
   ) where
 
 import LLM.Types
@@ -43,10 +47,12 @@ import qualified Data.Aeson.KeyMap as KM
 import qualified Data.Text as T
 import qualified Data.Text.IO as T
 import qualified Data.Aeson.Key as Key
+import Data.Foldable (toList)
 import Data.List (sortBy)
 import Data.Ord (Down (..), comparing)
 import Data.Time.Clock (UTCTime)
-import System.Directory (doesFileExist, getModificationTime)
+import System.Directory (createDirectoryIfMissing, doesFileExist, getModificationTime, renameFile)
+import System.FilePath (takeDirectory)
 import System.Exit (ExitCode (..))
 import System.FilePath.Glob (glob)
 import System.Process (readCreateProcessWithExitCode, proc)
@@ -147,6 +153,75 @@ grepTool = ToolDef
               ]
           ]
       , "required" .= [ "pattern" :: T.Text ]
+      ]
+  }
+
+-- | Writes a file to the local filesystem. Description matches
+-- cli.js verbatim; parameter names match (@file_path@, @content@).
+--
+-- Semantics: overwrites if the file exists. Creates parent
+-- directories as needed. Writes are atomic (tempfile + rename).
+writeTool :: ToolDef
+writeTool = ToolDef
+  { _toolDef_name = "Write"
+  , _toolDef_description =
+      "Writes a file to the local filesystem. Overwrites the existing file if \
+      \there is one at the provided path. ALWAYS prefer editing existing files \
+      \in the codebase. NEVER create documentation files (*.md) or README \
+      \files unless explicitly requested by the User. The file_path parameter \
+      \must be an absolute path. Creates parent directories if needed."
+  , _toolDef_inputSchema = Data.Aeson.object
+      [ "type" .= ("object" :: T.Text)
+      , "properties" .= Data.Aeson.object
+          [ "file_path" .= stringProp "The absolute path to the file to write"
+          , "content"   .= stringProp "The content to write to the file"
+          ]
+      , "required" .= [ "file_path" :: T.Text, "content" :: T.Text ]
+      ]
+  }
+
+-- | Batched multi-edit to a single file. Description matches cli.js
+-- verbatim; parameter names match (@file_path@, @edits@ where each
+-- edit has @old_string@/@new_string@/@replace_all@).
+--
+-- Semantics: edits are applied in order. If ANY edit fails
+-- (old_string not found or ambiguous without replace_all), the
+-- WHOLE operation is aborted and no changes are written — atomic.
+-- This matches claude-code's own behavior and keeps the file from
+-- landing in a half-edited state.
+multiEditTool :: ToolDef
+multiEditTool = ToolDef
+  { _toolDef_name = "MultiEdit"
+  , _toolDef_description =
+      "This is a tool for making multiple edits to a single file in one \
+      \operation. It is built on top of the Edit tool and allows you to perform \
+      \multiple find-and-replace operations efficiently. Prefer this tool over \
+      \the Edit tool when you need to make multiple edits to the same file. \
+      \All edits are applied in sequence; if ANY edit fails (old_string not \
+      \found), NO changes are written to the file (atomic). Each edit's \
+      \old_string must be unique in the file unless replace_all is true."
+  , _toolDef_inputSchema = Data.Aeson.object
+      [ "type" .= ("object" :: T.Text)
+      , "properties" .= Data.Aeson.object
+          [ "file_path" .= stringProp "The absolute path to the file to modify"
+          , "edits" .= Data.Aeson.object
+              [ "type" .= ("array" :: T.Text)
+              , "description" .= ("Array of edit operations. Each edit has old_string, new_string, and optional replace_all." :: T.Text)
+              , "items" .= Data.Aeson.object
+                  [ "type" .= ("object" :: T.Text)
+                  , "properties" .= Data.Aeson.object
+                      [ "old_string"  .= stringProp "The text to replace (must be unique in file unless replace_all is true)"
+                      , "new_string"  .= stringProp "The replacement text"
+                      , "replace_all" .= Data.Aeson.object
+                          [ "type" .= ("boolean" :: T.Text)
+                          , "description" .= ("Replace ALL occurrences of old_string (default false)" :: T.Text)
+                          ]
+                      ]
+                  , "required" .= [ "old_string" :: T.Text, "new_string" :: T.Text ]
+                  ]
+              ]
+          ]
+      , "required" .= [ "file_path" :: T.Text, "edits" :: T.Text ]
       ]
   }
 
@@ -317,3 +392,106 @@ execGlob v = case fromJSON v of
               pure $ T.unlines (map (T.pack . fst) sorted)
     _ -> pure "Missing or non-string 'pattern' in Glob arguments"
   Success _ -> pure "Expected object for Glob arguments"
+
+-- | Executes 'writeTool'. Atomic write via tempfile + rename; creates
+-- parent directories as needed. Returns a diagnostic summary with the
+-- number of bytes written. Silently overwrites.
+execWrite :: Value -> IO T.Text
+execWrite v = case fromJSON v of
+  Error e -> pure $ T.pack $ "Invalid Write arguments: " <> e
+  Success (Object o) -> case (KM.lookup "file_path" o, KM.lookup "content" o) of
+    (Just (String path), Just (String content)) -> do
+      let pathStr = T.unpack path
+          dir     = takeDir pathStr
+      _ <- try (createDirectoryIfMissing True dir) :: IO (Either SomeException ())
+      let tmp = pathStr <> ".gingerly-write-tmp"
+      r <- try (do
+                   T.writeFile tmp content
+                   renameFile tmp pathStr)
+             :: IO (Either SomeException ())
+      case r of
+        Left ex -> pure $ "Write failed: " <> T.pack (show ex)
+        Right () -> pure $
+          "Wrote " <> T.pack (show (T.length content)) <> " chars to " <> path
+    _ -> pure "Missing file_path or content in Write arguments"
+  Success _ -> pure "Expected object for Write arguments"
+  where
+    -- Minimal parent-dir extractor (FilePath's takeDirectory lives in
+    -- System.FilePath which we already have).
+    takeDir :: FilePath -> FilePath
+    takeDir = takeDirectory
+
+-- | Executes 'multiEditTool'. Atomic: reads the file ONCE, applies
+-- the edits sequentially to the in-memory text, and if ALL succeed
+-- writes back atomically. If any edit's old_string is not found
+-- (or found multiple times without replace_all=true), the WHOLE
+-- operation fails with no disk writes. Mirrors cli.js's behavior.
+execMultiEdit :: Value -> IO T.Text
+execMultiEdit v = case fromJSON v of
+  Error e -> pure $ T.pack $ "Invalid MultiEdit arguments: " <> e
+  Success (Object o) ->
+    case (KM.lookup "file_path" o, KM.lookup "edits" o) of
+      (Just (String path), Just (Array editsArr)) -> do
+        let pathStr = T.unpack path
+        exists <- doesFileExist pathStr
+        if not exists
+          then pure $ "File not found: " <> path
+          else do
+            r <- try (T.readFile pathStr) :: IO (Either SomeException T.Text)
+            case r of
+              Left ex -> pure $ "MultiEdit read failed: " <> T.pack (show ex)
+              Right original -> do
+                let editsList = toList editsArr
+                case applyEdits original editsList 0 of
+                  Left err -> pure err
+                  Right newContent -> do
+                    let tmp = pathStr <> ".gingerly-medit-tmp"
+                    w <- try (do
+                                 T.writeFile tmp newContent
+                                 renameFile tmp pathStr)
+                           :: IO (Either SomeException ())
+                    case w of
+                      Left ex -> pure $ "MultiEdit write failed: " <> T.pack (show ex)
+                      Right () -> pure $
+                        "Applied " <> T.pack (show (length editsList))
+                           <> " edits to " <> path
+      _ -> pure "Missing file_path or edits in MultiEdit arguments"
+  Success _ -> pure "Expected object for MultiEdit arguments"
+  where
+    applyEdits :: T.Text -> [Value] -> Int -> Either T.Text T.Text
+    applyEdits acc []       _ = Right acc
+    applyEdits acc (e:rest) i = case e of
+      Object eo ->
+        case (KM.lookup "old_string" eo, KM.lookup "new_string" eo) of
+          (Just (String oldS), Just (String newS)) ->
+            let replaceAll = case KM.lookup "replace_all" eo of
+                  Just (Bool True) -> True
+                  _                -> False
+            in case applyOne acc oldS newS replaceAll of
+                 Left err -> Left $
+                   "Edit #" <> T.pack (show (i+1)) <> " failed: " <> err
+                 Right acc' -> applyEdits acc' rest (i+1)
+          _ -> Left $
+            "Edit #" <> T.pack (show (i+1))
+              <> " missing or non-string old_string/new_string"
+      _ -> Left $
+        "Edit #" <> T.pack (show (i+1)) <> " not a JSON object"
+
+    applyOne :: T.Text -> T.Text -> T.Text -> Bool -> Either T.Text T.Text
+    applyOne content oldS newS replaceAll
+      | T.null oldS = Left "old_string is empty"
+      | not (oldS `T.isInfixOf` content) =
+          Left ("old_string not found in file")
+      | replaceAll = Right (T.replace oldS newS content)
+      | otherwise =
+          let occurrences = countOccurrences oldS content
+          in if occurrences > 1
+             then Left $ "old_string appears "
+                           <> T.pack (show occurrences)
+                           <> " times — pass replace_all=true or disambiguate"
+             else Right (T.replace oldS newS content)
+
+    countOccurrences :: T.Text -> T.Text -> Int
+    countOccurrences needle haystack
+      | T.null needle = 0
+      | otherwise     = length (T.breakOnAll needle haystack)
