@@ -32,6 +32,7 @@ module LLM.Tools.FileOps
   , globTool
   , writeTool
   , multiEditTool
+  , taskTool
   , execRead
   , execGrep
   , execGlob
@@ -222,6 +223,37 @@ multiEditTool = ToolDef
               ]
           ]
       , "required" .= [ "file_path" :: T.Text, "edits" :: T.Text ]
+      ]
+  }
+
+-- | Phase U — Task tool for spawning a scoped subagent conversation.
+-- The tool itself is just the definition; the actual dispatch runs
+-- in the harness (which has the backend + hook registry) via a
+-- gingerly-side executor that intercepts tool_use.name == \"Task\"
+-- before 'defaultToolExecutor' sees it.
+--
+-- Schema mirrors claude-code's Task tool shape: subagent_type is
+-- the agent profile name ('general-purpose', 'Explore', etc.);
+-- prompt is the full brief the subagent is to work from;
+-- description is a 3-5 word summary for the chat view / logs.
+taskTool :: ToolDef
+taskTool = ToolDef
+  { _toolDef_name = "Task"
+  , _toolDef_description =
+      "Launch a new agent to handle complex, multi-step tasks. Each agent \
+      \type has specific capabilities and tools available. Prefer this tool \
+      \for open-ended questions that span the codebase, or tasks that match \
+      \an available agent type. When multiple independent lookups are needed, \
+      \dispatching several Task tools in parallel is more efficient than \
+      \running them sequentially."
+  , _toolDef_inputSchema = Data.Aeson.object
+      [ "type" .= ("object" :: T.Text)
+      , "properties" .= Data.Aeson.object
+          [ "subagent_type" .= stringProp "The type of specialized agent (e.g. 'general-purpose', 'Explore')"
+          , "prompt"        .= stringProp "Full brief / task description for the subagent"
+          , "description"   .= stringProp "3-5 word description of the task for progress display"
+          ]
+      , "required" .= [ "subagent_type" :: T.Text, "prompt" :: T.Text, "description" :: T.Text ]
       ]
   }
 
