@@ -390,6 +390,15 @@ blockJSON = \case
       , "content" .= content
       , "is_error" .= isErr
       ]
+  BlockImage mediaType b64 ->
+    object
+      [ "type" .= ("image" :: T.Text)
+      , "source" .= object
+          [ "type"       .= ("base64" :: T.Text)
+          , "media_type" .= mediaType
+          , "data"       .= b64
+          ]
+      ]
 
 richMessageJSON :: RichMessage -> Value
 richMessageJSON (RichMessage role blocks) =

@@ -433,6 +433,7 @@ data Block
   = BlockText T.Text
   | BlockToolUse ToolUse
   | BlockToolResult T.Text T.Text Bool -- ^ tool_use id, result content, is-error
+  | BlockImage T.Text T.Text          -- ^ T.1: media_type (e.g. "image/png"), base64 data
   deriving (Show, Generic)
 
 instance ToJSON Block
