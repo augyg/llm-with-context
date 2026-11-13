@@ -122,19 +122,34 @@ postToolsOnce env creds defs msgs = do
             -- (ClaudeConfig's '_claudeConfig_promptCaching' lives in the
             -- API-key path only). Prompt caching for OAuth would need a
             -- flag on 'AnthropicOAuthEnv' — tracked as a future task.
-          body = Aeson.object
+          thinkingField =
+            [ "thinking" .= Aeson.object
+                [ "type"          .= ("enabled" :: Text)
+                , "budget_tokens" .= (2048 :: Int)
+                ]
+            | envEnableThinking env
+            ]
+          body = Aeson.object $
             [ "model"      .= envModel env
             , "max_tokens" .= envMaxTokens env
             , "system"     .= markLastSystemBlockCached (claudeCodeSystemBlocks (envModel env))
             , "tools"      .= toolsJSON
             , "messages"   .= map richMessageJSON msgs
-            ]
+            ] ++ thinkingField
+          -- M.1: append interleaved-thinking beta when opted in. The
+          -- comma-separated 'anthropic-beta' header is the documented
+          -- way to activate multiple betas on one request.
+          betaHeader
+            | envEnableThinking env =
+                TE.encodeUtf8 defaultAnthropicBeta
+                  <> ",interleaved-thinking-2025-05-14"
+            | otherwise = TE.encodeUtf8 defaultAnthropicBeta
           req = baseReq
             { method         = "POST"
             , requestHeaders =
                 [ (hAuthorization,     "Bearer " <> TE.encodeUtf8 (credAccessToken creds))
                 , ("anthropic-version", TE.encodeUtf8 defaultAnthropicVersion)
-                , ("anthropic-beta",    TE.encodeUtf8 defaultAnthropicBeta)
+                , ("anthropic-beta",    betaHeader)
                 , (hUserAgent,          TE.encodeUtf8 defaultUserAgent)
                 , (hContentType,        "application/json")
                 ] ++ stainlessHeaders

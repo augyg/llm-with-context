@@ -296,6 +296,13 @@ data AnthropicOAuthEnv = AnthropicOAuthEnv
   , envModel           :: Text
   , envMaxTokens       :: Int
   , envAnthropicBaseUrl :: Text
+  , envEnableThinking   :: Bool
+    -- ^ M.1: when True, add thinking:{type:enabled, budget_tokens:2048}
+    -- to the request body + 'interleaved-thinking-2025-05-14' to the
+    -- anthropic-beta header. Server then emits content[].type=thinking
+    -- blocks which Phase M surfaces in gingerly's event-stream pane.
+    -- Default False (constructors below) keeps behaviour unchanged for
+    -- callers that don't opt in.
   } deriving (Generic)
 
 -- | Convenience constructor: 'loadCredentials' + build the MVar.
@@ -345,6 +352,7 @@ newAnthropicOAuthEnv mgr credPath model maxToks baseUrl = do
         , envModel            = model
         , envMaxTokens        = maxToks
         , envAnthropicBaseUrl = baseUrl
+        , envEnableThinking   = False
         }
     _ -> do
       -- Fallback 1: ~/.config/gingerly/oauth-token (Phase F — written
@@ -374,6 +382,7 @@ newAnthropicOAuthEnv mgr credPath model maxToks baseUrl = do
                 , envModel            = model
                 , envMaxTokens        = maxToks
                 , envAnthropicBaseUrl = baseUrl
+                , envEnableThinking   = False
                 }
   where
     isSpaceChar c = c == ' ' || c == '\t' || c == '\n' || c == '\r'
@@ -395,6 +404,7 @@ newAnthropicOAuthEnv mgr credPath model maxToks baseUrl = do
         , envModel            = model
         , envMaxTokens        = maxToks
         , envAnthropicBaseUrl = baseUrl
+        , envEnableThinking   = False
         }
 
 -- | If the current token is within 60s of expiring, refresh it and
@@ -505,18 +515,30 @@ postMessages env creds contents = do
                     , "text" Aeson..= t
                     ])
               _ -> baseSystemBlocks   -- defensive; constructor only returns Array
-          body = Aeson.object
+          thinkingField =
+            [ "thinking" Aeson..= Aeson.object
+                [ "type"          Aeson..= ("enabled" :: Text)
+                , "budget_tokens" Aeson..= (2048 :: Int)
+                ]
+            | envEnableThinking env
+            ]
+          body = Aeson.object $
             [ "model"      Aeson..= envModel env
             , "max_tokens" Aeson..= envMaxTokens env
             , "system"     Aeson..= markLastSystemBlockCached systemBlocks
             , "messages"   Aeson..= map Aeson.toJSON messages
-            ]
+            ] ++ thinkingField
+          betaHeader'
+            | envEnableThinking env =
+                TE.encodeUtf8 defaultAnthropicBeta
+                  <> ",interleaved-thinking-2025-05-14"
+            | otherwise = TE.encodeUtf8 defaultAnthropicBeta
           req = baseReq
             { method         = "POST"
             , requestHeaders =
                 [ (hAuthorization,     "Bearer " <> TE.encodeUtf8 (credAccessToken creds))
                 , ("anthropic-version", TE.encodeUtf8 defaultAnthropicVersion)
-                , ("anthropic-beta",    TE.encodeUtf8 defaultAnthropicBeta)
+                , ("anthropic-beta",    betaHeader')
                 , (hUserAgent,          TE.encodeUtf8 defaultUserAgent)
                 , (hContentType,        "application/json")
                 ] ++ stainlessHeaders
@@ -666,19 +688,31 @@ streamOnce env creds contents onChunk = do
                     , "text" Aeson..= t
                     ])
               _ -> baseSystemBlocks
-          body = Aeson.encode $ Aeson.object
+          thinkingField =
+            [ "thinking" Aeson..= Aeson.object
+                [ "type"          Aeson..= ("enabled" :: Text)
+                , "budget_tokens" Aeson..= (2048 :: Int)
+                ]
+            | envEnableThinking env
+            ]
+          body = Aeson.encode $ Aeson.object $
             [ "model"      Aeson..= envModel env
             , "max_tokens" Aeson..= envMaxTokens env
             , "stream"     Aeson..= True
             , "system"     Aeson..= markLastSystemBlockCached systemBlocks
             , "messages"   Aeson..= map toUserAssistantJSON messages
-            ]
+            ] ++ thinkingField
+          betaHeader'
+            | envEnableThinking env =
+                TE.encodeUtf8 defaultAnthropicBeta
+                  <> ",interleaved-thinking-2025-05-14"
+            | otherwise = TE.encodeUtf8 defaultAnthropicBeta
           req = baseReq
             { method         = "POST"
             , requestHeaders =
                 [ (hAuthorization,     "Bearer " <> TE.encodeUtf8 (credAccessToken creds))
                 , ("anthropic-version", TE.encodeUtf8 defaultAnthropicVersion)
-                , ("anthropic-beta",    TE.encodeUtf8 defaultAnthropicBeta)
+                , ("anthropic-beta",    betaHeader')
                 , (hUserAgent,          TE.encodeUtf8 defaultUserAgent)
                 , (hContentType,        "application/json")
                 , ("accept",            "text/event-stream")
