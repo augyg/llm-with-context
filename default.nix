@@ -115,7 +115,14 @@ let
   llm-with-context =
     hlib.addBuildTools
       (hp.callCabal2nix "llm-with-context" (cleanSrc ./.) { inherit scrappy-core scrappy-json; })
-      [ pkgs.bubblewrap newerPkgs.claude-code ];
+      [ pkgs.bubblewrap
+        newerPkgs.claude-code
+        # ripgrep required at COMPILE time by $(staticWhich "rg") in
+        # LLM.Tools.FileOps (added on gs/merge-llm-with-context). Without
+        # it here, test-suite / doctest sub-builds fail to compile that
+        # module even though the main library build is fine.
+        pkgs.ripgrep
+      ];
 in
 hlib.doCheck llm-with-context
 

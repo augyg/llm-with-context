@@ -49,6 +49,7 @@ module LLM.Provider.AnthropicCli
   , multimodalAskArgs
     -- * Effect runner
   , runLLMAnthropicCli
+  , runLLMAnthropicCliWith
   ) where
 
 import qualified Control.Exception as CE
@@ -102,10 +103,32 @@ data AskArgs = AskArgs
   , aAddDirs   :: ![FilePath]
     -- ^ Directories to grant tool access to via repeated
     -- @--add-dir=<DIR>@ flags (EQUALS-BOUND — see module header).
+  , aModel     :: !(Maybe T.Text)
+    -- ^ @--model <alias>@ (e.g. @\"sonnet\"@, @\"haiku\"@, @\"opus\"@).
+    -- 'Nothing' lets the CLI pick its default. Added for hook-nested
+    -- callers (e.g. the dispatcher's semantic classifier) that need a
+    -- specific model.
+  , aDisableSlashCommands :: !Bool
+    -- ^ @--disable-slash-commands@: suppresses slash-command
+    -- interpretation inside the prompt body. Required when the prompt
+    -- may contain @\/@-prefixed strings that aren't meant as Claude
+    -- Code commands.
+  , aNoSessionPersistence :: !Bool
+    -- ^ @--no-session-persistence@: suppresses writing session state
+    -- to disk. Critical when the CLI is invoked from inside another
+    -- Claude Code session (the subprocess would otherwise interleave
+    -- its state with the outer session's).
+  , aExcludeDynSysPromptSections :: !Bool
+    -- ^ @--exclude-dynamic-system-prompt-sections@: suppresses the
+    -- caller's @UserPromptSubmit@ hook injection in the nested
+    -- process. Reduces noise and prevents unbounded prompt growth
+    -- under recursive invocation.
   } deriving (Show, Eq)
 
 -- | Sensible defaults for an LLM ask: print mode on, skip permissions
--- on, env-scrub @CLAUDECODE@, no extra directory access.
+-- on, env-scrub @CLAUDECODE@, no extra directory access. All
+-- hook-nested-invocation-specific flags are OFF by default — opt in
+-- via the new fields on 'AskArgs' when calling from a hook context.
 defaultAskArgs :: T.Text -> AskArgs
 defaultAskArgs p = AskArgs
   { aPrompt    = p
@@ -113,22 +136,36 @@ defaultAskArgs p = AskArgs
   , aSkipPerms = True
   , aScrubEnv  = ["CLAUDECODE"]
   , aAddDirs   = []
+  , aModel                       = Nothing
+  , aDisableSlashCommands        = False
+  , aNoSessionPersistence        = False
+  , aExcludeDynSysPromptSections = False
   }
 
 -- | Build the argv slice. The caller prepends the @claude@ binary
 -- path via 'runLLMAnthropicCli' / 'staticWhich'.
 askArgs :: AskArgs -> [String]
-askArgs (AskArgs prompt printMode skipPerms _ addDirs) =
+askArgs a =
      printArgs
   <> skipPermsArgs
+  <> modelArgs
+  <> disableSlashArgs
+  <> noSessionArgs
+  <> excludeDynArgs
   <> addDirArgs
-  <> [ T.unpack prompt ]
+  <> [ T.unpack (aPrompt a) ]
   where
-    printArgs     = [ "-p"                              | printMode ]
-    skipPermsArgs = [ "--dangerously-skip-permissions"  | skipPerms ]
+    printArgs        = [ "-p"                              | aPrintMode a ]
+    skipPermsArgs    = [ "--dangerously-skip-permissions"  | aSkipPerms a ]
+    modelArgs        = case aModel a of
+      Nothing -> []
+      Just m  -> [ "--model", T.unpack m ]
+    disableSlashArgs = [ "--disable-slash-commands"               | aDisableSlashCommands a ]
+    noSessionArgs    = [ "--no-session-persistence"               | aNoSessionPersistence a ]
+    excludeDynArgs   = [ "--exclude-dynamic-system-prompt-sections" | aExcludeDynSysPromptSections a ]
     -- See module header: equals-bind each --add-dir value because the
     -- CLI's argparse otherwise greedily consumes the following prompt.
-    addDirArgs    = map (\d -> "--add-dir=" <> d) addDirs
+    addDirArgs       = map (\d -> "--add-dir=" <> d) (aAddDirs a)
 
 -- | Build the auto-prepended \"Read the image(s) at ...\" preamble for
 -- multimodal asks. Exported for test inspection.
@@ -193,12 +230,34 @@ multimodalAskArgs paths contents =
 -- The interpreter handles the generic 'Ask' op; the capability classes
 -- ('CanText', 'CanMultimodal') sit on top of 'Ask' as more typed entry
 -- points.
+--
+-- Uses 'defaultAskArgs' for the CLI invocation. Callers that need
+-- custom flags (e.g. hook-nested invocations that need @--model@ /
+-- @--no-session-persistence@ / @--disable-slash-commands@ /
+-- @--exclude-dynamic-system-prompt-sections@) should use
+-- 'runLLMAnthropicCliWith' instead.
 runLLMAnthropicCli
   :: forall es a. (IOE :> es, Memory :> es)
   => Eff (LLM 'AnthropicCli : es) a
   -> Eff es a
-runLLMAnthropicCli = interpret $ \_ -> \case
-  Ask contents -> liftIO $ runClaudeAsk (defaultAskArgs (flattenContents contents))
+runLLMAnthropicCli = runLLMAnthropicCliWith defaultAskArgs
+
+-- | Same as 'runLLMAnthropicCli' but with a caller-supplied
+-- 'AskArgs' builder. The builder is applied to the flattened prompt
+-- body before each 'Ask' invocation, giving the caller full control
+-- over model, print mode, scrubbed env vars, and hook-friendly flags
+-- ('aNoSessionPersistence', 'aDisableSlashCommands',
+-- 'aExcludeDynSysPromptSections'). The multimodal path still uses
+-- 'multimodalAskArgs' + preamble — multimodal callers that want the
+-- extra flags should post-process the returned 'AskArgs' with record
+-- updates (future work).
+runLLMAnthropicCliWith
+  :: forall es a. (IOE :> es, Memory :> es)
+  => (T.Text -> AskArgs)
+  -> Eff (LLM 'AnthropicCli : es) a
+  -> Eff es a
+runLLMAnthropicCliWith argsFor = interpret $ \_ -> \case
+  Ask contents -> liftIO $ runClaudeAsk (argsFor (flattenContents contents))
   -- Multimodal: derive each path's parent dir, prepend the Read-tool
   -- preamble in front of the flattened user prompt, and bind --add-dir
   -- per unique dir (EQUALS-BOUND, see module header). The result
