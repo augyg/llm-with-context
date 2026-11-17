@@ -57,7 +57,7 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Time.Clock (addUTCTime, getCurrentTime)
 import GHC.Generics (Generic)
-import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Network.HTTP.Client
   ( BodyReader
   , Manager
@@ -303,6 +303,11 @@ data AnthropicOAuthEnv = AnthropicOAuthEnv
     -- blocks which Phase M surfaces in gingerly's event-stream pane.
     -- Default False (constructors below) keeps behaviour unchanged for
     -- callers that don't opt in.
+  , envForceToolChoice  :: IORef (Maybe Text)
+    -- ^ When Just "any" / "auto" / tool-name, the Tools path adds a
+    -- @tool_choice@ field to the request body. Lets the harness force
+    -- tool use (e.g. /auto mode) without an env var. Mutable so the
+    -- harness can toggle at runtime without rebuilding the backend.
   } deriving (Generic)
 
 -- | Convenience constructor: 'loadCredentials' + build the MVar.
@@ -328,6 +333,7 @@ newAnthropicOAuthEnv
   -> Text       -- ^ base URL (typically @"https://api.anthropic.com"@)
   -> IO (Either LoadError AnthropicOAuthEnv)
 newAnthropicOAuthEnv mgr credPath model maxToks baseUrl = do
+  ftcRef <- newIORef (Nothing :: Maybe Text)
   mEnvTok <- lookupEnv "CLAUDE_CODE_OAUTH_TOKEN"
   case mEnvTok of
     Just raw | not (null (dropWhile isSpaceChar raw)) -> do
@@ -353,6 +359,7 @@ newAnthropicOAuthEnv mgr credPath model maxToks baseUrl = do
         , envMaxTokens        = maxToks
         , envAnthropicBaseUrl = baseUrl
         , envEnableThinking   = False
+        , envForceToolChoice  = ftcRef
         }
     _ -> do
       -- Fallback 1: ~/.config/gingerly/oauth-token (Phase F — written
@@ -361,7 +368,7 @@ newAnthropicOAuthEnv mgr credPath model maxToks baseUrl = do
       -- Credentials value from the token string.
       mFileTok <- Bootstrap.readTokenFile
       case mFileTok of
-        Just tok -> buildFromToken tok
+        Just tok -> buildFromToken ftcRef tok
         Nothing  ->
           -- Fallback 2: real claude-code's short-lived
           -- ~/.claude/.credentials.json (the subscription OAuth file
@@ -383,11 +390,12 @@ newAnthropicOAuthEnv mgr credPath model maxToks baseUrl = do
                 , envMaxTokens        = maxToks
                 , envAnthropicBaseUrl = baseUrl
                 , envEnableThinking   = False
+                , envForceToolChoice  = ftcRef
                 }
   where
     isSpaceChar c = c == ' ' || c == '\t' || c == '\n' || c == '\r'
-    buildFromToken :: Text -> IO (Either LoadError AnthropicOAuthEnv)
-    buildFromToken tok = do
+    buildFromToken :: IORef (Maybe Text) -> Text -> IO (Either LoadError AnthropicOAuthEnv)
+    buildFromToken ftcRef tok = do
       let creds = Credentials
             { credAccessToken      = tok
             , credRefreshToken     = ""
@@ -405,6 +413,7 @@ newAnthropicOAuthEnv mgr credPath model maxToks baseUrl = do
         , envMaxTokens        = maxToks
         , envAnthropicBaseUrl = baseUrl
         , envEnableThinking   = False
+        , envForceToolChoice  = ftcRef
         }
 
 -- | If the current token is within 60s of expiring, refresh it and

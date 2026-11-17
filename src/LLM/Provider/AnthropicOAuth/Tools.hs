@@ -35,7 +35,9 @@ module LLM.Provider.AnthropicOAuth.Tools
 
 import Control.Concurrent.MVar (readMVar)
 import Control.Exception (SomeException, try)
+import Control.Monad (when)
 import Control.Monad.IO.Class (MonadIO, liftIO)
+import Data.IORef (readIORef, writeIORef)
 import Data.Aeson ((.=))
 import qualified Data.Aeson as Aeson
 import qualified Data.ByteString as BS
@@ -113,10 +115,15 @@ postToolsOnce
 postToolsOnce env creds defs msgs = do
   mkReq <- try (parseRequest (T.unpack (envAnthropicBaseUrl env <> "/v1/messages")))
     :: IO (Either SomeException Request)
+  mForceChoice <- readIORef (envForceToolChoice env)
   case mkReq of
     Left e -> pure (Left ("Anthropic OAuth tools: HTTP setup: " <> T.pack (show e)))
     Right baseReq -> do
       let toolsJSON = [toolDefJSON False d | d <- defs]
+          toolChoiceField = case mForceChoice of
+            Just s | not (T.null (T.strip s)) ->
+              [ "tool_choice" .= Aeson.object [ "type" .= T.strip s ] ]
+            _ -> []
             -- 'False' here = cache_control OFF per tool. The OAuth
             -- backend doesn't currently thread the prompt-cache flag
             -- (ClaudeConfig's '_claudeConfig_promptCaching' lives in the
@@ -135,7 +142,7 @@ postToolsOnce env creds defs msgs = do
             , "system"     .= markLastSystemBlockCached (claudeCodeSystemBlocks (envModel env))
             , "tools"      .= toolsJSON
             , "messages"   .= map richMessageJSON msgs
-            ] ++ thinkingField
+            ] ++ thinkingField ++ toolChoiceField
           -- M.1: append interleaved-thinking beta when opted in. The
           -- comma-separated 'anthropic-beta' header is the documented
           -- way to activate multiple betas on one request.
@@ -252,15 +259,46 @@ runAnthropicOAuthToolLoop
   -> ([ToolUse] -> IO [ToolResult])         -- ^ gated executor
   -> [RichMessage]                          -- ^ initial messages (incl. user turn)
   -> m (Either Text Text)
-runAnthropicOAuthToolLoop env maxRounds defs execTool initial =
-  liftIO (go 0 initial [])
+runAnthropicOAuthToolLoop env maxRounds defs execTool initial = liftIO $ do
+  -- Round 0 uses the caller's forced tool_choice (typically "any") so
+  -- the model can't text-confabulate on the first response. Rounds 1+
+  -- MUST use "auto" or the model is locked into infinite tool-use —
+  -- it can't ever emit end_turn. Save + restore so caller state survives.
+  savedForce <- readIORef (envForceToolChoice env)
+  res <- go 0 0 initial []
+  writeIORef (envForceToolChoice env) savedForce
+  pure res
   where
-    go :: Int -> [RichMessage] -> [Text] -> IO (Either Text Text)
-    go n history acc
+    -- A round where EVERY tool result is a user-denial. If three of these
+    -- stack we bail — the model clearly isn't going to take "no" and keeps
+    -- generating new tool_use blocks after each deny. Three strikes is
+    -- generous; one is too aggressive (model may legitimately try an
+    -- alternate tool after one deny, and we want to let that happen).
+    isDenyRound :: [ToolResult] -> Bool
+    isDenyRound rs = not (null rs) && all isDeny rs
+    isDeny r = "Denied by user" `T.isInfixOf` _toolResult_content r
+    maxConsecutiveDenies = 3 :: Int
+    go :: Int -> Int -> [RichMessage] -> [Text] -> IO (Either Text Text)
+    go n denies history acc
+      | denies >= maxConsecutiveDenies =
+          pure $ Right $
+            "[tool-loop] stopped — you denied " <>
+            T.pack (show maxConsecutiveDenies) <>
+            " tool calls in a row, so I'm giving up on this turn."
       | n >= maxRounds =
-          pure $ Right $ T.unlines $
-            "[tool-loop] reached max rounds; partial progress:" : reverse acc
+          -- Don't dump accumulated tool-result text into the chat
+          -- as prose — the TUI already renders each tool via its
+          -- own PreToolCall/PostToolCall pair. Just surface a short
+          -- stopped-early banner so the user knows why we stopped.
+          pure $ Right $
+            "[tool-loop] stopped after " <> T.pack (show maxRounds)
+            <> " rounds — raise the cap in Main.hs if this was genuine work."
       | otherwise = do
+          -- After round 0, flip tool_choice off so the model can emit
+          -- end_turn. Without this the loop is unbreakable: every API
+          -- call is forced to pick a tool, model never decides it's
+          -- done, loop runs until maxRounds hits.
+          when (n == 1) $ writeIORef (envForceToolChoice env) Nothing
           res <- askAnthropicOAuthTools env defs history
           case res of
             Left err -> pure (Left err)
@@ -286,4 +324,6 @@ runAnthropicOAuthToolLoop env maxRounds defs execTool initial =
                         Just t  -> t : acc
                         Nothing -> acc
                       acc'' = map _toolResult_content results ++ acc'
-                  go (n + 1) (history ++ [assistantMsg, toolResultMsg]) acc''
+                      denies' = if isDenyRound results then denies + 1 else 0
+                  go (n + 1) denies'
+                     (history ++ [assistantMsg, toolResultMsg]) acc''
